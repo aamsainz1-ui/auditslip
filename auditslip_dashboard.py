@@ -2067,6 +2067,228 @@ def record_endpoint_mutation(db_path: Path, action: str, *, actor: str = "", req
     record_mutation(db_path, action, actor=actor, chat_id=chat_id, bot_key=bot_key, slip_id=slip_id, payload=payload, result_status=result_status, result_summary=(prefix + (result_summary or "")))
 
 
+# ---------------------------------------------------------------------------
+# Phase B3: two-person approval workflow for destructive operations
+# ---------------------------------------------------------------------------
+
+PENDING_ACTION_TTL_HOURS = 24
+APPROVAL_REQUIRED_ACTIONS = {"slip.delete", "period.close"}
+_PENDING_ACTIONS_READY = False
+
+
+def ensure_pending_actions_table(db_path: Path) -> None:
+    """Create pending_actions table if missing. Idempotent."""
+    global _PENDING_ACTIONS_READY
+    if _PENDING_ACTIONS_READY:
+        return
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_actions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              action TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              requested_by TEXT NOT NULL,
+              requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              approved_by TEXT DEFAULT NULL,
+              approved_at TEXT DEFAULT NULL,
+              executed_at TEXT DEFAULT NULL,
+              executed_result TEXT DEFAULT NULL,
+              status TEXT NOT NULL DEFAULT 'pending',
+              expires_at TEXT NOT NULL,
+              request_id TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_actions(status, expires_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_action ON pending_actions(action)")
+        conn.commit()
+    _PENDING_ACTIONS_READY = True
+
+
+def _utc_now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def _utc_expiry_iso(hours: int = PENDING_ACTION_TTL_HOURS) -> str:
+    return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=hours)).isoformat()
+
+
+def create_pending_action(
+    db_path: Path,
+    *,
+    action: str,
+    payload: Any,
+    requested_by: str,
+    request_id: str = "",
+    ttl_hours: int = PENDING_ACTION_TTL_HOURS,
+) -> int:
+    """Insert a pending action row. Returns the new row id."""
+    ensure_pending_actions_table(db_path)
+    now_iso = _utc_now_iso()
+    expires_iso = _utc_expiry_iso(ttl_hours)
+    payload_json = json.dumps(_sanitize_mutation_payload(payload), ensure_ascii=False, default=str)
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO pending_actions "
+            "(action, payload_json, requested_by, requested_at, status, expires_at, request_id) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (action, payload_json, requested_by or "", now_iso, "pending", expires_iso, request_id or ""),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def load_pending_action(db_path: Path, pending_id: int) -> Dict[str, Any]:
+    """Return pending row as dict or {} if missing."""
+    ensure_pending_actions_table(db_path)
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM pending_actions WHERE id=?", (int(pending_id),)).fetchone()
+    return dict(row) if row else {}
+
+
+def list_pending_actions(db_path: Path, *, status: str = "", limit: int = 200) -> List[Dict[str, Any]]:
+    """List pending actions newest first. Filter by status if non-empty."""
+    ensure_pending_actions_table(db_path)
+    with connect(db_path) as conn:
+        if status:
+            rows = conn.execute(
+                "SELECT id, action, payload_json, requested_by, requested_at, approved_by, approved_at, "
+                "executed_at, status, expires_at, request_id FROM pending_actions WHERE status=? "
+                "ORDER BY id DESC LIMIT ?",
+                (status, int(limit)),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, action, payload_json, requested_by, requested_at, approved_by, approved_at, "
+                "executed_at, status, expires_at, request_id FROM pending_actions "
+                "ORDER BY id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        try:
+            payload = json.loads(d.get("payload_json") or "{}")
+        except Exception:
+            payload = {}
+        d["payload_summary"] = _pending_payload_summary(payload)
+        d.pop("payload_json", None)
+        out.append(d)
+    return out
+
+
+def _pending_payload_summary(payload: Any) -> Dict[str, Any]:
+    """Compact, PII-light view of payload for /api/pending listing."""
+    if not isinstance(payload, dict):
+        return {}
+    summary: Dict[str, Any] = {}
+    for key in ("id", "slip_id", "bot_key", "chat_id", "company_name", "reason", "note"):
+        if key in payload:
+            value = payload.get(key)
+            if isinstance(value, str) and len(value) > 80:
+                value = value[:80] + "..."
+            summary[key] = value
+    return summary
+
+
+def expire_old_pending_actions(db_path: Path) -> int:
+    """Mark pending rows whose expires_at < now as 'expired'. Returns rowcount."""
+    ensure_pending_actions_table(db_path)
+    now_iso = _utc_now_iso()
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE pending_actions SET status='expired' WHERE status='pending' AND expires_at < ?",
+            (now_iso,),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def approve_pending_action(db_path: Path, pending_id: int, approver_fp: str) -> Dict[str, Any]:
+    """Approve a pending action. Rejects self-approval (requester == approver)."""
+    ensure_pending_actions_table(db_path)
+    expire_old_pending_actions(db_path)
+    row = load_pending_action(db_path, pending_id)
+    if not row:
+        return {"ok": False, "error": "pending action not found", "status": 404}
+    if row.get("status") != "pending":
+        return {"ok": False, "error": f"cannot approve status={row.get('status')}", "status": 409}
+    if not approver_fp:
+        return {"ok": False, "error": "approver fingerprint required", "status": 403}
+    if row.get("requested_by") == approver_fp:
+        return {"ok": False, "error": "self-approval not allowed", "status": 403}
+    now_iso = _utc_now_iso()
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE pending_actions SET status='approved', approved_by=?, approved_at=? "
+            "WHERE id=? AND status='pending'",
+            (approver_fp, now_iso, int(pending_id)),
+        )
+        conn.commit()
+    return {"ok": True, "pending_id": int(pending_id), "approved_by": approver_fp, "approved_at": now_iso}
+
+
+def reject_pending_action(db_path: Path, pending_id: int, rejecter_fp: str, reason: str = "") -> Dict[str, Any]:
+    ensure_pending_actions_table(db_path)
+    row = load_pending_action(db_path, pending_id)
+    if not row:
+        return {"ok": False, "error": "pending action not found", "status": 404}
+    if row.get("status") not in {"pending", "approved"}:
+        return {"ok": False, "error": f"cannot reject status={row.get('status')}", "status": 409}
+    now_iso = _utc_now_iso()
+    summary = (reason or "")[:480]
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE pending_actions SET status='rejected', approved_by=?, approved_at=?, executed_result=? "
+            "WHERE id=?",
+            (rejecter_fp or "", now_iso, summary, int(pending_id)),
+        )
+        conn.commit()
+    return {"ok": True, "pending_id": int(pending_id), "rejected_by": rejecter_fp, "reason": summary}
+
+
+def cancel_pending_action(db_path: Path, pending_id: int, requester_fp: str) -> Dict[str, Any]:
+    """Only the original requester may cancel."""
+    ensure_pending_actions_table(db_path)
+    row = load_pending_action(db_path, pending_id)
+    if not row:
+        return {"ok": False, "error": "pending action not found", "status": 404}
+    if row.get("status") not in {"pending", "approved"}:
+        return {"ok": False, "error": f"cannot cancel status={row.get('status')}", "status": 409}
+    if not requester_fp or row.get("requested_by") != requester_fp:
+        return {"ok": False, "error": "only requester may cancel", "status": 403}
+    now_iso = _utc_now_iso()
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE pending_actions SET status='cancelled', executed_at=? WHERE id=?",
+            (now_iso, int(pending_id)),
+        )
+        conn.commit()
+    return {"ok": True, "pending_id": int(pending_id), "cancelled_by": requester_fp}
+
+
+def mark_pending_executed(db_path: Path, pending_id: int, executed_result: str = "") -> None:
+    ensure_pending_actions_table(db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE pending_actions SET status='executed', executed_at=?, executed_result=? WHERE id=?",
+            (_utc_now_iso(), (executed_result or "")[:480], int(pending_id)),
+        )
+        conn.commit()
+
+
+def pending_action_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Parse the stored payload_json of a pending row back into a dict."""
+    if not row:
+        return {}
+    try:
+        data = json.loads(row.get("payload_json") or "{}")
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def openai_bank_double_check_slip(db_path: Path, slip_id: str, apply: bool = True) -> Dict[str, Any]:
     slip_id = clean_display(slip_id)
     if not slip_id:
@@ -4700,6 +4922,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return ""
         return hashlib.sha256(tok.encode("utf-8", "replace")).hexdigest()[:12]
 
+    def parse_approval_param(self) -> str:
+        """Read ?approval=request|execute from URL query (default 'request')."""
+        parsed = urlparse(self.path)
+        q = parse_qs(parsed.query)
+        val = (q.get("approval") or ["request"])[0].strip().lower()
+        return val if val in {"request", "execute"} else "request"
+
     def cookie_attrs(self) -> str:
         attrs = ["HttpOnly", "SameSite=Strict", "Path=/", "Max-Age=86400"]
         if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
@@ -4759,6 +4988,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_bytes(200, render_dashboard_html().encode("utf-8"), "text/html; charset=utf-8")
             return
         if parsed.path == "/api/summary":
+            # Lazy expiry hook (cheap; runs at most once per request).
+            try:
+                expire_old_pending_actions(DB_PATH)
+            except Exception:
+                logger.exception("expire_old_pending_actions failed during /api/summary")
             q = parse_qs(parsed.query)
             chat_id = (q.get("chat_id") or [""])[0]
             bot_key = (q.get("bot_key") or [""])[0]
@@ -4768,6 +5002,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
             slip_search = (q.get("slip_search") or [""])[0]
             account_search_mode = (q.get("account_search_mode") or [""])[0] or "scoped"
             self.send_json(dashboard_snapshot(DB_PATH, chat_id=chat_id, bot_key=bot_key, flow_type=flow_type, scope=scope, slip_filter=slip_filter, slip_search=slip_search, account_search_mode=account_search_mode))
+            return
+        if parsed.path == "/api/pending":
+            try:
+                expire_old_pending_actions(DB_PATH)
+            except Exception:
+                logger.exception("expire_old_pending_actions failed during /api/pending")
+            q = parse_qs(parsed.query)
+            status_filter = (q.get("status") or [""])[0]
+            try:
+                limit = int((q.get("limit") or ["200"])[0])
+            except (TypeError, ValueError):
+                limit = 200
+            rows = list_pending_actions(DB_PATH, status=status_filter, limit=limit)
+            self.send_json({"ok": True, "items": rows, "count": len(rows)})
             return
         if parsed.path == "/api/slip-image":
             q = parse_qs(parsed.query)
@@ -4871,18 +5119,55 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 else:
                     payload = {k: v[0] for k, v in parse_qs(raw).items()}
         if parsed.path == "/api/close":
-            chat_id = str(payload.get("chat_id") or "")
-            bot_key = str(payload.get("bot_key") or "default")
-            company_name = str(payload.get("company_name") or "")
-            note = str(payload.get("note") or "dashboard close")
+            actor_fp = self.actor_fingerprint()
+            approval_mode = self.parse_approval_param()
+            pending_id_executed: int = 0
+            if approval_mode == "request":
+                request_id = uuid.uuid4().hex[:12]
+                pending_id = create_pending_action(
+                    DB_PATH,
+                    action="period.close",
+                    payload=payload,
+                    requested_by=actor_fp,
+                    request_id=request_id,
+                )
+                record_endpoint_mutation(DB_PATH, "close.request", actor=actor_fp, request_id=request_id, chat_id=str(payload.get("chat_id") or ""), bot_key=str(payload.get("bot_key") or "default"), payload=payload, result_status="pending", result_summary=f"pending_id={pending_id}")
+                self.send_json({"ok": True, "status": "pending", "pending_id": pending_id, "request_id": request_id, "expires_in_hours": PENDING_ACTION_TTL_HOURS})
+                return
+            # approval_mode == "execute"
+            try:
+                pending_id_executed = int(payload.get("pending_id") or 0)
+            except (TypeError, ValueError):
+                pending_id_executed = 0
+            if not pending_id_executed:
+                self.send_json({"ok": False, "error": "pending_id required for execute"}, 400)
+                return
+            expire_old_pending_actions(DB_PATH)
+            pending_row = load_pending_action(DB_PATH, pending_id_executed)
+            if not pending_row or pending_row.get("action") != "period.close":
+                self.send_json({"ok": False, "error": "pending action not found"}, 404)
+                return
+            if pending_row.get("status") != "approved":
+                self.send_json({"ok": False, "error": f"not approved (status={pending_row.get('status')})"}, 409)
+                return
+            # Use the originally-requested payload, NOT the new request body, to prevent target swap.
+            stored_payload = pending_action_payload(pending_row)
+            chat_id = str(stored_payload.get("chat_id") or "")
+            bot_key = str(stored_payload.get("bot_key") or "default")
+            company_name = str(stored_payload.get("company_name") or "")
+            note = str(stored_payload.get("note") or "dashboard close")
             try:
                 result = dashboard_close_period(DB_PATH, chat_id, note, bot_key=bot_key, company_name=company_name)
             except Exception as exc:
                 logger.exception("api_close failed")
-                record_mutation(DB_PATH, "close", actor=self.actor_fingerprint(), chat_id=chat_id, bot_key=bot_key, payload=payload, result_status="error", result_summary=safe_error(exc))
-                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+                record_mutation(DB_PATH, "close", actor=actor_fp, chat_id=chat_id, bot_key=bot_key, payload=stored_payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "pending_id": pending_id_executed}, 400)
                 return
-            record_mutation(DB_PATH, "close", actor=self.actor_fingerprint(), chat_id=chat_id, bot_key=bot_key, payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("settlement_id") or result.get("error") or ""))
+            record_mutation(DB_PATH, "close", actor=actor_fp, chat_id=chat_id, bot_key=bot_key, payload=stored_payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("settlement_id") or result.get("error") or ""))
+            if result.get("ok"):
+                mark_pending_executed(DB_PATH, pending_id_executed, executed_result=str(result.get("settlement_id") or ""))
+            if isinstance(result, dict):
+                result["pending_id"] = pending_id_executed
             self.send_json(result, 200 if result.get("ok") else 400)
             return
         if parsed.path == "/api/account-limit":
@@ -4945,24 +5230,59 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json(result, 200 if result.get("ok") else 400)
             return
         if parsed.path == "/api/slip/delete":
-            request_id = uuid.uuid4().hex[:12]
-            slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
-            bot_key_in = str(payload.get("bot_key") or "")
+            actor_fp = self.actor_fingerprint()
+            approval_mode = self.parse_approval_param()
+            if approval_mode == "request":
+                request_id = uuid.uuid4().hex[:12]
+                pending_id = create_pending_action(
+                    DB_PATH,
+                    action="slip.delete",
+                    payload=payload,
+                    requested_by=actor_fp,
+                    request_id=request_id,
+                )
+                slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
+                record_endpoint_mutation(DB_PATH, "delete.request", actor=actor_fp, request_id=request_id, bot_key=str(payload.get("bot_key") or ""), slip_id=slip_id_in, payload=payload, result_status="pending", result_summary=f"pending_id={pending_id}")
+                self.send_json({"ok": True, "status": "pending", "pending_id": pending_id, "request_id": request_id, "expires_in_hours": PENDING_ACTION_TTL_HOURS})
+                return
+            # approval_mode == "execute"
+            try:
+                pending_id_executed = int(payload.get("pending_id") or 0)
+            except (TypeError, ValueError):
+                pending_id_executed = 0
+            if not pending_id_executed:
+                self.send_json({"ok": False, "error": "pending_id required for execute"}, 400)
+                return
+            expire_old_pending_actions(DB_PATH)
+            pending_row = load_pending_action(DB_PATH, pending_id_executed)
+            if not pending_row or pending_row.get("action") != "slip.delete":
+                self.send_json({"ok": False, "error": "pending action not found"}, 404)
+                return
+            if pending_row.get("status") != "approved":
+                self.send_json({"ok": False, "error": f"not approved (status={pending_row.get('status')})"}, 409)
+                return
+            stored_payload = pending_action_payload(pending_row)
+            request_id = str(pending_row.get("request_id") or uuid.uuid4().hex[:12])
+            slip_id_in = str(stored_payload.get("id") or stored_payload.get("slip_id") or "")
+            bot_key_in = str(stored_payload.get("bot_key") or "")
             try:
                 result = delete_dashboard_slip(
                     DB_PATH,
                     slip_id_in,
                     bot_key_in,
-                    str(payload.get("reason") or "dashboard operator delete"),
+                    str(stored_payload.get("reason") or "dashboard operator delete"),
                 )
             except Exception as exc:
                 logger.exception("api_slip_delete failed")
-                record_endpoint_mutation(DB_PATH, "delete", actor=self.actor_fingerprint(), request_id=request_id, bot_key=bot_key_in, slip_id=slip_id_in, payload=payload, result_status="error", result_summary=safe_error(exc))
-                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
+                record_endpoint_mutation(DB_PATH, "delete", actor=actor_fp, request_id=request_id, bot_key=bot_key_in, slip_id=slip_id_in, payload=stored_payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id, "pending_id": pending_id_executed}, 400)
                 return
-            record_endpoint_mutation(DB_PATH, "delete", actor=self.actor_fingerprint(), request_id=request_id, bot_key=bot_key_in, slip_id=slip_id_in, chat_id=str(result.get("chat_id") or ""), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("previous_status") or result.get("error") or ""))
+            record_endpoint_mutation(DB_PATH, "delete", actor=actor_fp, request_id=request_id, bot_key=bot_key_in, slip_id=slip_id_in, chat_id=str(result.get("chat_id") or ""), payload=stored_payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("previous_status") or result.get("error") or ""))
+            if result.get("ok"):
+                mark_pending_executed(DB_PATH, pending_id_executed, executed_result=str(result.get("previous_status") or ""))
             if isinstance(result, dict):
                 result["request_id"] = request_id
+                result["pending_id"] = pending_id_executed
             self.send_json(result, 200 if result.get("ok") else 400)
             return
         if parsed.path == "/api/slip/reprocess":
@@ -5045,6 +5365,49 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 logger.exception("api_reconcile failed")
                 record_endpoint_mutation(DB_PATH, "reconcile", actor=self.actor_fingerprint(), request_id=request_id, payload=payload, result_status="error", result_summary=safe_error(exc))
                 self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
+            return
+        if parsed.path == "/api/pending/approve":
+            actor_fp = self.actor_fingerprint()
+            try:
+                pending_id = int(payload.get("pending_id") or 0)
+            except (TypeError, ValueError):
+                pending_id = 0
+            if not pending_id:
+                self.send_json({"ok": False, "error": "pending_id required"}, 400)
+                return
+            result = approve_pending_action(DB_PATH, pending_id, actor_fp)
+            status_code = int(result.pop("status", 200)) if not result.get("ok") else 200
+            record_endpoint_mutation(DB_PATH, "pending.approve", actor=actor_fp, request_id=str(pending_id), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("error") or result.get("approved_at") or ""))
+            self.send_json(result, status_code)
+            return
+        if parsed.path == "/api/pending/reject":
+            actor_fp = self.actor_fingerprint()
+            try:
+                pending_id = int(payload.get("pending_id") or 0)
+            except (TypeError, ValueError):
+                pending_id = 0
+            if not pending_id:
+                self.send_json({"ok": False, "error": "pending_id required"}, 400)
+                return
+            reason = str(payload.get("reason") or "")
+            result = reject_pending_action(DB_PATH, pending_id, actor_fp, reason)
+            status_code = int(result.pop("status", 200)) if not result.get("ok") else 200
+            record_endpoint_mutation(DB_PATH, "pending.reject", actor=actor_fp, request_id=str(pending_id), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("error") or result.get("reason") or ""))
+            self.send_json(result, status_code)
+            return
+        if parsed.path == "/api/pending/cancel":
+            actor_fp = self.actor_fingerprint()
+            try:
+                pending_id = int(payload.get("pending_id") or 0)
+            except (TypeError, ValueError):
+                pending_id = 0
+            if not pending_id:
+                self.send_json({"ok": False, "error": "pending_id required"}, 400)
+                return
+            result = cancel_pending_action(DB_PATH, pending_id, actor_fp)
+            status_code = int(result.pop("status", 200)) if not result.get("ok") else 200
+            record_endpoint_mutation(DB_PATH, "pending.cancel", actor=actor_fp, request_id=str(pending_id), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("error") or ""))
+            self.send_json(result, status_code)
             return
         self.send_json({"ok": False, "error": "not found"}, 404)
 
