@@ -1,0 +1,4709 @@
+#!/usr/bin/env python3
+"""Auditslip lightweight VPS dashboard.
+
+Serves a token-protected dashboard for accounting totals, OCR queue health,
+recent slips, and Excel exports.
+"""
+from __future__ import annotations
+
+import warnings
+
+warnings.filterwarnings("ignore", "'cgi' is deprecated", DeprecationWarning)
+import cgi
+import datetime as dt
+import hashlib
+import json
+import mimetypes
+import os
+import re
+import sqlite3
+import sys
+import tempfile
+import time
+import zipfile
+from copy import copy
+
+import requests
+from openpyxl import Workbook
+from collections import defaultdict
+from difflib import SequenceMatcher
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+from urllib.parse import parse_qs, urlencode, urlparse
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from auditslip_bot import (
+    APP_NAME,
+    DATA_DIR,
+    DB_PATH,
+    EXPORT_DIR,
+    TELEGRAM_API,
+    AuditslipBot,
+    fmt_money,
+    h,
+    normalize_date_parts,
+    normalize_record,
+    ocr_extract,
+    openai_extract,
+    parse_number,
+    scope_to_date,
+    telegram_bot_configs,
+    unclear_reason,
+)
+
+HOST = os.environ.get("AUDITSLIP_DASHBOARD_HOST", "0.0.0.0")
+PORT = int(os.environ.get("AUDITSLIP_DASHBOARD_PORT", "8095"))
+DASHBOARD_TOKEN = os.environ.get("AUDITSLIP_DASHBOARD_TOKEN", "")
+COOKIE_NAME = "auditslip_dashboard_token"
+
+
+def connect(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def rows_to_dicts(rows: List[sqlite3.Row]) -> List[Dict[str, Any]]:
+    return [dict(r) for r in rows]
+
+
+def aggregate_dicts(rows: Any) -> List[Dict[str, Any]]:
+    if rows and isinstance(rows[0], sqlite3.Row):
+        return rows_to_dicts(rows)
+    return list(rows or [])
+
+
+def clean_display(value: Any) -> str:
+    return " ".join(str(value or "").strip().split())
+
+
+def clean_company_name(value: Any, bot_key: Any = "") -> str:
+    """Operator-facing company name: remove noisy suffixes such as Audit."""
+    text = clean_display(value)
+    text = re.sub(r"(?i)\baudit\b", "", text)
+    text = clean_display(text).strip(" -_/|")
+    return text or clean_display(bot_key)
+
+
+def company_number(value: Any, bot_key: Any = "") -> int:
+    text = clean_display(f"{value} {bot_key}")
+    for pattern in [r"บริษัท\s*0*(\d+)", r"company\s*0*(\d+)", r"bot\s*0*(\d+)"]:
+        match = re.search(pattern, text, flags=re.I)
+        if match:
+            return int(match.group(1))
+    match = re.search(r"(?<!\d)0*([1-9]\d?)(?!\d)", text)
+    return int(match.group(1)) if match else 999999
+
+
+def company_sort_key(value: Any, bot_key: Any = "") -> Tuple[int, int, str, str]:
+    name = clean_company_name(value, bot_key)
+    number = company_number(name, bot_key)
+    return (0 if number != 999999 else 1, number, name.lower(), clean_display(bot_key).lower())
+
+
+def dict_company_sort_key(row: Dict[str, Any]) -> Tuple[int, int, str, str]:
+    return company_sort_key(row.get("company_name") or row.get("bot_key"), row.get("bot_key"))
+
+
+def clean_company_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    row["bot_key"] = clean_display(row.get("bot_key")) or "default"
+    row["company_name"] = clean_company_name(row.get("company_name"), row.get("bot_key"))
+    return row
+
+
+BANK_ALIASES = {
+    "KRUNGTHAI": {"krungthai", "krungthaibank", "ktb", "ktbnext", "กรุงไทย", "ธกรุงไทย", "ธนาคารกรุงไทย"},
+    "KBANK": {"kbank", "kasikorn", "kasikornbank", "kasikornthai", "กสิกร", "กสิกรไทย", "ธกสิกรไทย", "ธนาคารกสิกรไทย"},
+    "SCB": {"scb", "scbeasy", "siamcommercialbank", "siamcommercial", "ไทยพาณิชย์", "ธไทยพาณิชย์", "ธนาคารไทยพาณิชย์"},
+    "BANGKOK BANK": {"bangkokbank", "bangkok", "bbl", "bualuang", "กรุงเทพ", "ธกรุงเทพ", "ธนาคารกรุงเทพ"},
+    "GSB": {"gsb", "governmentsavingsbank", "governmentsavings", "ออมสิน", "ธออมสิน", "ธนาคารออมสิน"},
+    "TTB": {"ttb", "tmb", "tmbthanachart", "ttbtmbthanachart", "ทีเอ็มบีธนชาต", "ทหารไทยธนชาต"},
+    "BAAC": {"baac", "ธกส", "ธกสธนาคารเพื่อการเกษตรและสหกรณ์การเกษตร", "เพื่อการเกษตร"},
+    "KRUNGSRI": {"krungsri", "bay", "bankofayudhya", "กรุงศรี", "อยุธยา", "กรุงศรีอยุธยา", "ธกรุงศรี", "ธนาคารกรุงศรี"},
+    "KKP": {"kkp", "kiatnakinphatra", "เกียรตินาคินภัทร", "เกียรตินาคิน"},
+    "UOB": {"uob", "uobtmrw", "ยูโอบี", "ธยูโอบี", "ธนาคารยูโอบี"},
+    "CIMB": {"cimb", "cimbthai", "ซีไอเอ็มบี", "ซีไอเอ็มบีไทย", "ธนาคารซีไอเอ็มบีไทย"},
+    "LH BANK": {"lhbank", "landandhouse", "landandhouses", "แลนด์แอนด์เฮ้าส์", "ธนาคารแลนด์แอนด์เฮ้าส์"},
+    "GHB": {"ghb", "governmenthousingbank", "ธอส", "อาคารสงเคราะห์", "ธนาคารอาคารสงเคราะห์"},
+    "THAI CREDIT": {"thaicredit", "ไทยเครดิต", "ธนาคารไทยเครดิต"},
+    "TISCO": {"tisco", "ทิสโก้", "ทิสโก", "ธนาคารทิสโก้"},
+    "ICBC": {"icbc", "icbcthai", "ไอซีบีซี", "ธนาคารไอซีบีซี"},
+    "STANDARD CHARTERED": {"standardchartered", "standardcharteredbank", "สแตนดาร์ดชาร์เตอร์ด"},
+}
+
+BANK_LIMITS = {
+    "SCB": 200000.0,
+    "KRUNGTHAI": 50000.0,
+}
+
+
+MISSING_BANK_VALUES = {"", "unknown", "unknownbank", "n/a", "na", "none", "null", "-", "ไม่ทราบ", "xxx", "xxxx", "xxxbank", "masked"}
+
+
+def bank_key(value: Any) -> str:
+    return re.sub(r"[\s\*\u200b\u200c\u200d.\-_/|(),]+", "", clean_display(value).lower())
+
+
+def bank_needs_review(value: Any) -> bool:
+    text = clean_display(value)
+    key = bank_key(text)
+    return (not key) or key in MISSING_BANK_VALUES or bool(re.fullmatch(r"x+(?:bank)?", key, flags=re.I)) or "ไม่ทราบ" in text
+
+
+def display_bank(value: Any) -> str:
+    bank = clean_display(value)
+    key = bank_key(bank)
+    if bank_needs_review(bank):
+        return ""
+    for canonical, aliases in BANK_ALIASES.items():
+        normalized_aliases = {bank_key(alias) for alias in aliases}
+        if key in normalized_aliases or any(alias and ((len(alias) >= 3 and key.startswith(alias)) or (len(alias) >= 4 and alias in key)) for alias in normalized_aliases):
+            return canonical
+    return bank.upper() if re.fullmatch(r"[A-Za-z0-9 ._-]+", bank) else bank
+
+
+def bank_limit_amount(value: Any) -> float:
+    return float(BANK_LIMITS.get(display_bank(value), 0.0))
+
+
+def is_known_bank(value: Any) -> bool:
+    return display_bank(value) in BANK_ALIASES
+
+
+def limit_check_enabled_for_flow(flow_type: str) -> bool:
+    return normalize_flow_type(flow_type) != "deposit"
+
+
+def limit_key_for(bank: Any, account: Any, name_key: str) -> str:
+    bank_part = bank_key(display_bank(bank)) or "unknown-bank"
+    account_part = bank_key(account) or name_key or "unknown-account"
+    return f"{bank_part}|{account_part}"
+
+
+def ensure_account_limit_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS account_limits (
+          chat_id TEXT NOT NULL,
+          limit_key TEXT NOT NULL,
+          display_name TEXT,
+          bank TEXT,
+          account TEXT,
+          limit_amount REAL DEFAULT 0,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY(chat_id, limit_key)
+        )
+        """
+    )
+
+
+def load_account_limits(conn: sqlite3.Connection, chat_id: str) -> Dict[str, Dict[str, Any]]:
+    ensure_account_limit_table(conn)
+    rows = conn.execute("SELECT * FROM account_limits WHERE chat_id=?", (str(chat_id),)).fetchall()
+    return {str(r["limit_key"]): dict(r) for r in rows}
+
+
+def save_account_limit(db_path: Path, chat_id: str, limit_key: str, display_name: str, bank: str, account: str, limit_amount: float) -> Dict[str, Any]:
+    with connect(db_path) as conn:
+        ensure_account_limit_table(conn)
+        conn.execute(
+            """
+            INSERT INTO account_limits(chat_id, limit_key, display_name, bank, account, limit_amount, updated_at)
+            VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(chat_id, limit_key) DO UPDATE SET
+              display_name=excluded.display_name,
+              bank=excluded.bank,
+              account=excluded.account,
+              limit_amount=excluded.limit_amount,
+              updated_at=excluded.updated_at
+            """,
+            (str(chat_id), str(limit_key), clean_display(display_name), display_bank(bank), clean_display(account), float(limit_amount or 0), int(time.time())),
+        )
+        conn.commit()
+    return {"ok": True, "chat_id": str(chat_id), "limit_key": str(limit_key), "limit_amount": float(limit_amount or 0)}
+
+
+def account_key_for(company_name: Any, bank: Any, account_no: Any, account_name: Any) -> str:
+    raw = "|".join([clean_display(company_name), display_bank(bank), bank_key(account_no), clean_display(account_name)])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def ensure_company_account_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS company_accounts (
+          bot_key TEXT NOT NULL DEFAULT 'default',
+          chat_id TEXT NOT NULL,
+          account_key TEXT NOT NULL,
+          company_name TEXT NOT NULL,
+          bank TEXT,
+          account_no TEXT,
+          account_name TEXT,
+          daily_limit REAL DEFAULT 0,
+          active INTEGER DEFAULT 1,
+          updated_at INTEGER NOT NULL,
+          PRIMARY KEY(bot_key, chat_id, account_key)
+        )
+        """
+    )
+
+
+def save_company_account(
+    db_path: Path,
+    bot_key: str,
+    chat_id: str,
+    company_name: str,
+    bank: str,
+    account_no: str,
+    account_name: str,
+    daily_limit: float = 0.0,
+) -> Dict[str, Any]:
+    bot_key = clean_display(bot_key) or "default"
+    chat_id = str(chat_id or "")
+    company_name = clean_company_name(company_name, bot_key) or bot_key
+    bank = display_bank(bank)
+    account_no = clean_display(account_no)
+    account_name = clean_display(account_name)
+    account_key = account_key_for(company_name, bank, account_no, account_name)
+    with connect(db_path) as conn:
+        ensure_company_account_table(conn)
+        conn.execute(
+            """
+            INSERT INTO company_accounts(bot_key, chat_id, account_key, company_name, bank, account_no, account_name, daily_limit, active, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,1,?)
+            ON CONFLICT(bot_key, chat_id, account_key) DO UPDATE SET
+              company_name=excluded.company_name,
+              bank=excluded.bank,
+              account_no=excluded.account_no,
+              account_name=excluded.account_name,
+              daily_limit=excluded.daily_limit,
+              active=1,
+              updated_at=excluded.updated_at
+            """,
+            (bot_key, chat_id, account_key, company_name, bank, account_no, account_name, float(daily_limit or 0), int(time.time())),
+        )
+        conn.commit()
+    return {
+        "ok": True,
+        "bot_key": bot_key,
+        "chat_id": chat_id,
+        "account_key": account_key,
+        "company_name": company_name,
+        "bank": bank,
+        "account_no": account_no,
+        "account_name": account_name,
+        "daily_limit": float(daily_limit or 0),
+    }
+
+
+def load_company_accounts(conn: sqlite3.Connection, bot_key: str, chat_id: str) -> List[Dict[str, Any]]:
+    ensure_company_account_table(conn)
+    rows = conn.execute(
+        """
+        SELECT * FROM company_accounts
+        WHERE bot_key=? AND chat_id=? AND COALESCE(active,1)=1
+        ORDER BY company_name ASC, bank ASC, account_no ASC
+        """,
+        (clean_display(bot_key) or "default", str(chat_id or "")),
+    ).fetchall()
+    out = [clean_company_fields(dict(r)) for r in rows]
+    return sorted(out, key=lambda r: (*dict_company_sort_key(r), clean_display(r.get("bank")), clean_display(r.get("account_no"))))
+
+
+def public_telegram_bots() -> List[Dict[str, Any]]:
+    rows = [
+        {
+            "bot_key": clean_display(cfg.get("bot_key", "default")) or "default",
+            "company_name": clean_company_name(cfg.get("company_name", ""), cfg.get("bot_key", "default")),
+            "token_env": cfg.get("token_env", ""),
+            "has_token": bool(cfg.get("token")),
+        }
+        for cfg in telegram_bot_configs()
+    ]
+    return sorted(rows, key=dict_company_sort_key)
+
+
+def token_for_bot(bot_key: str) -> str:
+    bot_key = clean_display(bot_key) or "default"
+    for cfg in telegram_bot_configs():
+        if cfg.get("bot_key") == bot_key:
+            return cfg.get("token", "")
+    return ""
+
+
+def fetch_slip_image(db_path: Path, slip_id: str) -> Tuple[bytes, str]:
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT id, bot_key, file_id FROM slips WHERE id=?", (slip_id,)).fetchone()
+    if not row or not row["file_id"]:
+        raise FileNotFoundError("slip image not found")
+    bot_key = clean_display(row["bot_key"]) or "default"
+    file_id = clean_display(row["file_id"])
+    token = token_for_bot(bot_key)
+    if not token:
+        raise FileNotFoundError("bot token not configured for this slip")
+    cache_dir = DATA_DIR / "slip-images"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_key = hashlib.sha256(f"{bot_key}|{file_id}".encode("utf-8")).hexdigest()
+    cached = sorted(cache_dir.glob(cache_key + ".*"))
+    if cached:
+        body = cached[0].read_bytes()
+        mime = mimetypes.guess_type(str(cached[0]))[0] or "image/jpeg"
+        return body, mime
+    meta = requests.get(f"{TELEGRAM_API}/bot{token}/getFile", params={"file_id": file_id}, timeout=30)
+    meta.raise_for_status()
+    obj = meta.json()
+    file_path = obj.get("result", {}).get("file_path")
+    if not file_path:
+        raise FileNotFoundError("Telegram getFile did not return file_path")
+    image = requests.get(f"{TELEGRAM_API}/file/bot{token}/{file_path}", timeout=90)
+    image.raise_for_status()
+    suffix = Path(file_path).suffix or ".jpg"
+    out = cache_dir / f"{cache_key}{suffix}"
+    out.write_bytes(image.content)
+    mime = mimetypes.guess_type(str(out))[0] or "image/jpeg"
+    return image.content, mime
+
+
+def display_transferor_name(value: Any) -> str:
+    text = clean_display(value)
+    text = re.sub(r"^(นาย|นางสาว|นาง|น\.ส\.|MR\.?|MRS\.?|MS\.?|MISS)\s+", "", text, flags=re.I)
+    text = re.sub(r"\s*\*\s*", "*", text)
+    text = re.sub(r"\s+([.,])", r"\1", text)
+    return clean_display(text).strip(" -_/|")
+
+
+def transferor_key(value: Any) -> str:
+    text = display_transferor_name(value).lower()
+    text = re.sub(r"[\s\*\u200b\u200c\u200d.\-_/|()]+", "", text)
+    return text
+
+
+def names_similar(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    if min(len(a), len(b)) < 4:
+        return False
+    ratio = SequenceMatcher(None, a, b).ratio()
+    return ratio >= (0.78 if min(len(a), len(b)) <= 8 else 0.84)
+
+
+def banks_compatible(a: Any, b: Any) -> bool:
+    """Merge the same account when OCR missed one side's bank, but not across two known different banks."""
+    left = display_bank(a)
+    right = display_bank(b)
+    return (not left) or (not right) or bank_key(left) == bank_key(right)
+
+
+def transferor_totals(conn: sqlite3.Connection, where_clause: str, params: List[Any], account_limits: Dict[str, Dict[str, Any]] | None = None, limit: int = 50) -> List[Dict[str, Any]]:
+    account_limits = account_limits or {}
+    rows = conn.execute(
+        f"""
+        SELECT COALESCE(NULLIF(transferor_name,''), NULLIF(sender_name,''), '(ไม่ทราบชื่อผู้โอน)') AS raw_name,
+               COALESCE(NULLIF(company_name,''), NULLIF(bot_key,''), '') AS company_name,
+               COALESCE(NULLIF(bot_key,''),'default') AS bot_key,
+               COALESCE(NULLIF(from_bank,''), NULLIF(issuer_bank,''), '') AS bank,
+               COALESCE(NULLIF(from_account,''), '') AS account,
+               slip_date_display,
+               slip_date_iso,
+               COUNT(*) AS count,
+               COALESCE(SUM(amount),0) AS amount,
+               COALESCE(SUM(fee),0) AS fee
+        FROM slips
+        WHERE {where_clause}
+        GROUP BY bot_key, company_name, raw_name, bank, account, slip_date_display, slip_date_iso
+        ORDER BY amount DESC, count DESC, raw_name ASC
+        """,
+        params,
+    ).fetchall()
+    groups: List[Dict[str, Any]] = []
+    for row in rows:
+        display_name = display_transferor_name(row["raw_name"]) or "(ไม่ทราบชื่อผู้โอน)"
+        bot_key = clean_display(row["bot_key"]) or "default"
+        company_name = clean_company_name(row["company_name"], bot_key)
+        bank = display_bank(row["bank"])
+        account = clean_display(row["account"])
+        key = transferor_key(display_name)
+        account_key = bank_key(account)
+        date_key, date_label, sort_date = date_bucket(row["slip_date_display"], row["slip_date_iso"])
+        target = None
+        for group in groups:
+            if group["bot_key"] != bot_key or group["company_name"] != company_name:
+                continue
+            if account_key or group["account_key"]:
+                if account_key and account_key == group["account_key"] and banks_compatible(bank, group["bank"]):
+                    target = group
+                    break
+            elif banks_compatible(bank, group["bank"]) and (key == group["key"] or names_similar(key, group["key"])):
+                target = group
+                break
+        if target is None:
+            row_limit_key = limit_key_for(bank, account, key)
+            target = {
+                "display_name": display_name,
+                "company_name": company_name,
+                "bot_key": bot_key,
+                "key": key,
+                "bank": bank,
+                "account": account,
+                "account_key": account_key,
+                "limit_key": row_limit_key,
+                "count": 0,
+                "amount": 0.0,
+                "fee": 0.0,
+                "daily_buckets": {},
+                "aliases": [],
+            }
+            groups.append(target)
+        row_count = int(row["count"] or 0)
+        row_amount = float(row["amount"] or 0)
+        row_fee = float(row["fee"] or 0)
+        target["count"] += row_count
+        target["amount"] += row_amount
+        target["fee"] += row_fee
+        day = target["daily_buckets"].setdefault(
+            date_key,
+            {"date_key": date_key, "date": date_label, "sort_date": sort_date, "count": 0, "amount": 0.0, "fee": 0.0},
+        )
+        day["count"] += row_count
+        day["amount"] += row_amount
+        day["fee"] += row_fee
+        if bank and not target["bank"]:
+            target["bank"] = bank
+            target["limit_key"] = limit_key_for(bank, target["account"], target["key"])
+        if display_name not in target["aliases"]:
+            target["aliases"].append(display_name)
+    out = []
+    for group in sorted(groups, key=lambda g: (-g["amount"], -g["count"], g["display_name"]))[:limit]:
+        name = f"{group['display_name']} ({group['bank']})" if group["bank"] else group["display_name"]
+        limit_row = account_limits.get(group["limit_key"], {})
+        raw_limit = limit_row.get("limit_amount") if limit_row else bank_limit_amount(group["bank"])
+        limit_amount = float(raw_limit or 0)
+        daily_rows = sorted(
+            group.get("daily_buckets", {}).values(),
+            key=lambda d: (str(d.get("sort_date") or ""), float(d.get("amount") or 0)),
+            reverse=True,
+        )
+        peak_day = max(daily_rows, key=lambda d: float(d.get("amount") or 0), default={})
+        peak_daily_amount = float(peak_day.get("amount") or 0)
+        peak_daily_count = int(peak_day.get("count") or 0)
+        remaining = limit_amount - peak_daily_amount if limit_amount else 0.0
+        out.append(
+            {
+                "name": name,
+                "display_name": group["display_name"],
+                "company_name": group.get("company_name", ""),
+                "bot_key": group.get("bot_key", "default"),
+                "bank": group["bank"],
+                "account": group["account"],
+                "limit_key": group["limit_key"],
+                "limit_amount": limit_amount,
+                "remaining_amount": remaining,
+                "daily_remaining_amount": remaining,
+                "over_limit": bool(limit_amount and peak_daily_amount > limit_amount),
+                "daily_over_limit": bool(limit_amount and peak_daily_amount > limit_amount),
+                "peak_daily_amount": peak_daily_amount,
+                "peak_daily_count": peak_daily_count,
+                "peak_daily_date": peak_day.get("date") or peak_day.get("date_key") or "",
+                "count": group["count"],
+                "amount": group["amount"],
+                "range_amount": group["amount"],
+                "fee": group["fee"],
+                "daily_buckets": daily_rows,
+                "aliases": group["aliases"],
+            }
+        )
+    return out
+
+
+def daily_account_totals(conn: sqlite3.Connection, where_clause: str, params: List[Any], account_limits: Dict[str, Dict[str, Any]] | None = None, limit: int = 120) -> List[Dict[str, Any]]:
+    """Summarize counted slip usage per day and transferor account."""
+    account_limits = account_limits or {}
+    rows = conn.execute(
+        f"""
+        SELECT COALESCE(NULLIF(transferor_name,''), NULLIF(sender_name,''), '(ไม่ทราบชื่อผู้โอน)') AS raw_name,
+               COALESCE(NULLIF(company_name,''), NULLIF(bot_key,''), '') AS company_name,
+               COALESCE(NULLIF(bot_key,''),'default') AS bot_key,
+               COALESCE(NULLIF(from_bank,''), NULLIF(issuer_bank,''), '') AS bank,
+               COALESCE(NULLIF(from_account,''), '') AS account,
+               slip_date_display,
+               slip_date_iso,
+               COUNT(*) AS count,
+               COALESCE(SUM(amount),0) AS amount,
+               COALESCE(SUM(fee),0) AS fee
+        FROM slips
+        WHERE {where_clause}
+          AND NULLIF(TRIM(COALESCE(from_account,'')), '') IS NOT NULL
+        GROUP BY bot_key, company_name, raw_name, bank, account, slip_date_display, slip_date_iso
+        ORDER BY COALESCE(NULLIF(slip_date_iso,''), slip_date_display) DESC, amount DESC, raw_name ASC
+        """,
+        params,
+    ).fetchall()
+    groups: List[Dict[str, Any]] = []
+    for row in rows:
+        display_name = display_transferor_name(row["raw_name"]) or "(ไม่ทราบชื่อผู้โอน)"
+        bot_key = clean_display(row["bot_key"]) or "default"
+        company_name = clean_company_name(row["company_name"], bot_key)
+        bank = display_bank(row["bank"])
+        account = clean_display(row["account"])
+        date_key, date_label, sort_date = date_bucket(row["slip_date_display"], row["slip_date_iso"])
+        name_key = transferor_key(display_name)
+        account_key = bank_key(account)
+        target = None
+        for group in groups:
+            if group["date_key"] != date_key or group["bot_key"] != bot_key or group["company_name"] != company_name:
+                continue
+            if account_key or group["account_key"]:
+                if account_key and account_key == group["account_key"] and banks_compatible(bank, group["bank"]):
+                    target = group
+                    break
+            elif banks_compatible(bank, group["bank"]) and (name_key == group["name_key"] or names_similar(name_key, group["name_key"])):
+                target = group
+                break
+        if target is None:
+            target = {
+                "date_key": date_key,
+                "date": date_label,
+                "sort_date": sort_date,
+                "display_name": display_name,
+                "company_name": company_name,
+                "bot_key": bot_key,
+                "name_key": name_key,
+                "bank": bank,
+                "account": account,
+                "account_key": account_key,
+                "limit_key": limit_key_for(bank, account, name_key),
+                "count": 0,
+                "amount": 0.0,
+                "fee": 0.0,
+                "aliases": [],
+            }
+            groups.append(target)
+        target["count"] += int(row["count"] or 0)
+        target["amount"] += float(row["amount"] or 0)
+        target["fee"] += float(row["fee"] or 0)
+        if bank and not target["bank"]:
+            target["bank"] = bank
+            target["limit_key"] = limit_key_for(bank, target["account"], target["name_key"])
+        if display_name not in target["aliases"]:
+            target["aliases"].append(display_name)
+    out: List[Dict[str, Any]] = []
+    sorted_groups = sorted(groups, key=lambda g: str(g["display_name"]))
+    sorted_groups = sorted(sorted_groups, key=lambda g: float(g["amount"] or 0), reverse=True)
+    sorted_groups = sorted(sorted_groups, key=dict_company_sort_key)
+    sorted_groups = sorted(sorted_groups, key=lambda g: str(g["sort_date"] or ""), reverse=True)
+    for group in sorted_groups[:limit]:
+        limit_row = account_limits.get(group["limit_key"], {})
+        raw_limit = limit_row.get("limit_amount") if limit_row else bank_limit_amount(group["bank"])
+        daily_limit = float(raw_limit or 0)
+        amount = float(group["amount"] or 0)
+        remaining = daily_limit - amount if daily_limit else 0.0
+        name = f"{group['display_name']} ({group['bank']})" if group["bank"] else group["display_name"]
+        out.append(
+            {
+                "date_key": group["date_key"],
+                "date": group["date"],
+                "name": name,
+                "display_name": group["display_name"],
+                "company_name": group.get("company_name", ""),
+                "bot_key": group.get("bot_key", "default"),
+                "bank": group["bank"],
+                "account": group["account"],
+                "limit_key": group["limit_key"],
+                "daily_limit": daily_limit,
+                "limit_amount": daily_limit,
+                "remaining_amount": remaining,
+                "over_limit": bool(daily_limit and amount > daily_limit),
+                "count": int(group["count"] or 0),
+                "amount": amount,
+                "fee": float(group["fee"] or 0),
+                "aliases": group["aliases"],
+            }
+        )
+    return out
+
+
+def company_account_row_identity(row: sqlite3.Row) -> Tuple[str, str, str, str]:
+    flow = flow_type_for_title(row["chat_title"], row["bot_key"], row["chat_id"])
+    if flow == "deposit":
+        return clean_display(row["to_account"]), display_bank(row["to_bank"]), "บัญชีรับเงิน/ปลายทาง", flow
+    if flow == "withdraw":
+        return clean_display(row["from_account"]), display_bank(row["from_bank"]), "บัญชีผู้โอน/ต้นทาง", flow
+    account = clean_display(row["to_account"] or row["from_account"])
+    bank = display_bank(row["to_bank"] or row["from_bank"])
+    return account, bank, "บัญชีจากสลิป", flow
+
+
+def company_account_daily_totals(conn: sqlite3.Connection, where_clause: str, params: List[Any], search: str = "", limit: int = 300) -> List[Dict[str, Any]]:
+    """Daily account rows grouped by company, account, date, and flow."""
+    search_clause, search_params = slip_search_clause("slips", search)
+    rows = conn.execute(
+        f"""
+        SELECT COALESCE(NULLIF(bot_key,''),'default') AS bot_key,
+               COALESCE(NULLIF(company_name,''), COALESCE(NULLIF(bot_key,''),'default')) AS company_name,
+               chat_id, chat_title, slip_date_display, slip_date_iso,
+               from_bank, from_account, to_bank, to_account,
+               COUNT(*) AS count,
+               COALESCE(SUM(amount),0) AS amount,
+               COALESCE(SUM(fee),0) AS fee
+        FROM slips
+        WHERE {where_clause}
+          AND (NULLIF(TRIM(COALESCE(from_account,'')), '') IS NOT NULL OR NULLIF(TRIM(COALESCE(to_account,'')), '') IS NOT NULL)
+          {search_clause}
+        GROUP BY bot_key, company_name, chat_id, chat_title, slip_date_display, slip_date_iso, from_bank, from_account, to_bank, to_account
+        """,
+        [*params, *search_params],
+    ).fetchall()
+    groups: Dict[Tuple[str, str, str, str, str, str], Dict[str, Any]] = {}
+    for row in rows:
+        bot_key = clean_display(row["bot_key"]) or "default"
+        company_name = clean_company_name(row["company_name"], bot_key)
+        account, bank, account_role, flow = company_account_row_identity(row)
+        if not account:
+            continue
+        date_key, date_label, sort_date = date_bucket(row["slip_date_display"], row["slip_date_iso"])
+        key = (bot_key, flow, date_key, bank_key(bank), bank_key(account), account_role)
+        group = groups.setdefault(
+            key,
+            {
+                "bot_key": bot_key,
+                "company_name": company_name,
+                "flow_type": flow,
+                "flow_label": flow_label(flow),
+                "date_key": date_key,
+                "date": date_label,
+                "sort_date": sort_date,
+                "bank": bank,
+                "account": account,
+                "account_role": account_role,
+                "count": 0,
+                "amount": 0.0,
+                "fee": 0.0,
+                "chat_titles": [],
+            },
+        )
+        group["count"] += int(row["count"] or 0)
+        group["amount"] += float(row["amount"] or 0)
+        group["fee"] += float(row["fee"] or 0)
+        title = clean_display(row["chat_title"])
+        if title and title not in group["chat_titles"]:
+            group["chat_titles"].append(title)
+    out = list(groups.values())
+    out.sort(key=lambda r: (clean_display(r.get("account")), FLOW_TYPE_LABELS.get(r.get("flow_type"), "")))
+    out.sort(key=lambda r: str(r.get("sort_date") or ""), reverse=True)
+    out.sort(key=dict_company_sort_key)
+    return out[:limit]
+
+
+def cross_company_account_usage(conn: sqlite3.Connection, scope: str = "all", flow_type: str = "all", selected_bot_key: str = "", search: str = "", limit: int = 120) -> List[Dict[str, Any]]:
+    """Find accounts that appear under more than one company in the selected period/flow."""
+    clause, params, _ = global_scope_where(scope, success_only=True)
+    clause, params = apply_flow_sql(clause, params, flow_type)
+    rows = conn.execute(
+        f"""
+        SELECT COALESCE(NULLIF(bot_key,''),'default') AS bot_key,
+               COALESCE(NULLIF(company_name,''), COALESCE(NULLIF(bot_key,''),'default')) AS company_name,
+               chat_id, chat_title, slip_date_display, slip_date_iso,
+               from_bank, from_account, to_bank, to_account,
+               COUNT(*) AS count,
+               COALESCE(SUM(amount),0) AS amount
+        FROM slips
+        WHERE {clause}
+          AND (NULLIF(TRIM(COALESCE(from_account,'')), '') IS NOT NULL OR NULLIF(TRIM(COALESCE(to_account,'')), '') IS NOT NULL)
+        GROUP BY bot_key, company_name, chat_id, chat_title, slip_date_display, slip_date_iso, from_bank, from_account, to_bank, to_account
+        """,
+        params,
+    ).fetchall()
+    selected_bot = clean_display(selected_bot_key)
+    groups: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        account, bank, account_role, flow = company_account_row_identity(row)
+        if not account:
+            continue
+        key = f"{bank_key(bank)}|{bank_key(account)}"
+        bot_key = clean_display(row["bot_key"]) or "default"
+        company_name = clean_company_name(row["company_name"], bot_key)
+        group = groups.setdefault(
+            key,
+            {
+                "bank": bank,
+                "account": account,
+                "account_key": key,
+                "roles": [],
+                "flows": [],
+                "companies_map": {},
+                "days_map": {},
+                "total_count": 0,
+                "total_amount": 0.0,
+            },
+        )
+        if account_role and account_role not in group["roles"]:
+            group["roles"].append(account_role)
+        if flow and flow not in group["flows"]:
+            group["flows"].append(flow)
+        comp = group["companies_map"].setdefault(
+            bot_key,
+            {
+                "bot_key": bot_key,
+                "company_name": company_name,
+                "count": 0,
+                "amount": 0.0,
+                "deposit_amount": 0.0,
+                "withdraw_amount": 0.0,
+                "flows": [],
+                "days_map": {},
+            },
+        )
+        comp["count"] += int(row["count"] or 0)
+        row_count = int(row["count"] or 0)
+        row_amount = float(row["amount"] or 0)
+        comp["amount"] += row_amount
+        if flow == "deposit":
+            comp["deposit_amount"] += row_amount
+        elif flow == "withdraw":
+            comp["withdraw_amount"] += row_amount
+        if flow and flow not in comp["flows"]:
+            comp["flows"].append(flow)
+        date_key, date_label, sort_date = date_bucket(row["slip_date_display"], row["slip_date_iso"])
+        comp_day = comp["days_map"].setdefault(
+            date_key,
+            {"date_key": date_key, "date": date_label, "sort_date": sort_date, "count": 0, "amount": 0.0, "flows": []},
+        )
+        comp_day["count"] += row_count
+        comp_day["amount"] += row_amount
+        if flow and flow not in comp_day["flows"]:
+            comp_day["flows"].append(flow)
+        group_day = group["days_map"].setdefault(
+            date_key,
+            {"date_key": date_key, "date": date_label, "sort_date": sort_date, "count": 0, "amount": 0.0},
+        )
+        group_day["count"] += row_count
+        group_day["amount"] += row_amount
+        group["total_count"] += row_count
+        group["total_amount"] += row_amount
+    needle = normalize_match_text(search)
+    out: List[Dict[str, Any]] = []
+    for group in groups.values():
+        companies = sorted(group.pop("companies_map").values(), key=dict_company_sort_key)
+        for company in companies:
+            days = list(company.pop("days_map", {}).values())
+            days.sort(key=lambda r: (str(r.get("sort_date") or ""), str(r.get("date") or "")), reverse=True)
+            for day in days:
+                day["flow_labels"] = [flow_label(f) for f in day.pop("flows", [])]
+                day.pop("sort_date", None)
+            company["days"] = days
+        if len(companies) < 2:
+            continue
+        if selected_bot and selected_bot not in {"__all__", "all"} and selected_bot not in {c["bot_key"] for c in companies}:
+            continue
+        if needle:
+            hay = normalize_match_text(" ".join([group.get("bank", ""), group.get("account", ""), *[c.get("company_name", "") for c in companies]]))
+            if needle not in hay:
+                continue
+        first = companies[0] if companies else {}
+        days = list(group.pop("days_map", {}).values())
+        days.sort(key=lambda r: (str(r.get("sort_date") or ""), str(r.get("date") or "")), reverse=True)
+        for day in days:
+            day.pop("sort_date", None)
+        item = {
+            **group,
+            "company_count": len(companies),
+            "companies": companies,
+            "days": days,
+            "company_name": first.get("company_name", ""),
+            "bot_key": first.get("bot_key", ""),
+            "flow_labels": [flow_label(f) for f in group.get("flows", [])],
+        }
+        out.append(item)
+    out.sort(key=lambda r: (dict_company_sort_key(r), clean_display(r.get("bank")), clean_display(r.get("account"))))
+    return out[:limit]
+
+
+def date_bucket(display_value: Any, iso_value: Any = "") -> Tuple[str, str, str]:
+    display_raw = clean_display(display_value)
+    iso_raw = clean_display(iso_value)
+    display_label, display_iso = normalize_date_parts(display_raw)
+    iso_label, iso_iso = normalize_date_parts(iso_raw)
+    label = display_label or iso_label or display_raw or iso_raw or "(ไม่ทราบวันที่)"
+    sort_key = display_iso or iso_iso or label
+    group_key = display_iso or iso_iso or label
+    return group_key, label, sort_key
+
+
+def date_totals(conn: sqlite3.Connection, where_clause: str, params: List[Any], limit: int = 50) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        f"""
+        SELECT slip_date_display, slip_date_iso,
+               COALESCE(amount,0) AS amount,
+               COALESCE(fee,0) AS fee
+        FROM slips
+        WHERE {where_clause}
+        """,
+        params,
+    ).fetchall()
+    groups: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        key, label, sort_key = date_bucket(row["slip_date_display"], row["slip_date_iso"])
+        group = groups.setdefault(key, {"date": label, "sort_date": sort_key, "count": 0, "amount": 0.0, "fee": 0.0})
+        group["count"] += 1
+        group["amount"] += float(row["amount"] or 0)
+        group["fee"] += float(row["fee"] or 0)
+        if sort_key > group["sort_date"]:
+            group["sort_date"] = sort_key
+    out = sorted(groups.values(), key=lambda r: (r["sort_date"], r["date"]), reverse=True)[:limit]
+    return [{"date": r["date"], "count": r["count"], "amount": r["amount"], "fee": r["fee"]} for r in out]
+
+
+def daily_flow_totals(conn: sqlite3.Connection, where_clause: str, params: List[Any], limit: int = 60) -> List[Dict[str, Any]]:
+    """Daily counted totals split into withdraw vs deposit/top-up for the dashboard chart."""
+    rows = conn.execute(
+        f"""
+        SELECT COALESCE(NULLIF(bot_key,''),'default') AS bot_key, chat_id,
+               slip_date_display, slip_date_iso, chat_title,
+               COALESCE(amount,0) AS amount
+        FROM slips
+        WHERE {where_clause}
+        """,
+        params,
+    ).fetchall()
+    groups: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        key, label, sort_key = date_bucket(row["slip_date_display"], row["slip_date_iso"])
+        flow = flow_type_for_title(row["chat_title"], row["bot_key"], row["chat_id"])
+        if flow not in {"deposit", "withdraw"}:
+            flow = "other"
+        group = groups.setdefault(
+            key,
+            {
+                "date_key": key,
+                "date": label,
+                "sort_date": sort_key,
+                "withdraw_count": 0,
+                "withdraw_amount": 0.0,
+                "deposit_count": 0,
+                "deposit_amount": 0.0,
+                "other_count": 0,
+                "other_amount": 0.0,
+                "total_count": 0,
+                "total_amount": 0.0,
+            },
+        )
+        amount = float(row["amount"] or 0)
+        group[f"{flow}_count"] += 1
+        group[f"{flow}_amount"] += amount
+        group["total_count"] += 1
+        group["total_amount"] += amount
+        if sort_key > group["sort_date"]:
+            group["sort_date"] = sort_key
+    out = sorted(groups.values(), key=lambda r: (r["sort_date"], r["date"]), reverse=True)[:limit]
+    for row in out:
+        row.pop("sort_date", None)
+    return out
+
+
+def normalize_match_date(value: Any) -> str:
+    display, iso = normalize_date_parts(value)
+    return iso or display or clean_display(value)
+
+
+def normalize_match_text(value: Any) -> str:
+    return re.sub(r"[\s\*\u200b\u200c\u200d.\-_/|()]+", "", clean_display(value).lower())
+
+
+def extract_time_text(*values: Any) -> str:
+    """Return HH:MM from Excel time cells or combined date/time text."""
+    for value in values:
+        if value in (None, ""):
+            continue
+        if isinstance(value, dt.datetime):
+            return value.strftime("%H:%M")
+        if isinstance(value, dt.time):
+            return value.strftime("%H:%M")
+        text = clean_display(value)
+        match = re.search(r"(?<!\d)(\d{1,2}:\d{2})(?::\d{2})?(?!\d)", text)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def detect_column(headers: List[str], aliases: List[str]) -> int:
+    normalized = [normalize_match_text(h) for h in headers]
+    alias_norm = [normalize_match_text(a) for a in aliases]
+    for idx, head in enumerate(normalized):
+        if head and any(alias == head for alias in alias_norm if alias):
+            return idx
+    for idx, head in enumerate(normalized):
+        if any(alias in head or head in alias for alias in alias_norm if alias):
+            return idx
+    return -1
+
+
+def parse_backend_excel(path: Path) -> List[Dict[str, Any]]:
+    from openpyxl import load_workbook
+
+    wb = load_workbook(path, data_only=True, read_only=True)
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return []
+    header_idx = 0
+    for i, row in enumerate(rows[:10]):
+        texts = [clean_display(c) for c in row]
+        if any(t for t in texts) and detect_column(texts, ["amount", "ยอด", "ยอดเงิน", "จำนวนเงิน", "total"]) >= 0:
+            header_idx = i
+            break
+    headers = [clean_display(c) for c in rows[header_idx]]
+    amount_i = detect_column(headers, ["amount", "ยอด", "ยอดเงิน", "จำนวน", "จำนวนเงิน", "เงิน", "total", "deposit", "credit", "gross amount"])
+    received_i = detect_column(headers, ["จำนวนที่ได้รับ", "ยอดที่ได้รับ", "ได้รับ", "received", "received amount", "net amount", "credit amount"])
+    date_i = detect_column(headers, ["date", "วันที่", "transaction date", "วันเวลา", "วันที่เวลา", "วันที่/เวลา", "วันทำรายการ", "created date", "created at"])
+    time_i = detect_column(headers, ["time", "เวลา", "transaction time", "เวลาทำรายการ", "created time"])
+    name_i = detect_column(headers, ["name", "ชื่อ", "ชื่อผู้โอน", "ผู้โอน", "ยูสเซอร์", "ยูสเซอร์เนม", "user", "username", "user name", "member", "ลูกค้า", "customer", "payer", "transferor"])
+    bank_i = detect_column(headers, ["bank", "ธนาคาร", "ธนาคารผู้โอน", "ธนาคารลูกค้า", "customer bank", "bank name"])
+    ref_i = detect_column(headers, ["ref", "reference", "reference no", "เลขอ้างอิง", "หมายเลขอ้างอิง", "รหัส", "รหัสรายการ", "เลขที่รายการ", "รายการ", "transaction", "transaction id", "transaction code", "code", "seq", "id", "order id"])
+    note_i = detect_column(headers, ["หมายเหตุ", "remark", "remarks", "memo", "note", "description"])
+    source_i = detect_column(headers, ["ไฟล์", "แหล่งที่มา", "ไฟล์/แหล่งที่มา", "source", "filename", "file", "import"])
+    if amount_i < 0 and received_i < 0:
+        raise ValueError("ไม่พบคอลัมน์ยอดเงินใน Excel หลังบ้าน")
+    parsed: List[Dict[str, Any]] = []
+    for row_no, row in enumerate(rows[header_idx + 1 :], start=header_idx + 2):
+        values = list(row)
+        gross_amount = parse_number(values[amount_i] if 0 <= amount_i < len(values) else 0)
+        received_amount = parse_number(values[received_i] if 0 <= received_i < len(values) else 0)
+        amount = received_amount or gross_amount
+        if not amount:
+            continue
+        date_raw = values[date_i] if 0 <= date_i < len(values) else ""
+        raw_time_value = values[time_i] if 0 <= time_i < len(values) else ""
+        time_text = extract_time_text(raw_time_value, date_raw)
+        name = clean_display(values[name_i]) if 0 <= name_i < len(values) else ""
+        bank = display_bank(values[bank_i]) if 0 <= bank_i < len(values) else ""
+        reference = clean_display(values[ref_i]) if 0 <= ref_i < len(values) else ""
+        note = clean_display(values[note_i]) if 0 <= note_i < len(values) else ""
+        if not reference:
+            reference = note
+        source = clean_display(values[source_i]) if 0 <= source_i < len(values) else Path(path).name
+        date_label, date_iso = normalize_date_parts(date_raw)
+        parsed.append(
+            {
+                "row": row_no,
+                "date": date_label or clean_display(date_raw),
+                "date_key": date_iso or normalize_match_date(date_raw),
+                "time": time_text,
+                "name": name,
+                "name_key": normalize_match_text(name),
+                "bank": bank,
+                "bank_key": normalize_match_text(bank),
+                "amount": float(amount),
+                "gross_amount": float(gross_amount or amount),
+                "received_amount": float(received_amount or amount),
+                "reference": reference,
+                "reference_key": normalize_match_text(reference),
+                "note": note,
+                "source": source,
+            }
+        )
+    return parsed
+
+
+def reconcile_daily_summary(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    groups: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        date_label = clean_display(row.get("date")) or "(ไม่ทราบวันที่)"
+        key = clean_display(row.get("date_key")) or date_label
+        group = groups.setdefault(key, {"date": date_label, "date_key": key, "count": 0, "amount": 0.0})
+        group["count"] += 1
+        group["amount"] += float(row.get("amount") or 0)
+    return sorted(groups.values(), key=lambda r: (r["date_key"], r["date"]), reverse=True)
+
+
+def slip_reconcile_rows(conn: sqlite3.Connection, chat_id: str = "", scope: str = "all", bot_key: str = "", flow_type: str = "all") -> List[Dict[str, Any]]:
+    bot = clean_display(bot_key)
+    if chat_id:
+        where_clause, params, _ = scope_where(chat_id, scope, success_only=True, bot_key=bot)
+    else:
+        where_clause, params, _ = global_scope_where(scope, success_only=True, bot_key=bot)
+    where_clause, params = apply_flow_sql(where_clause, params, flow_type)
+    rows = conn.execute(
+        f"""
+        SELECT id, COALESCE(NULLIF(bot_key,''),'default') AS bot_key, company_name,
+               chat_id, chat_title, message_id,
+               slip_date_display, slip_date_iso, slip_time,
+               transferor_name, sender_name, recipient_name,
+               from_bank, from_account, issuer_bank, to_bank, to_account,
+               amount, reference_no, seq, aid
+        FROM slips
+        WHERE {where_clause}
+        ORDER BY created_at ASC
+        """,
+        params,
+    ).fetchall()
+    out = []
+    for r in rows:
+        date_value = r["slip_date_iso"] or r["slip_date_display"]
+        bank = display_bank(r["from_bank"] or r["issuer_bank"] or r["to_bank"])
+        reference = clean_display(r["reference_no"] or r["seq"] or r["aid"])
+        name = display_transferor_name(r["transferor_name"] or r["sender_name"])
+        message_id = clean_display(r["message_id"])
+        out.append(
+            {
+                "id": r["id"],
+                "bot_key": r["bot_key"],
+                "company_name": clean_company_name(r["company_name"], r["bot_key"]),
+                "chat_id": r["chat_id"],
+                "chat_title": clean_display(r["chat_title"]),
+                "message_id": message_id,
+                "date": r["slip_date_display"] or r["slip_date_iso"],
+                "date_key": normalize_match_date(date_value),
+                "time": clean_display(r["slip_time"]),
+                "name": name,
+                "name_key": transferor_key(name),
+                "recipient_name": clean_display(r["recipient_name"]),
+                "bank": bank,
+                "bank_key": normalize_match_text(bank),
+                "from_bank": display_bank(r["from_bank"]),
+                "from_account": clean_display(r["from_account"]),
+                "to_bank": display_bank(r["to_bank"]),
+                "to_account": clean_display(r["to_account"]),
+                "issuer_bank": display_bank(r["issuer_bank"]),
+                "amount": float(r["amount"] or 0),
+                "reference": reference,
+                "reference_key": normalize_match_text(reference),
+                "source": f"msg {message_id}" if message_id else clean_display(r["chat_title"]),
+            }
+        )
+    return out
+
+
+def reconcile_backend_excel(db_path: Path, excel_path: Path, chat_id: str = "", scope: str = "all", bot_key: str = "", flow_type: str = "all") -> Dict[str, Any]:
+    backend_rows = parse_backend_excel(excel_path)
+    flow = normalize_flow_type(flow_type)
+    bot = clean_display(bot_key)
+    with connect(db_path) as conn:
+        slip_rows = slip_reconcile_rows(conn, chat_id=chat_id, scope=scope, bot_key=bot, flow_type=flow)
+    used_slips: set[int] = set()
+    matches: List[Dict[str, Any]] = []
+    missing: List[Dict[str, Any]] = []
+    for backend in backend_rows:
+        best_idx = -1
+        best_score = -1
+        for idx, slip in enumerate(slip_rows):
+            if idx in used_slips:
+                continue
+            if abs(float(backend["amount"]) - float(slip["amount"])) > 0.009:
+                continue
+            date_match = not backend["date_key"] or not slip["date_key"] or backend["date_key"] == slip["date_key"]
+            if not date_match:
+                continue
+            score = 10
+            if backend["reference_key"] and backend["reference_key"] == slip["reference_key"]:
+                score += 100
+            if backend["bank_key"] and backend["bank_key"] == slip["bank_key"]:
+                score += 20
+            if backend.get("time") and slip.get("time") and clean_display(backend.get("time")) == clean_display(slip.get("time")):
+                score += 10
+            if backend["name_key"] and (backend["name_key"] == slip["name_key"] or names_similar(backend["name_key"], slip["name_key"])):
+                score += 20
+            if backend["reference_key"] and slip["reference_key"] and backend["reference_key"] != slip["reference_key"]:
+                score -= 50
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+        if best_idx >= 0 and best_score >= 10:
+            used_slips.add(best_idx)
+            matches.append({"backend": backend, "slip": slip_rows[best_idx], "score": best_score})
+        else:
+            missing.append(backend)
+    extra = [slip for idx, slip in enumerate(slip_rows) if idx not in used_slips]
+    backend_amount = sum(float(r["amount"] or 0) for r in backend_rows)
+    slip_amount = sum(float(r["amount"] or 0) for r in slip_rows)
+    matched_amount = sum(float(m["backend"]["amount"] or 0) for m in matches)
+    return {
+        "ok": True,
+        "excel_path": str(excel_path),
+        "scope": {"chat_id": clean_display(chat_id), "bot_key": bot or "__all__", "flow_type": flow, "flow_label": flow_label(flow), "date_scope": clean_display(scope)},
+        "backend": {"count": len(backend_rows), "amount": backend_amount},
+        "slips": {"count": len(slip_rows), "amount": slip_amount},
+        "matched": {"count": len(matches), "amount": matched_amount, "rows": matches[:100]},
+        "missing_in_slips": missing[:100],
+        "extra_slips": extra[:100],
+        "missing": {"count": len(missing), "amount": sum(float(r["amount"] or 0) for r in missing)},
+        "extra": {"count": len(extra), "amount": sum(float(r["amount"] or 0) for r in extra)},
+        "daily": {"backend": reconcile_daily_summary(backend_rows), "slips": reconcile_daily_summary(slip_rows)},
+        "diff_amount": backend_amount - slip_amount,
+    }
+
+
+def scope_where(chat_id: str, scope: str = "open", success_only: bool = True, bot_key: str = "") -> Tuple[str, List[Any], str]:
+    """Build the same success/open/date scope semantics used by the Telegram bot."""
+    clause, params, label = global_scope_where(scope, success_only=success_only, bot_key=bot_key)
+    return "chat_id=? AND " + clause, [str(chat_id), *params], label
+
+
+def normalize_scope_bound(value: str) -> str:
+    display, iso = normalize_date_parts(clean_display(value))
+    return iso or clean_display(value)
+
+
+def scope_date_range(scope: str) -> Tuple[str, str, str]:
+    raw = clean_display(scope)
+    text = raw[6:] if raw.lower().startswith("range:") else raw
+    if ".." not in text:
+        return "", "", ""
+    start_text, end_text = text.split("..", 1)
+    start = normalize_scope_bound(start_text)
+    end = normalize_scope_bound(end_text)
+    if not start and not end:
+        return "", "", ""
+    if start and end and start > end:
+        start, end = end, start
+    if start and end:
+        label = f"{start} ถึง {end}"
+    elif start:
+        label = f"ตั้งแต่ {start}"
+    else:
+        label = f"ถึง {end}"
+    return start, end, label
+
+
+def append_scope_date_range(clause: str, params: List[Any], start: str, end: str, prefix: str = "") -> Tuple[str, List[Any]]:
+    date_expr = f"{prefix}slip_date_iso"
+    out = list(params)
+    if start and end:
+        clause += f" AND {date_expr} BETWEEN ? AND ?"
+        out.extend([start, end])
+    elif start:
+        clause += f" AND {date_expr} >= ?"
+        out.append(start)
+    elif end:
+        clause += f" AND {date_expr} <= ?"
+        out.append(end)
+    return clause, out
+
+
+def global_scope_where(scope: str = "open", success_only: bool = True, bot_key: str = "") -> Tuple[str, List[Any], str]:
+    """Build scope semantics across every chat, optionally limited to one bot/company."""
+    range_start, range_end, range_label = scope_date_range(scope)
+    normalized, label = scope_to_date(scope)
+    clause = "1=1"
+    params: List[Any] = []
+    if bot_key and clean_display(bot_key) not in {"__all__", "all"}:
+        clause += " AND COALESCE(bot_key,'default')=?"
+        params.append(clean_display(bot_key) or "default")
+    if success_only:
+        clause += " AND status='success' AND COALESCE(is_duplicate,0)=0"
+    if range_label:
+        clause, params = append_scope_date_range(clause, params, range_start, range_end)
+    elif normalized == "open":
+        clause += " AND settlement_id IS NULL"
+    elif normalized == "all":
+        pass
+    elif re.match(r"^\d{4}-\d{2}-\d{2}$", normalized):
+        clause += " AND slip_date_iso=?"
+        params.append(normalized)
+    else:
+        clause += " AND (slip_date_display=? OR slip_date_iso=?)"
+        params.extend([normalized, normalized])
+    return clause, params, range_label or label
+
+
+
+FLOW_TYPE_LABELS = {"all": "รวมทุกกลุ่ม", "deposit": "ฝาก/เติมมือ", "withdraw": "ถอน", "other": "อื่นๆ"}
+DEPOSIT_TITLE_TOKENS = ["ฝาก", "deposit", "deposits", "รับฝาก", "เติมเงิน", "เติมมือ", "topup", "top-up"]
+WITHDRAW_TITLE_TOKENS = ["ถอน", "withdraw", "withdrawal", "withdrawals"]
+
+
+def normalize_flow_type(value: Any) -> str:
+    raw = clean_display(value).lower()
+    if raw in {"all", "ทุกกลุ่ม", "รวมทุกกลุ่ม", ""}:
+        return "all"
+    if raw in {"deposit", "deposits", "ฝาก", "ฝาก/เติมมือ", "เติมมือ", "เติมเงิน", "รับฝาก", "in", "credit", "topup", "top-up", "manual topup"} or "เติมมือ" in raw or "เติมเงิน" in raw:
+        return "deposit"
+    if raw in {"withdraw", "withdrawal", "withdrawals", "ถอน", "out", "debit"}:
+        return "withdraw"
+    if raw in {"other", "อื่น", "อื่นๆ"}:
+        return "other"
+    return "all"
+
+
+def configured_flow_map() -> Dict[Tuple[str, str], str]:
+    """Explicit bot/chat -> flow mapping from AUDITSLIP_FLOW_MAP.
+
+    Accepts JSON objects such as {"bot1|CHAT_ID":"deposit"} or CSV entries
+    like bot1|CHAT_ID=deposit,bot1|OTHER=withdraw. A blank/* bot maps by chat_id.
+    """
+    raw = clean_display(os.environ.get("AUDITSLIP_FLOW_MAP") or os.environ.get("AUDITSLIP_GROUP_FLOW_MAP") or "")
+    if not raw:
+        return {}
+    items: List[Tuple[str, Any]] = []
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            items = [(str(k), v) for k, v in parsed.items()]
+        elif isinstance(parsed, list):
+            for entry in parsed:
+                if isinstance(entry, dict):
+                    key = "|".join([clean_display(entry.get("bot_key") or entry.get("bot") or "*"), clean_display(entry.get("chat_id") or entry.get("chat") or "")])
+                    items.append((key, entry.get("flow_type") or entry.get("flow") or ""))
+    except Exception:
+        for part in raw.split(","):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                items.append((k.strip(), v.strip()))
+    result: Dict[Tuple[str, str], str] = {}
+    for raw_key, raw_flow in items:
+        flow = normalize_flow_type(raw_flow)
+        if flow not in {"deposit", "withdraw", "other"}:
+            continue
+        key = clean_display(raw_key)
+        if "|" in key:
+            bot_key, chat_id = key.split("|", 1)
+        elif ":" in key:
+            bot_key, chat_id = key.split(":", 1)
+        else:
+            bot_key, chat_id = "*", key
+        chat_id = clean_display(chat_id)
+        if not chat_id:
+            continue
+        result[(clean_display(bot_key) or "*", chat_id)] = flow
+    return result
+
+
+def configured_flow_for(bot_key: Any = "", chat_id: Any = "") -> str:
+    mapping = configured_flow_map()
+    bot = clean_display(bot_key) or "default"
+    chat = clean_display(chat_id)
+    if not chat:
+        return ""
+    return mapping.get((bot, chat)) or mapping.get(("*", chat)) or mapping.get(("__all__", chat)) or ""
+
+
+def title_tokens_expr(field: str, tokens: List[str]) -> Tuple[str, List[Any]]:
+    clauses: List[str] = []
+    params: List[Any] = []
+    for token in tokens:
+        if re.fullmatch(r"[a-z0-9_-]+", token):
+            clauses.append(f"LOWER({field}) LIKE ?")
+            params.append(f"%{token.lower()}%")
+        else:
+            clauses.append(f"{field} LIKE ?")
+            params.append(f"%{token}%")
+    return "(" + " OR ".join(clauses) + ")", params
+
+
+def flow_map_expr(flow: str | None = None, alias: str = "") -> Tuple[str, List[Any]]:
+    prefix = f"{alias}." if alias else ""
+    bot_field = f"COALESCE(NULLIF({prefix}bot_key,''),'default')"
+    chat_field = f"COALESCE({prefix}chat_id,'')"
+    clauses: List[str] = []
+    params: List[Any] = []
+    for (bot_key, chat_id), mapped_flow in configured_flow_map().items():
+        if flow and mapped_flow != flow:
+            continue
+        if bot_key in {"", "*", "__all__", "all"}:
+            clauses.append(f"({chat_field}=?)")
+            params.append(chat_id)
+        else:
+            clauses.append(f"({bot_field}=? AND {chat_field}=?)")
+            params.extend([bot_key, chat_id])
+    if not clauses:
+        return "", []
+    return "(" + " OR ".join(clauses) + ")", params
+
+
+def flow_type_for_title(title: Any, bot_key: Any = "", chat_id: Any = "") -> str:
+    mapped = configured_flow_for(bot_key, chat_id)
+    if mapped:
+        return mapped
+    text = clean_display(title).lower()
+    deposit_signal = any(token in text for token in DEPOSIT_TITLE_TOKENS)
+    withdraw_signal = any(token in text for token in WITHDRAW_TITLE_TOKENS)
+    if deposit_signal and not withdraw_signal:
+        return "deposit"
+    if withdraw_signal:
+        return "withdraw"
+    # Legacy/current groups that do not explicitly say ฝาก/เติมมือ are treated as ถอน,
+    # so selecting บริษัท + ถอน never hides historical data just because the old
+    # chat title was generic (for example a DM or an older audit room name).
+    return "withdraw"
+
+
+def flow_sql_clause(flow_type: str, alias: str = "") -> Tuple[str, List[Any]]:
+    flow = normalize_flow_type(flow_type)
+    if flow == "all":
+        return "", []
+    prefix = f"{alias}." if alias else ""
+    field = f"COALESCE({prefix}chat_title,'')"
+    deposit_expr, deposit_params = title_tokens_expr(field, DEPOSIT_TITLE_TOKENS)
+    withdraw_expr, withdraw_params = title_tokens_expr(field, WITHDRAW_TITLE_TOKENS)
+    deposit_only_expr = f"({deposit_expr} AND NOT {withdraw_expr})"
+    deposit_only_params = [*deposit_params, *withdraw_params]
+    mapped_any_expr, mapped_any_params = flow_map_expr(None, alias=alias)
+    mapped_flow_expr, mapped_flow_params = flow_map_expr(flow, alias=alias)
+    not_mapped_expr = f"NOT {mapped_any_expr}" if mapped_any_expr else "1=1"
+    pieces: List[str] = []
+    params: List[Any] = []
+    if mapped_flow_expr:
+        pieces.append(mapped_flow_expr)
+        params.extend(mapped_flow_params)
+    if flow == "deposit":
+        pieces.append(f"({not_mapped_expr} AND {deposit_only_expr})")
+        params.extend([*mapped_any_params, *deposit_only_params])
+    elif flow == "withdraw":
+        pieces.append(f"({not_mapped_expr} AND NOT {deposit_only_expr})")
+        params.extend([*mapped_any_params, *deposit_only_params])
+    else:
+        pieces.append(f"({not_mapped_expr} AND 1=0)")
+        params.extend(mapped_any_params)
+    return " AND (" + " OR ".join(pieces) + ")", params
+
+
+def apply_flow_sql(clause: str, params: List[Any], flow_type: str, alias: str = "") -> Tuple[str, List[Any]]:
+    extra, extra_params = flow_sql_clause(flow_type, alias=alias)
+    return clause + extra, [*params, *extra_params]
+
+
+def limit_scope_clause(where_clause: str, params: List[Any], flow_type: str) -> Tuple[str, List[Any]]:
+    """Scope transferor/limit panels to withdrawal slips only when the dashboard shows all flows."""
+    flow = normalize_flow_type(flow_type)
+    if flow == "deposit":
+        return "1=0", []
+    if flow == "all":
+        return apply_flow_sql(where_clause, params, "withdraw")
+    return where_clause, list(params)
+
+
+def deposit_customer_scope_clause(where_clause: str, params: List[Any], flow_type: str) -> Tuple[str, List[Any]]:
+    """Scope the customer-slip panel to deposit/top-up rooms only."""
+    flow = normalize_flow_type(flow_type)
+    if flow == "withdraw":
+        return "1=0", []
+    if flow == "deposit":
+        return where_clause, list(params)
+    if flow == "all":
+        return apply_flow_sql(where_clause, params, "deposit")
+    return "1=0", []
+
+
+def flow_label(flow_type: str) -> str:
+    return FLOW_TYPE_LABELS.get(normalize_flow_type(flow_type), "ทุกกลุ่ม")
+
+
+def first_chat_selection(conn: sqlite3.Connection) -> Tuple[str, str]:
+    row = conn.execute(
+        """
+        SELECT COALESCE(NULLIF(bot_key,''),'default') AS bot_key,
+               chat_id,
+               COALESCE(SUM(CASE WHEN status='success' AND COALESCE(is_duplicate,0)=0 AND settlement_id IS NULL THEN amount ELSE 0 END),0) AS open_amount,
+               COUNT(*) AS total_rows
+        FROM slips
+        GROUP BY COALESCE(NULLIF(bot_key,''),'default'), chat_id
+        ORDER BY open_amount DESC, total_rows DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    return (str(row["bot_key"]), str(row["chat_id"])) if row else ("", "")
+
+
+def first_chat_id(conn: sqlite3.Connection) -> str:
+    return first_chat_selection(conn)[1]
+
+
+def grouped_totals(conn: sqlite3.Connection, where_clause: str, params: List[Any], name_expr: str, limit: int = 50) -> List[sqlite3.Row]:
+    return conn.execute(
+        f"""
+        SELECT {name_expr} AS name,
+               COUNT(*) AS count,
+               COALESCE(SUM(amount),0) AS amount,
+               COALESCE(SUM(fee),0) AS fee
+        FROM slips
+        WHERE {where_clause}
+        GROUP BY name
+        ORDER BY amount DESC, count DESC, name ASC
+        LIMIT ?
+        """,
+        [*params, limit],
+    ).fetchall()
+
+
+def bank_totals(conn: sqlite3.Connection, where_clause: str, params: List[Any], name_expr: str, unknown_label: str, limit: int = 50, include_limit: bool = False) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        f"""
+        SELECT {name_expr} AS raw_name,
+               COUNT(*) AS count,
+               COALESCE(SUM(amount),0) AS amount,
+               COALESCE(SUM(fee),0) AS fee
+        FROM slips
+        WHERE {where_clause}
+        GROUP BY raw_name
+        ORDER BY amount DESC, count DESC, raw_name ASC
+        """,
+        params,
+    ).fetchall()
+    groups: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        name = display_bank(row["raw_name"]) or unknown_label
+        key = bank_key(name) or name
+        initial = {"name": name, "count": 0, "amount": 0.0, "fee": 0.0}
+        if include_limit:
+            initial["limit_amount"] = bank_limit_amount(name)
+        group = groups.setdefault(key, initial)
+        group["count"] += int(row["count"] or 0)
+        group["amount"] += float(row["amount"] or 0)
+        group["fee"] += float(row["fee"] or 0)
+    return sorted(groups.values(), key=lambda g: (-g["amount"], -g["count"], g["name"]))[:limit]
+
+
+def scoped_counts(conn: sqlite3.Connection, chat_id: str, scope: str, bot_key: str = "") -> sqlite3.Row:
+    where_clause, params, _ = scope_where(chat_id, scope, success_only=True, bot_key=bot_key)
+    return conn.execute(
+        f"SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount FROM slips WHERE {where_clause}",
+        params,
+    ).fetchone()
+
+
+def _scope_clause_for_alias(alias: str, chat_id: str, scope: str = "open", success_only: bool = False, bot_key: str = "") -> Tuple[str, List[Any]]:
+    clause, params = _scope_clause_for_alias_optional(alias, scope, success_only=success_only, bot_key=bot_key)
+    prefix = f"{alias}."
+    return f"{prefix}chat_id=? AND {clause}", [str(chat_id), *params]
+
+
+def _scope_clause_for_alias_optional(alias: str, scope: str = "open", success_only: bool = False, bot_key: str = "") -> Tuple[str, List[Any]]:
+    range_start, range_end, range_label = scope_date_range(scope)
+    normalized, _ = scope_to_date(scope)
+    prefix = f"{alias}."
+    clause = "1=1"
+    params: List[Any] = []
+    if bot_key and clean_display(bot_key) not in {"__all__", "all"}:
+        clause += f" AND COALESCE({prefix}bot_key,'default')=?"
+        params.append(clean_display(bot_key) or "default")
+    if success_only:
+        clause += f" AND {prefix}status='success' AND COALESCE({prefix}is_duplicate,0)=0"
+    if range_label:
+        clause, params = append_scope_date_range(clause, params, range_start, range_end, prefix=prefix)
+    elif normalized == "open":
+        clause += f" AND {prefix}settlement_id IS NULL"
+    elif normalized == "all":
+        pass
+    elif re.match(r"^\d{4}-\d{2}-\d{2}$", normalized):
+        clause += f" AND {prefix}slip_date_iso=?"
+        params.append(normalized)
+    else:
+        clause += f" AND ({prefix}slip_date_display=? OR {prefix}slip_date_iso=?)"
+        params.extend([normalized, normalized])
+    return clause, params
+
+
+def image_url_for(file_id: Any, slip_id: Any) -> str:
+    return "/api/slip-image?" + urlencode({"id": clean_display(slip_id)}) if clean_display(file_id) else ""
+
+
+def slip_search_clause(alias: str, query: str) -> Tuple[str, List[Any]]:
+    query = clean_display(query)
+    if not query:
+        return "", []
+    prefix = f"{alias}."
+    fields = [
+        "id",
+        "duplicate_of",
+        "message_id",
+        "transferor_name",
+        "recipient_name",
+        "sender_name",
+        "username",
+        "amount",
+        "reference_no",
+        "seq",
+        "aid",
+        "from_bank",
+        "from_account",
+        "to_bank",
+        "to_account",
+        "issuer_bank",
+        "slip_date_display",
+        "slip_date_iso",
+        "slip_time",
+    ]
+    pattern = f"%{query}%"
+    clause = " OR ".join([f"CAST({prefix}{field} AS TEXT) LIKE ?" for field in fields])
+    return f" AND ({clause})", [pattern] * len(fields)
+
+
+def duplicate_pair_search_clause(query: str) -> Tuple[str, List[Any]]:
+    query = clean_display(query)
+    if not query:
+        return "", []
+    fields = [
+        "d.id", "d.duplicate_of", "d.message_id", "d.transferor_name", "d.recipient_name", "d.sender_name", "d.username", "d.amount", "d.reference_no", "d.seq", "d.aid", "d.from_bank", "d.from_account", "d.to_bank", "d.to_account", "d.issuer_bank", "d.slip_date_display", "d.slip_date_iso", "d.slip_time",
+        "o.id", "o.message_id", "o.transferor_name", "o.recipient_name", "o.sender_name", "o.username", "o.amount", "o.reference_no", "o.seq", "o.aid", "o.from_bank", "o.from_account", "o.to_bank", "o.to_account", "o.issuer_bank", "o.slip_date_display", "o.slip_date_iso", "o.slip_time",
+    ]
+    pattern = f"%{query}%"
+    clause = " OR ".join([f"CAST({field} AS TEXT) LIKE ?" for field in fields])
+    return f" AND ({clause})", [pattern] * len(fields)
+
+
+def duplicate_pair_rows(conn: sqlite3.Connection, chat_id: str, scope: str = "open", bot_key: str = "", search: str = "", limit: int = 40, flow_type: str = "all") -> List[Dict[str, Any]]:
+    if chat_id:
+        clause, params = _scope_clause_for_alias("d", chat_id, scope, success_only=False, bot_key=bot_key)
+    else:
+        clause, params = _scope_clause_for_alias_optional("d", scope, success_only=False, bot_key=bot_key)
+    clause, params = apply_flow_sql(clause, params, flow_type, alias="d")
+    clause += " AND d.status='success' AND COALESCE(d.is_duplicate,0)=1"
+    search_clause, search_params = duplicate_pair_search_clause(search)
+    clause += search_clause
+    params.extend(search_params)
+    rows = conn.execute(
+        f"""
+        SELECT d.id AS duplicate_id,
+               d.file_id AS duplicate_file_id,
+               d.message_id AS duplicate_message_id,
+               d.sender_name AS duplicate_sender_name,
+               d.reference_no AS reference_no,
+               d.seq AS seq,
+               d.aid AS aid,
+               d.created_at_iso AS duplicate_created_at_iso,
+               d.duplicate_of AS original_id,
+               d.slip_date_display AS slip_date_display,
+               d.slip_date_iso AS slip_date_iso,
+               d.slip_time AS slip_time,
+               d.transferor_name AS transferor_name,
+               d.recipient_name AS recipient_name,
+               d.amount AS amount,
+               d.from_bank AS from_bank,
+               d.to_bank AS to_bank,
+               d.issuer_bank AS issuer_bank,
+               o.file_id AS original_file_id,
+               o.message_id AS original_message_id,
+               o.sender_name AS original_sender_name,
+               o.reference_no AS original_reference_no,
+               o.seq AS original_seq,
+               o.aid AS original_aid,
+               o.created_at_iso AS original_created_at_iso,
+               o.slip_date_display AS original_slip_date_display,
+               o.slip_date_iso AS original_slip_date_iso,
+               o.slip_time AS original_slip_time,
+               o.transferor_name AS original_transferor_name,
+               o.recipient_name AS original_recipient_name,
+               o.amount AS original_amount,
+               o.from_bank AS original_from_bank,
+               o.to_bank AS original_to_bank,
+               o.issuer_bank AS original_issuer_bank
+        FROM slips d
+        LEFT JOIN slips o ON o.id=d.duplicate_of AND COALESCE(o.bot_key,'default')=COALESCE(d.bot_key,'default')
+        WHERE {clause}
+        ORDER BY d.created_at DESC
+        LIMIT ?
+        """,
+        [*params, limit],
+    ).fetchall()
+    out = rows_to_dicts(rows)
+    for row in out:
+        row["duplicate_image_url"] = image_url_for(row.get("duplicate_file_id"), row.get("duplicate_id"))
+        row["original_image_url"] = image_url_for(row.get("original_file_id"), row.get("original_id"))
+        row["from_bank"] = display_bank(row.get("from_bank"))
+        row["to_bank"] = display_bank(row.get("to_bank"))
+        row["issuer_bank"] = display_bank(row.get("issuer_bank"))
+        row["original_from_bank"] = display_bank(row.get("original_from_bank"))
+        row["original_to_bank"] = display_bank(row.get("original_to_bank"))
+        row["original_issuer_bank"] = display_bank(row.get("original_issuer_bank"))
+    return out
+
+
+def source_bank_review_condition() -> str:
+    missing_from_bank = """
+      (
+        NULLIF(TRIM(COALESCE(from_bank,'')), '') IS NULL
+        OR LOWER(TRIM(COALESCE(from_bank,''))) IN ('unknown','n/a','na','none','null','-','xxx','xxxx','masked')
+        OR COALESCE(from_bank,'') LIKE '%ไม่ทราบ%'
+      )
+    """
+    missing_issuer_bank = """
+      (
+        NULLIF(TRIM(COALESCE(issuer_bank,'')), '') IS NULL
+        OR LOWER(TRIM(COALESCE(issuer_bank,''))) IN ('unknown','n/a','na','none','null','-','xxx','xxxx','masked')
+        OR COALESCE(issuer_bank,'') LIKE '%ไม่ทราบ%'
+      )
+    """
+    return f"({missing_from_bank} AND {missing_issuer_bank})"
+
+
+def source_bank_review_count(conn: sqlite3.Connection, where_clause: str, params: List[Any], search: str = "") -> int:
+    search_clause, search_params = slip_search_clause("slips", search)
+    row = conn.execute(
+        f"SELECT COUNT(*) AS count FROM slips WHERE {where_clause} AND {source_bank_review_condition()}{search_clause}",
+        [*params, *search_params],
+    ).fetchone()
+    return int(row["count"] or 0)
+
+
+def source_bank_review_ids(conn: sqlite3.Connection, where_clause: str, params: List[Any], search: str = "") -> List[str]:
+    search_clause, search_params = slip_search_clause("slips", search)
+    rows = conn.execute(
+        f"""
+        SELECT id
+        FROM slips
+        WHERE {where_clause} AND {source_bank_review_condition()}{search_clause}
+        ORDER BY created_at DESC
+        """,
+        [*params, *search_params],
+    ).fetchall()
+    return [str(r["id"]) for r in rows]
+
+
+def source_bank_review_rows(conn: sqlite3.Connection, where_clause: str, params: List[Any], search: str = "", limit: int = 40) -> List[Dict[str, Any]]:
+    search_clause, search_params = slip_search_clause("slips", search)
+    limit_clause = "LIMIT ?" if limit and limit > 0 else ""
+    query_params: List[Any] = [*params, *search_params]
+    if limit_clause:
+        query_params.append(limit)
+    rows = conn.execute(
+        f"""
+        SELECT id, COALESCE(NULLIF(bot_key,''),'default') AS bot_key, company_name, chat_id, chat_title,
+               file_id, message_id, sender_name, username, status, error,
+               slip_date_display, slip_date_iso, slip_time,
+               TRIM(COALESCE(NULLIF(slip_date_display,''), NULLIF(slip_date_iso,''), '') || ' ' || COALESCE(NULLIF(slip_time,''), '')) AS slip_date_text,
+               transferor_name, recipient_name, issuer_bank, from_bank, from_account, to_bank, to_account,
+               amount, confidence, created_at_iso
+        FROM slips
+        WHERE {where_clause} AND {source_bank_review_condition()}{search_clause}
+        ORDER BY created_at DESC
+        {limit_clause}
+        """,
+        query_params,
+    ).fetchall()
+    out = rows_to_dicts(rows)
+    for row in out:
+        for field in ["issuer_bank", "from_bank", "to_bank"]:
+            row[field] = display_bank(row.get(field))
+        row["image_url"] = image_url_for(row.get("file_id"), row.get("id"))
+    return out
+
+
+def slip_list_rows(conn: sqlite3.Connection, where_clause: str, params: List[Any], search: str = "", limit: int = 40) -> List[Dict[str, Any]]:
+    search_clause, search_params = slip_search_clause("slips", search)
+    rows = conn.execute(
+        f"""
+        SELECT id, COALESCE(NULLIF(bot_key,''),'default') AS bot_key, company_name, chat_id, chat_title,
+               file_id, message_id, sender_name, username, status, error,
+               slip_date_display, slip_date_iso, slip_time,
+               TRIM(COALESCE(NULLIF(slip_date_display,''), NULLIF(slip_date_iso,''), '') || ' ' || COALESCE(NULLIF(slip_time,''), '')) AS slip_date_text,
+               transferor_name, recipient_name, issuer_bank, from_bank, from_account, to_bank, to_account,
+               amount, confidence, created_at_iso, settlement_id, is_duplicate, duplicate_of
+        FROM slips
+        WHERE {where_clause} AND COALESCE(status,'')!='deleted'{search_clause}
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        [*params, *search_params, limit],
+    ).fetchall()
+    out = rows_to_dicts(rows)
+    for row in out:
+        for field in ["issuer_bank", "from_bank", "to_bank"]:
+            row[field] = display_bank(row.get(field))
+        row["image_url"] = image_url_for(row.get("file_id"), row.get("id"))
+        row["flow_type"] = flow_type_for_title(row.get("chat_title"), row.get("bot_key"), row.get("chat_id"))
+        row["flow_label"] = flow_label(row["flow_type"])
+    return out
+
+
+def empty_account_slip_search(search: str = "") -> Dict[str, Any]:
+    return {"query": clean_display(search), "count": 0, "amount": 0.0, "rows": [], "truncated": False}
+
+
+def account_slip_match(row: sqlite3.Row, search: str) -> Tuple[str, str]:
+    """Return matched account side for an operator account/name/bank search."""
+    query = clean_display(search)
+    if not query:
+        return "", ""
+    needle = normalize_match_text(query)
+    raw_needle = query.lower()
+    sides: List[Tuple[str, str]] = []
+    candidates = [
+        ("from", "บัญชีต้นทาง/ผู้โอน", [row["from_account"], row["from_bank"], row["transferor_name"], row["sender_name"]]),
+        ("to", "บัญชีปลายทาง/ผู้รับ", [row["to_account"], row["to_bank"], row["recipient_name"], row["account_name"]]),
+    ]
+    for side, label, values in candidates:
+        compact_values = [normalize_match_text(v) for v in values if clean_display(v)]
+        raw_values = [clean_display(v).lower() for v in values if clean_display(v)]
+        haystack = normalize_match_text(" ".join(clean_display(v) for v in values))
+        if (
+            (needle and (needle in haystack or any(value and (needle in value or value in needle) for value in compact_values)))
+            or any(raw_needle and raw_needle in value for value in raw_values)
+        ):
+            sides.append((side, label))
+    if not sides:
+        return "", ""
+    if len({side for side, _ in sides}) > 1:
+        return "both", "ต้นทางและปลายทาง"
+    return sides[0]
+
+
+def account_slip_search_company_summary(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    companies: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        bot = clean_display(row.get("bot_key")) or "default"
+        company = clean_company_name(row.get("company_name"), bot)
+        group = companies.setdefault(bot, {"bot_key": bot, "company_name": company, "count": 0, "amount": 0.0})
+        group["count"] += 1
+        group["amount"] += float(row.get("amount") or 0)
+    return sorted(companies.values(), key=dict_company_sort_key)
+
+
+def account_slip_search_rows(conn: sqlite3.Connection, where_clause: str, params: List[Any], search: str = "", limit: int = 80) -> Dict[str, Any]:
+    """Individual counted slip rows for auditing one account within the selected day/company/flow scope."""
+    query = clean_display(search)
+    if not query:
+        return empty_account_slip_search(query)
+    rows = conn.execute(
+        f"""
+        SELECT id, COALESCE(NULLIF(bot_key,''),'default') AS bot_key, company_name, chat_id, chat_title,
+               file_id, message_id, sender_name, username, status, error,
+               slip_date_display, slip_date_iso, slip_time,
+               TRIM(COALESCE(NULLIF(slip_date_display,''), NULLIF(slip_date_iso,''), '') || ' ' || COALESCE(NULLIF(slip_time,''), '')) AS slip_date_text,
+               transferor_name, recipient_name, issuer_bank, from_bank, from_account, to_bank, to_account,
+               account_name, amount, fee, reference_no, seq, aid, confidence, created_at, created_at_iso, settlement_id, is_duplicate, duplicate_of
+        FROM slips
+        WHERE {where_clause}
+          AND (NULLIF(TRIM(COALESCE(from_account,'')), '') IS NOT NULL
+               OR NULLIF(TRIM(COALESCE(to_account,'')), '') IS NOT NULL
+               OR NULLIF(TRIM(COALESCE(transferor_name,'')), '') IS NOT NULL
+               OR NULLIF(TRIM(COALESCE(recipient_name,'')), '') IS NOT NULL)
+        ORDER BY COALESCE(NULLIF(slip_date_iso,''), '') DESC,
+                 COALESCE(NULLIF(slip_time,''), '') DESC,
+                 CAST(COALESCE(message_id,0) AS INTEGER) DESC,
+                 created_at DESC
+        """,
+        params,
+    ).fetchall()
+    matched: List[Dict[str, Any]] = []
+    total_amount = 0.0
+    for row in rows:
+        matched_side, matched_label = account_slip_match(row, query)
+        if not matched_side:
+            continue
+        date_key, date_label, _ = date_bucket(row["slip_date_display"], row["slip_date_iso"])
+        amount = float(row["amount"] or 0)
+        total_amount += amount
+        item = dict(row)
+        clean_company_fields(item)
+        for field in ["issuer_bank", "from_bank", "to_bank"]:
+            item[field] = display_bank(item.get(field))
+        item.update(
+            {
+                "date_key": date_key,
+                "date": date_label,
+                "amount": amount,
+                "fee": float(row["fee"] or 0),
+                "reference": clean_display(row["reference_no"] or row["seq"] or row["aid"]),
+                "matched_side": matched_side,
+                "matched_label": matched_label,
+                "flow_type": flow_type_for_title(row["chat_title"], row["bot_key"], row["chat_id"]),
+                "flow_label": flow_label(flow_type_for_title(row["chat_title"], row["bot_key"], row["chat_id"])),
+                "image_url": image_url_for(row["file_id"], row["id"]),
+            }
+        )
+        matched.append(item)
+    company_rows = account_slip_search_company_summary(matched)
+    row_limit = int(limit or 0)
+    visible_rows = matched if row_limit <= 0 else matched[:row_limit]
+    return {"query": query, "count": len(matched), "amount": total_amount, "rows": visible_rows, "truncated": row_limit > 0 and len(matched) > row_limit, "company_count": len(company_rows), "companies": company_rows}
+
+
+def cross_company_account_slip_search_rows(conn: sqlite3.Connection, scope: str = "all", flow_type: str = "all", search: str = "", limit: int = 120) -> Dict[str, Any]:
+    """Individual counted slip rows for one account across every company in the selected date/flow scope."""
+    query = clean_display(search)
+    if not query:
+        result = empty_account_slip_search(query)
+        result.update({"company_count": 0, "companies": []})
+        return result
+    where_clause, params, _ = global_scope_where(scope, success_only=True)
+    where_clause, params = apply_flow_sql(where_clause, params, flow_type)
+    result = account_slip_search_rows(conn, where_clause, params, query, limit=limit)
+    company_rows = result.get("companies") or []
+    result.update({"company_count": len(company_rows), "companies": company_rows})
+    return result
+
+
+def count_amount_for_where(conn: sqlite3.Connection, where_clause: str, params: List[Any]) -> Dict[str, Any]:
+    row = conn.execute(f"SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount FROM slips WHERE {where_clause}", params).fetchone()
+    return {"count": int(row["count"] or 0), "amount": float(row["amount"] or 0)}
+
+
+def flow_split_panels(
+    conn: sqlite3.Connection,
+    selected_where: str,
+    selected_params: List[Any],
+    flow_type: str,
+    account_limits: Dict[str, Dict[str, Any]],
+    search: str = "",
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+    limit_where, limit_params = limit_scope_clause(selected_where, selected_params, flow_type)
+    deposit_where, deposit_params = deposit_customer_scope_clause(selected_where, selected_params, flow_type)
+    by_transferor = transferor_totals(conn, limit_where, limit_params, account_limits=account_limits)
+    by_account_day = daily_account_totals(conn, limit_where, limit_params, account_limits=account_limits)
+    deposit_customer_slips = slip_list_rows(conn, deposit_where, deposit_params, search)
+    withdraw_limit_totals = count_amount_for_where(conn, limit_where, limit_params)
+    deposit_customer_totals = count_amount_for_where(conn, deposit_where, deposit_params)
+    return by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals
+
+
+def ensure_bank_review_log_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bank_review_logs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          slip_id TEXT NOT NULL,
+          bot_key TEXT,
+          chat_id TEXT,
+          provider TEXT,
+          model TEXT,
+          applied INTEGER DEFAULT 0,
+          previous_json TEXT,
+          suggested_json TEXT,
+          created_at INTEGER NOT NULL
+        )
+        """
+    )
+
+
+def openai_bank_double_check_slip(db_path: Path, slip_id: str, apply: bool = True) -> Dict[str, Any]:
+    slip_id = clean_display(slip_id)
+    if not slip_id:
+        return {"ok": False, "error": "missing slip id"}
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT id, COALESCE(NULLIF(bot_key,''),'default') AS bot_key, chat_id, file_id,
+                   issuer_bank, from_bank, to_bank
+            FROM slips
+            WHERE id=? AND status='success'
+            """,
+            (slip_id,),
+        ).fetchone()
+    if not row:
+        return {"ok": False, "error": "slip not found"}
+    if not row["file_id"]:
+        return {"ok": False, "error": "slip image not found"}
+
+    body, mime = fetch_slip_image(db_path, slip_id)
+    suffix = mimetypes.guess_extension(mime or "image/jpeg") or ".jpg"
+    tmp_name = ""
+    try:
+        with tempfile.NamedTemporaryFile(prefix="auditslip-bank-review-", suffix=suffix, delete=False) as tmp:
+            tmp.write(body)
+            tmp_name = tmp.name
+        data, meta = openai_extract(Path(tmp_name), mime)
+    finally:
+        if tmp_name:
+            try:
+                Path(tmp_name).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    normalized = normalize_record(data)
+    suggested = {
+        "issuer_bank": display_bank(normalized.get("issuer_bank")),
+        "from_bank": display_bank(normalized.get("from_bank")),
+        "to_bank": display_bank(normalized.get("to_bank")),
+        "confidence": float(normalized.get("confidence") or 0),
+        "raw_text": clean_display(normalized.get("raw_text")),
+    }
+    if bank_needs_review(suggested.get("from_bank")) and is_known_bank(suggested.get("issuer_bank")):
+        suggested["from_bank"] = suggested["issuer_bank"]
+    previous = {field: display_bank(row[field]) for field in ["issuer_bank", "from_bank", "to_bank"]}
+    applied: Dict[str, str] = {}
+    for field in ["issuer_bank", "from_bank", "to_bank"]:
+        value = suggested.get(field) or ""
+        if value and bank_needs_review(previous.get(field)):
+            applied[field] = value
+
+    did_apply = bool(apply and applied)
+    with connect(db_path) as conn:
+        ensure_bank_review_log_table(conn)
+        if did_apply:
+            assignments = ", ".join([f"{field}=?" for field in applied])
+            conn.execute(f"UPDATE slips SET {assignments} WHERE id=?", [*applied.values(), slip_id])
+        conn.execute(
+            """
+            INSERT INTO bank_review_logs(slip_id, bot_key, chat_id, provider, model, applied, previous_json, suggested_json, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                slip_id,
+                row["bot_key"],
+                row["chat_id"],
+                meta.get("provider", "openai"),
+                meta.get("model", ""),
+                1 if did_apply else 0,
+                json.dumps(previous, ensure_ascii=False),
+                json.dumps({"suggested": suggested, "applied": applied, "raw": data}, ensure_ascii=False),
+                int(time.time()),
+            ),
+        )
+        conn.commit()
+    return {
+        "ok": True,
+        "id": slip_id,
+        "provider": meta.get("provider", "openai"),
+        "model": meta.get("model", ""),
+        "previous": previous,
+        "suggested": suggested,
+        "applied": applied if did_apply else {},
+    }
+
+
+def dashboard_success_scope(chat_id: str = "", bot_key: str = "", scope: str = "open", flow_type: str = "all") -> Tuple[str, List[Any], str]:
+    """Build the selected dashboard success/non-duplicate scope for bulk actions."""
+    selected_bot = clean_display(bot_key)
+    if chat_id:
+        scoped_bot = selected_bot if selected_bot not in {"__all__", "all"} else ""
+        where_clause, params, label = scope_where(chat_id, scope, success_only=True, bot_key=scoped_bot)
+    else:
+        scoped_bot = selected_bot if selected_bot not in {"__all__", "all"} else ""
+        where_clause, params, label = global_scope_where(scope, success_only=True, bot_key=scoped_bot)
+    where_clause, params = apply_flow_sql(where_clause, params, flow_type)
+    return where_clause, params, label
+
+
+def openai_bank_recheck_scope(
+    db_path: Path,
+    chat_id: str = "",
+    bot_key: str = "",
+    scope: str = "open",
+    flow_type: str = "all",
+    search: str = "",
+    apply: bool = True,
+) -> Dict[str, Any]:
+    """Run bank recheck for every matching slip in the selected scope, not only visible cards."""
+    where_clause, params, label = dashboard_success_scope(chat_id=chat_id, bot_key=bot_key, scope=scope, flow_type=flow_type)
+    with connect(db_path) as conn:
+        ids = source_bank_review_ids(conn, where_clause, params, search)
+    ok_count = 0
+    fail_count = 0
+    errors: List[Dict[str, Any]] = []
+    for slip_id in ids:
+        result: Dict[str, Any] = {"ok": False, "error": "not attempted"}
+        last_error = ""
+        for attempt in range(1, 4):
+            try:
+                result = openai_bank_double_check_slip(db_path, slip_id, apply=apply)
+                break
+            except Exception as exc:
+                last_error = str(exc)
+                is_rate_limit = "429" in last_error or "rate limit" in last_error.lower()
+                if is_rate_limit and attempt < 3:
+                    time.sleep(1.0 * attempt)
+                    continue
+                result = {"ok": False, "error": last_error}
+                break
+        if result.get("ok"):
+            ok_count += 1
+        else:
+            fail_count += 1
+            if len(errors) < 10:
+                errors.append({"id": slip_id, "error": result.get("error", "unknown error")})
+    return {
+        "ok": fail_count == 0,
+        "scope": {"chat_id": chat_id, "bot_key": bot_key, "flow_type": normalize_flow_type(flow_type), "date_scope": label},
+        "total_count": len(ids),
+        "ok_count": ok_count,
+        "fail_count": fail_count,
+        "errors": errors,
+    }
+
+
+
+def reprocess_dashboard_slip(db_path: Path, slip_id: str, bot_key: str = "") -> Dict[str, Any]:
+    """Re-run OCR for one unclear/error slip from the dashboard, preserving the same slip id."""
+    slip_id = clean_display(slip_id)
+    if not slip_id:
+        return {"ok": False, "error": "missing slip id"}
+    bot_filter = clean_display(bot_key)
+    with connect(db_path) as conn:
+        if bot_filter and bot_filter not in {"__all__", "all"}:
+            row = conn.execute("SELECT * FROM slips WHERE id=? AND COALESCE(bot_key,'default')=?", (slip_id, bot_filter)).fetchone()
+        else:
+            row = conn.execute("SELECT * FROM slips WHERE id=?", (slip_id,)).fetchone()
+    if not row:
+        return {"ok": False, "error": "slip not found"}
+    if not row["file_id"]:
+        return {"ok": False, "error": "slip image not found"}
+
+    previous = {"status": row["status"], "error": row["error"], "amount": float(row["amount"] or 0), "confidence": float(row["confidence"] or 0)}
+    body, mime = fetch_slip_image(db_path, slip_id)
+    suffix = mimetypes.guess_extension(mime or "image/jpeg") or ".jpg"
+    tmp_name = ""
+    try:
+        with tempfile.NamedTemporaryFile(prefix="auditslip-reprocess-", suffix=suffix, delete=False) as tmp:
+            tmp.write(body)
+            tmp_name = tmp.name
+        provider, data = ocr_extract(Path(tmp_name), mime)
+    finally:
+        if tmp_name:
+            try:
+                Path(tmp_name).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    reason = unclear_reason(data)
+    status = "unclear" if reason else "success"
+    saved = dict(row)
+    saved.update(data)
+    saved["status"] = status
+    saved["error"] = reason
+    saved["ocr_provider"] = provider
+    saved["raw_json"] = data.get("raw_json") or json.dumps(data, ensure_ascii=False)
+    row_bot_key = clean_display(row["bot_key"]) or "default"
+    bot = AuditslipBot(
+        token=token_for_bot(row_bot_key),
+        db_path=db_path,
+        dry_run=True,
+        bot_key=row_bot_key,
+        company_name=clean_company_name(row["company_name"], row_bot_key),
+    )
+    bot.save_slip(saved)
+    return {
+        "ok": True,
+        "id": slip_id,
+        "bot_key": row_bot_key,
+        "provider": provider,
+        "previous": previous,
+        "status": status,
+        "error": reason,
+        "amount": float(saved.get("amount") or 0),
+        "confidence": float(saved.get("confidence") or 0),
+    }
+
+
+
+def company_overview_dicts(company_rows: List[sqlite3.Row], job_rows: List[sqlite3.Row]) -> List[Dict[str, Any]]:
+    jobs_by_bot: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for r in job_rows:
+        jobs_by_bot[str(r["bot_key"])][str(r["status"])] += int(r["count"] or 0)
+    out = []
+    for r in company_rows:
+        item = clean_company_fields(dict(r))
+        bot = str(item.get("bot_key") or "default")
+        jobs = dict(jobs_by_bot.get(bot, {}))
+        item["jobs"] = jobs
+        item["queued"] = int(jobs.get("queued", 0))
+        item["processing"] = int(jobs.get("processing", 0))
+        item["failed"] = int(jobs.get("failed", 0))
+        out.append(item)
+    return sorted(out, key=dict_company_sort_key)
+
+def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = "open", bot_key: str = "", slip_filter: str = "all", slip_search: str = "", flow_type: str = "all") -> Dict[str, Any]:
+    slip_filter_key = clean_display(slip_filter).lower() or "all"
+    slip_search_key = clean_display(slip_search)
+    flow_type_key = normalize_flow_type(flow_type)
+    with connect(db_path) as conn:
+        chats = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(bot_key,''),'default') AS bot_key,
+                   COALESCE(MAX(NULLIF(company_name,'')), COALESCE(NULLIF(bot_key,''),'default')) AS company_name,
+                   chat_id,
+                   COALESCE(MAX(NULLIF(chat_title,'')), chat_id) AS chat_title,
+                   COUNT(*) AS total_rows,
+                   SUM(CASE WHEN status='success' AND COALESCE(is_duplicate,0)=0 AND settlement_id IS NULL THEN 1 ELSE 0 END) AS open_count,
+                   COALESCE(SUM(CASE WHEN status='success' AND COALESCE(is_duplicate,0)=0 AND settlement_id IS NULL THEN amount ELSE 0 END),0) AS open_amount
+            FROM slips
+            GROUP BY COALESCE(NULLIF(bot_key,''),'default'), chat_id
+            ORDER BY open_amount DESC, total_rows DESC
+            LIMIT 100
+            """
+        ).fetchall()
+        chat_dicts = rows_to_dicts(chats)
+        for chat in chat_dicts:
+            clean_company_fields(chat)
+            chat["flow_type"] = flow_type_for_title(chat.get("chat_title"), chat.get("bot_key"), chat.get("chat_id"))
+            chat["flow_label"] = flow_label(chat["flow_type"])
+        chat_dicts.sort(key=lambda r: (*dict_company_sort_key(r), clean_display(r.get("chat_title")), clean_display(r.get("chat_id"))))
+        requested_bot_key = clean_display(bot_key)
+        overview_mode = (not chat_id) and (not requested_bot_key or requested_bot_key in {"__all__", "all"})
+        if overview_mode:
+            selected_bot_key = "__all__"
+            selected_chat_id = ""
+        elif chat_id:
+            selected_chat_id = str(chat_id)
+            match = next((c for c in chat_dicts if str(c.get("chat_id")) == selected_chat_id and (not requested_bot_key or str(c.get("bot_key")) == requested_bot_key)), None)
+            selected_bot_key = requested_bot_key or (str(match.get("bot_key")) if match else "default")
+        elif requested_bot_key:
+            selected_bot_key = requested_bot_key
+            selected_chat_id = ""
+        else:
+            selected_bot_key = "__all__"
+            selected_chat_id = ""
+
+        if selected_bot_key == "__all__":
+            selected_where, selected_params, scope_label = global_scope_where(scope, success_only=True)
+            selected_where, selected_params = apply_flow_sql(selected_where, selected_params, flow_type_key)
+            selected_all_where, selected_all_params, _ = global_scope_where(scope, success_only=False)
+            selected_all_where, selected_all_params = apply_flow_sql(selected_all_where, selected_all_params, flow_type_key)
+            duplicate_where = selected_all_where + " AND status='success' AND COALESCE(is_duplicate,0)=1"
+            duplicate_params = selected_all_params
+            account_limits = {}
+            company_accounts = []
+            open_where, open_params, _ = global_scope_where("open", success_only=True)
+            open_where, open_params = apply_flow_sql(open_where, open_params, flow_type_key)
+            all_where, all_params, _ = global_scope_where("all", success_only=True)
+            all_where, all_params = apply_flow_sql(all_where, all_params, flow_type_key)
+            open_totals = conn.execute(f"SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount FROM slips WHERE {open_where}", open_params).fetchone()
+            all_totals = conn.execute(f"SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount FROM slips WHERE {all_where}", all_params).fetchone()
+            selected_totals = conn.execute(f"SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount FROM slips WHERE {selected_where}", selected_params).fetchone()
+            duplicate_totals = conn.execute(f"SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount FROM slips WHERE {duplicate_where}", duplicate_params).fetchone()
+            status_where = "WHERE 1=1"
+            status_params: List[Any] = []
+            status_extra, status_extra_params = flow_sql_clause(flow_type_key)
+            status_where += status_extra
+            status_params.extend(status_extra_params)
+            recent_where = f"WHERE {selected_all_where} AND COALESCE(status,'')!='deleted'"
+            recent_params = list(selected_all_params)
+            if slip_filter_key in {"duplicate", "duplicates", "dupe", "duplicateonly"}:
+                recent_where += " AND status='success' AND COALESCE(is_duplicate,0)=1"
+            elif slip_filter_key in {"nonduplicate", "normal", "success"}:
+                recent_where += " AND status='success' AND COALESCE(is_duplicate,0)=0"
+            elif slip_filter_key in {"issue", "issues", "error"}:
+                recent_where += " AND status IN ('unclear','error')"
+            recent_search_clause, recent_search_params = slip_search_clause("slips", slip_search_key)
+            recent_where += recent_search_clause
+            recent_params.extend(recent_search_params)
+            issue_where = f"WHERE {selected_all_where} AND status IN ('unclear','error')"
+            issue_params = list(selected_all_params)
+            issue_extra, issue_extra_params = flow_sql_clause(flow_type_key)
+            issue_where += issue_extra
+            issue_params.extend(issue_extra_params)
+            job_where = ""
+            job_params = []
+            job_recent_where = "WHERE status IN ('queued','processing','failed')"
+            job_recent_params = []
+            by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals = flow_split_panels(
+                conn, selected_where, selected_params, flow_type_key, account_limits, slip_search_key
+            )
+            duplicate_pairs = duplicate_pair_rows(conn, "", scope, "", slip_search_key, flow_type=flow_type_key)
+            source_bank_review = source_bank_review_rows(conn, selected_where, selected_params, slip_search_key)
+            source_bank_review_total = source_bank_review_count(conn, selected_where, selected_params, slip_search_key)
+            by_date = date_totals(conn, selected_where, selected_params)
+            daily_flow_summary = daily_flow_totals(conn, selected_where, selected_params)
+            by_from_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(from_bank,''), '(ไม่ทราบธนาคารต้นทาง)')", "(ไม่ทราบธนาคารต้นทาง)")
+            by_to_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(to_bank,''), '(ไม่ทราบธนาคารปลายทาง)')", "(ไม่ทราบธนาคารปลายทาง)")
+            by_sender = grouped_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(sender_name,''), NULLIF(username,''), '(ไม่ทราบผู้ส่งรูป)')")
+            company_account_daily = company_account_daily_totals(conn, selected_where, selected_params, slip_search_key)
+            account_slip_search = account_slip_search_rows(conn, selected_where, selected_params, slip_search_key)
+            account_cross_company = cross_company_account_usage(conn, scope, flow_type_key, selected_bot_key, slip_search_key)
+        elif selected_chat_id:
+            selected_where, selected_params, scope_label = scope_where(selected_chat_id, scope, success_only=True, bot_key=selected_bot_key)
+            selected_where, selected_params = apply_flow_sql(selected_where, selected_params, flow_type_key)
+            selected_all_where, selected_all_params, _ = scope_where(selected_chat_id, scope, success_only=False, bot_key=selected_bot_key)
+            selected_all_where, selected_all_params = apply_flow_sql(selected_all_where, selected_all_params, flow_type_key)
+            duplicate_where = selected_all_where + " AND status='success' AND COALESCE(is_duplicate,0)=1"
+            duplicate_params = selected_all_params
+            account_limits = load_account_limits(conn, selected_chat_id)
+            company_accounts = load_company_accounts(conn, selected_bot_key, selected_chat_id)
+            open_totals = scoped_counts(conn, selected_chat_id, "open", bot_key=selected_bot_key)
+            all_totals = scoped_counts(conn, selected_chat_id, "all", bot_key=selected_bot_key)
+            selected_totals = conn.execute(
+                f"SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount FROM slips WHERE {selected_where}",
+                selected_params,
+            ).fetchone()
+            duplicate_totals = conn.execute(
+                f"SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount FROM slips WHERE {duplicate_where}",
+                duplicate_params,
+            ).fetchone()
+            status_where = "WHERE chat_id=? AND COALESCE(bot_key,'default')=?"
+            status_params = [selected_chat_id, selected_bot_key]
+            status_extra, status_extra_params = flow_sql_clause(flow_type_key)
+            status_where += status_extra
+            status_params.extend(status_extra_params)
+            recent_where = f"WHERE {selected_all_where} AND COALESCE(status,'')!='deleted'"
+            recent_params = list(selected_all_params)
+            if slip_filter_key in {"duplicate", "duplicates", "dupe", "duplicateonly"}:
+                recent_where += " AND status='success' AND COALESCE(is_duplicate,0)=1"
+            elif slip_filter_key in {"nonduplicate", "normal", "success"}:
+                recent_where += " AND status='success' AND COALESCE(is_duplicate,0)=0"
+            elif slip_filter_key in {"issue", "issues", "error"}:
+                recent_where += " AND status IN ('unclear','error')"
+            recent_search_clause, recent_search_params = slip_search_clause("slips", slip_search_key)
+            recent_where += recent_search_clause
+            recent_params.extend(recent_search_params)
+            issue_where = f"WHERE {selected_all_where} AND status IN ('unclear','error')"
+            issue_params = list(selected_all_params)
+            issue_extra, issue_extra_params = flow_sql_clause(flow_type_key)
+            issue_where += issue_extra
+            issue_params.extend(issue_extra_params)
+            job_where = "WHERE chat_id=? AND COALESCE(bot_key,'default')=?"
+            job_params = [selected_chat_id, selected_bot_key]
+            job_recent_where = "WHERE chat_id=? AND COALESCE(bot_key,'default')=? AND status IN ('queued','processing','failed')"
+            job_recent_params = [selected_chat_id, selected_bot_key]
+            by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals = flow_split_panels(
+                conn, selected_where, selected_params, flow_type_key, account_limits, slip_search_key
+            )
+            duplicate_pairs = duplicate_pair_rows(conn, selected_chat_id, scope, selected_bot_key, slip_search_key, flow_type=flow_type_key)
+            source_bank_review = source_bank_review_rows(conn, selected_where, selected_params, slip_search_key)
+            source_bank_review_total = source_bank_review_count(conn, selected_where, selected_params, slip_search_key)
+            by_date = date_totals(conn, selected_where, selected_params)
+            daily_flow_summary = daily_flow_totals(conn, selected_where, selected_params)
+            by_from_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(from_bank,''), '(ไม่ทราบธนาคารต้นทาง)')", "(ไม่ทราบธนาคารต้นทาง)")
+            by_to_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(to_bank,''), '(ไม่ทราบธนาคารปลายทาง)')", "(ไม่ทราบธนาคารปลายทาง)")
+            by_sender = grouped_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(sender_name,''), NULLIF(username,''), '(ไม่ทราบผู้ส่งรูป)')")
+            company_account_daily = company_account_daily_totals(conn, selected_where, selected_params, slip_search_key)
+            account_slip_search = account_slip_search_rows(conn, selected_where, selected_params, slip_search_key)
+            account_cross_company = cross_company_account_usage(conn, scope, flow_type_key, selected_bot_key, slip_search_key)
+        else:
+            selected_bot_key = selected_bot_key or requested_bot_key
+            if selected_bot_key:
+                selected_where, selected_params, scope_label = global_scope_where(scope, success_only=True, bot_key=selected_bot_key)
+                selected_where, selected_params = apply_flow_sql(selected_where, selected_params, flow_type_key)
+                selected_all_where, selected_all_params, _ = global_scope_where(scope, success_only=False, bot_key=selected_bot_key)
+                selected_all_where, selected_all_params = apply_flow_sql(selected_all_where, selected_all_params, flow_type_key)
+                duplicate_where = selected_all_where + " AND status='success' AND COALESCE(is_duplicate,0)=1"
+                duplicate_params = selected_all_params
+                open_where, open_params, _ = global_scope_where("open", success_only=True, bot_key=selected_bot_key)
+                open_where, open_params = apply_flow_sql(open_where, open_params, flow_type_key)
+                all_where, all_params, _ = global_scope_where("all", success_only=True, bot_key=selected_bot_key)
+                all_where, all_params = apply_flow_sql(all_where, all_params, flow_type_key)
+                open_totals = conn.execute(f"SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount FROM slips WHERE {open_where}", open_params).fetchone()
+                all_totals = conn.execute(f"SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount FROM slips WHERE {all_where}", all_params).fetchone()
+                selected_totals = conn.execute(f"SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount FROM slips WHERE {selected_where}", selected_params).fetchone()
+                duplicate_totals = conn.execute(f"SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount FROM slips WHERE {duplicate_where}", duplicate_params).fetchone()
+                account_limits = {}
+                company_accounts = load_company_accounts(conn, selected_bot_key, "")
+                status_where = "WHERE COALESCE(bot_key,'default')=?"
+                status_params = [selected_bot_key]
+                status_extra, status_extra_params = flow_sql_clause(flow_type_key)
+                status_where += status_extra
+                status_params.extend(status_extra_params)
+                recent_where = f"WHERE {selected_all_where} AND COALESCE(status,'')!='deleted'"
+                recent_params = list(selected_all_params)
+                if slip_filter_key in {"duplicate", "duplicates", "dupe", "duplicateonly"}:
+                    recent_where += " AND status='success' AND COALESCE(is_duplicate,0)=1"
+                elif slip_filter_key in {"nonduplicate", "normal", "success"}:
+                    recent_where += " AND status='success' AND COALESCE(is_duplicate,0)=0"
+                elif slip_filter_key in {"issue", "issues", "error"}:
+                    recent_where += " AND status IN ('unclear','error')"
+                recent_search_clause, recent_search_params = slip_search_clause("slips", slip_search_key)
+                recent_where += recent_search_clause
+                recent_params.extend(recent_search_params)
+                issue_where = f"WHERE {selected_all_where} AND status IN ('unclear','error')"
+                issue_params = list(selected_all_params)
+                issue_extra, issue_extra_params = flow_sql_clause(flow_type_key)
+                issue_where += issue_extra
+                issue_params.extend(issue_extra_params)
+                job_where = "WHERE COALESCE(bot_key,'default')=?"
+                job_params = [selected_bot_key]
+                job_recent_where = "WHERE COALESCE(bot_key,'default')=? AND status IN ('queued','processing','failed')"
+                job_recent_params = [selected_bot_key]
+                by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals = flow_split_panels(
+                    conn, selected_where, selected_params, flow_type_key, account_limits, slip_search_key
+                )
+                duplicate_pairs = duplicate_pair_rows(conn, "", scope, selected_bot_key, slip_search_key, flow_type=flow_type_key)
+                source_bank_review = source_bank_review_rows(conn, selected_where, selected_params, slip_search_key)
+                source_bank_review_total = source_bank_review_count(conn, selected_where, selected_params, slip_search_key)
+                by_date = date_totals(conn, selected_where, selected_params)
+                daily_flow_summary = daily_flow_totals(conn, selected_where, selected_params)
+                by_from_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(from_bank,''), '(ไม่ทราบธนาคารต้นทาง)')", "(ไม่ทราบธนาคารต้นทาง)")
+                by_to_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(to_bank,''), '(ไม่ทราบธนาคารปลายทาง)')", "(ไม่ทราบธนาคารปลายทาง)")
+                by_sender = grouped_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(sender_name,''), NULLIF(username,''), '(ไม่ทราบผู้ส่งรูป)')")
+                company_account_daily = company_account_daily_totals(conn, selected_where, selected_params, slip_search_key)
+                account_slip_search = account_slip_search_rows(conn, selected_where, selected_params, slip_search_key)
+                account_cross_company = cross_company_account_usage(conn, scope, flow_type_key, selected_bot_key, slip_search_key)
+            else:
+                scope_label = "ไม่มีข้อมูล"
+                open_totals = {"count": 0, "amount": 0}
+                all_totals = {"count": 0, "amount": 0}
+                selected_totals = {"count": 0, "amount": 0}
+                duplicate_totals = {"count": 0, "amount": 0}
+                status_where = ""
+                status_params = []
+                recent_where = ""
+                recent_params = []
+                issue_where = "WHERE status IN ('unclear','error')"
+                issue_params = []
+                job_where = ""
+                job_params = []
+                job_recent_where = "WHERE status IN ('queued','processing','failed')"
+                job_recent_params = []
+                company_accounts = []
+                by_transferor = by_account_day = by_date = by_from_bank = by_to_bank = by_sender = []
+                daily_flow_summary = []
+                company_account_daily = []
+                account_slip_search = empty_account_slip_search(slip_search_key)
+                account_cross_company = []
+                deposit_customer_slips = []
+                withdraw_limit_totals = {"count": 0, "amount": 0.0}
+                deposit_customer_totals = {"count": 0, "amount": 0.0}
+                duplicate_pairs = []
+                source_bank_review = []
+                source_bank_review_total = 0
+
+        cross_company_account_slip_search = cross_company_account_slip_search_rows(conn, scope, flow_type_key, slip_search_key)
+
+        slip_status_rows = conn.execute(f"SELECT status, COUNT(*) AS count FROM slips {status_where} GROUP BY status", status_params).fetchall()
+        job_status_rows = conn.execute(f"SELECT status, COUNT(*) AS count FROM ocr_jobs {job_where} GROUP BY status", job_params).fetchall()
+        recent = conn.execute(
+            f"""
+            SELECT id, COALESCE(NULLIF(bot_key,''),'default') AS bot_key, company_name, chat_id, chat_title, file_id, message_id,
+                   status, error, slip_date_display, slip_date_iso, slip_time,
+                   TRIM(COALESCE(NULLIF(slip_date_display,''), NULLIF(slip_date_iso,''), '') || ' ' || COALESCE(NULLIF(slip_time,''), '')) AS slip_date_text,
+                   transferor_name, recipient_name, sender_name, username, issuer_bank, from_bank, to_bank,
+                   amount, confidence, created_at_iso, settlement_id, is_duplicate, duplicate_of
+            FROM slips
+            {recent_where}
+            -- Operator "recent slips" should follow the slip/message chronology, not OCR completion time.
+            -- A delayed OCR batch can otherwise hide later withdrawal messages behind older slips that finished late.
+            ORDER BY COALESCE(NULLIF(slip_date_iso,''), '') DESC,
+                     COALESCE(NULLIF(slip_time,''), '') DESC,
+                     CAST(COALESCE(message_id,0) AS INTEGER) DESC,
+                     created_at DESC
+            LIMIT 40
+            """,
+            recent_params,
+        ).fetchall()
+        issues = conn.execute(
+            f"""
+            SELECT id, COALESCE(NULLIF(bot_key,''),'default') AS bot_key, company_name, chat_id, chat_title, file_id,
+                   status, error, message_id, created_at_iso,
+                   TRIM(COALESCE(NULLIF(slip_date_display,''), NULLIF(slip_date_iso,''), '') || ' ' || COALESCE(NULLIF(slip_time,''), '')) AS slip_date_text,
+                   transferor_name, recipient_name, sender_name, username, amount, confidence, raw_text
+            FROM slips
+            {issue_where}
+            ORDER BY created_at DESC
+            LIMIT 40
+            """,
+            issue_params,
+        ).fetchall()
+        issue_count_row = conn.execute(f"SELECT COUNT(*) AS count FROM slips {issue_where}", issue_params).fetchone()
+        issue_queue_count_total = int(issue_count_row["count"] or 0) if issue_count_row else 0
+        provider_usage = conn.execute(
+            f"""
+            SELECT COALESCE(NULLIF(ocr_provider,''), '(pending)') AS provider,
+                   COALESCE(NULLIF(ocr_model,''), '') AS model,
+                   status,
+                   COUNT(*) AS count
+            FROM slips
+            {status_where}
+            GROUP BY provider, model, status
+            ORDER BY provider, model, status
+            """,
+            status_params,
+        ).fetchall()
+        jobs_recent = conn.execute(
+            f"""
+            SELECT job_id, slip_id, COALESCE(NULLIF(bot_key,''),'default') AS bot_key, company_name, chat_id, message_id, status, attempts, max_attempts, locked_by, error, created_at, updated_at
+            FROM ocr_jobs
+            {job_recent_where}
+            ORDER BY created_at ASC
+            LIMIT 50
+            """,
+            job_recent_params,
+        ).fetchall()
+
+        company_where = "WHERE 1=1"
+        company_where_params: List[Any] = []
+        company_extra, company_extra_params = flow_sql_clause(flow_type_key)
+        company_where += company_extra
+        company_where_params.extend(company_extra_params)
+
+        # The operator/company overview cards are labelled by the selected scope
+        # (today / selected day / range / open).  Keep the historical rows only as
+        # the company source list, but calculate every visible amount/count inside
+        # the current dashboard scope.  Otherwise a new day still shows yesterday's
+        # open-period totals and looks like the daily counter did not reset.
+        company_scope_where, company_scope_params, _ = global_scope_where(scope, success_only=True)
+        company_scope_where, company_scope_params = apply_flow_sql(company_scope_where, company_scope_params, flow_type_key)
+        deposit_scope_where, deposit_scope_params, _ = global_scope_where(scope, success_only=True)
+        deposit_scope_where, deposit_scope_params = apply_flow_sql(deposit_scope_where, deposit_scope_params, "deposit")
+        withdraw_scope_where, withdraw_scope_params, _ = global_scope_where(scope, success_only=True)
+        withdraw_scope_where, withdraw_scope_params = apply_flow_sql(withdraw_scope_where, withdraw_scope_params, "withdraw")
+        duplicate_scope_where, duplicate_scope_params, _ = global_scope_where(scope, success_only=False)
+        duplicate_scope_where += " AND status='success' AND COALESCE(is_duplicate,0)=1"
+        duplicate_scope_where, duplicate_scope_params = apply_flow_sql(duplicate_scope_where, duplicate_scope_params, flow_type_key)
+        issue_scope_where, issue_scope_params, _ = global_scope_where(scope, success_only=False)
+        issue_scope_where += " AND status IN ('unclear','error')"
+        issue_scope_where, issue_scope_params = apply_flow_sql(issue_scope_where, issue_scope_params, flow_type_key)
+        company_params: List[Any] = [
+            *company_scope_params,
+            *company_scope_params,
+            *deposit_scope_params,
+            *deposit_scope_params,
+            *withdraw_scope_params,
+            *withdraw_scope_params,
+            *duplicate_scope_params,
+            *duplicate_scope_params,
+            *issue_scope_params,
+            *company_scope_params,
+            *company_where_params,
+        ]
+        company_rows = conn.execute(
+            f"""
+            SELECT COALESCE(NULLIF(bot_key,''),'default') AS bot_key,
+                   COALESCE(MAX(NULLIF(company_name,'')), COALESCE(NULLIF(bot_key,''),'default')) AS company_name,
+                   COUNT(*) AS total_rows,
+                   SUM(CASE WHEN {company_scope_where} THEN 1 ELSE 0 END) AS open_count,
+                   COALESCE(SUM(CASE WHEN {company_scope_where} THEN amount ELSE 0 END),0) AS open_amount,
+                   SUM(CASE WHEN {deposit_scope_where} THEN 1 ELSE 0 END) AS deposit_open_count,
+                   COALESCE(SUM(CASE WHEN {deposit_scope_where} THEN amount ELSE 0 END),0) AS deposit_open_amount,
+                   SUM(CASE WHEN {withdraw_scope_where} THEN 1 ELSE 0 END) AS withdraw_open_count,
+                   COALESCE(SUM(CASE WHEN {withdraw_scope_where} THEN amount ELSE 0 END),0) AS withdraw_open_amount,
+                   SUM(CASE WHEN {duplicate_scope_where} THEN 1 ELSE 0 END) AS duplicate_count,
+                   COALESCE(SUM(CASE WHEN {duplicate_scope_where} THEN amount ELSE 0 END),0) AS duplicate_amount,
+                   SUM(CASE WHEN {issue_scope_where} THEN 1 ELSE 0 END) AS issue_count,
+                   MAX(CASE WHEN {company_scope_where} THEN created_at_iso ELSE NULL END) AS latest_slip_at
+            FROM slips
+            {company_where}
+            GROUP BY COALESCE(NULLIF(bot_key,''),'default')
+            ORDER BY open_amount DESC, total_rows DESC
+            """,
+            company_params,
+        ).fetchall()
+        company_job_rows = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(bot_key,''),'default') AS bot_key, status, COUNT(*) AS count
+            FROM ocr_jobs
+            GROUP BY COALESCE(NULLIF(bot_key,''),'default'), status
+            """
+        ).fetchall()
+
+    slip_statuses = defaultdict(int)
+    for r in slip_status_rows:
+        slip_statuses[str(r["status"])] += int(r["count"] or 0)
+    jobs = defaultdict(int)
+    for r in job_status_rows:
+        jobs[str(r["status"])] += int(r["count"] or 0)
+    recent_dicts = rows_to_dicts(recent)
+    for row in recent_dicts:
+        clean_company_fields(row)
+        for field in ["issuer_bank", "from_bank", "to_bank"]:
+            row[field] = display_bank(row.get(field))
+        row["image_url"] = "/api/slip-image?" + urlencode({"id": row.get("id", "")}) if row.get("file_id") else ""
+    issue_dicts = rows_to_dicts(issues)
+    for row in issue_dicts:
+        clean_company_fields(row)
+        row["image_url"] = "/api/slip-image?" + urlencode({"id": row.get("id", "")}) if row.get("file_id") else ""
+        row["raw_text"] = clean_display(row.get("raw_text"))[:240]
+
+    limit_check_enabled = limit_check_enabled_for_flow(flow_type_key)
+    if not limit_check_enabled:
+        by_transferor = []
+        by_account_day = []
+
+    company_menu_rows = company_overview_dicts(company_rows, company_job_rows)
+    selected_company_summary = company_menu_rows
+    if selected_bot_key and selected_bot_key not in {"__all__", "all"}:
+        selected_company_summary = [row for row in company_menu_rows if str(row.get("bot_key")) == str(selected_bot_key)]
+
+    duplicate_count_total = int(duplicate_totals["count"] or 0)
+    issue_count_total = int(issue_queue_count_total or 0)
+    queue_attention_count = int(jobs.get("queued", 0) or 0) + int(jobs.get("processing", 0) or 0) + int(jobs.get("failed", 0) or 0)
+    over_limit_count = sum(1 for row in (by_account_day or []) if row.get("over_limit")) if limit_check_enabled else 0
+    exception_summary = {
+        "over_limit_count": int(over_limit_count),
+        "issue_count": int(issue_count_total),
+        "bank_review_count": int(source_bank_review_total or 0),
+        "duplicate_count": int(duplicate_count_total),
+        "queue_attention_count": int(queue_attention_count),
+    }
+    exception_summary["total_count"] = sum(int(v or 0) for v in exception_summary.values())
+
+    return {
+        "app": APP_NAME,
+        "generated_at": int(time.time()),
+        "selected_chat_id": selected_chat_id,
+        "selected_bot_key": selected_bot_key,
+        "scope": scope or "open",
+        "slip_filter": slip_filter_key,
+        "slip_search": slip_search_key,
+        "flow_type": flow_type_key,
+        "flow_label": flow_label(flow_type_key),
+        "limit_check_enabled": limit_check_enabled,
+        "scope_label": scope_label,
+        "telegram_bots": public_telegram_bots(),
+        "company_accounts": company_accounts,
+        "totals": {
+            "open_success_count": int(open_totals["count"] or 0),
+            "open_success_amount": float(open_totals["amount"] or 0),
+            "all_success_count": int(all_totals["count"] or 0),
+            "all_success_amount": float(all_totals["amount"] or 0),
+            "selected_success_count": int(selected_totals["count"] or 0),
+            "selected_success_amount": float(selected_totals["amount"] or 0),
+            "selected_duplicate_count": int(duplicate_totals["count"] or 0),
+            "selected_duplicate_amount": float(duplicate_totals["amount"] or 0),
+            "withdraw_limit_count": int(withdraw_limit_totals.get("count", 0) or 0),
+            "withdraw_limit_amount": float(withdraw_limit_totals.get("amount", 0) or 0),
+            "deposit_customer_count": int(deposit_customer_totals.get("count", 0) or 0),
+            "deposit_customer_amount": float(deposit_customer_totals.get("amount", 0) or 0),
+            "source_bank_review_count": int(source_bank_review_total or 0),
+        },
+        "exception_summary": exception_summary,
+        "slip_statuses": dict(slip_statuses),
+        "jobs": dict(jobs),
+        "chats": chat_dicts,
+        "company_summary": selected_company_summary,
+        "company_menu": company_menu_rows,
+        "company_account_daily": aggregate_dicts(company_account_daily),
+        "account_slip_search": account_slip_search,
+        "cross_company_account_slip_search": cross_company_account_slip_search,
+        "account_cross_company": aggregate_dicts(account_cross_company),
+        "recent": recent_dicts,
+        "duplicate_pairs": duplicate_pairs,
+        "source_bank_review": source_bank_review,
+        "deposit_customer_slips": deposit_customer_slips,
+        "issues": issue_dicts,
+        "provider_usage": rows_to_dicts(provider_usage),
+        "jobs_recent": rows_to_dicts(jobs_recent),
+        "by_transferor": aggregate_dicts(by_transferor),
+        "by_account_day": aggregate_dicts(by_account_day),
+        "by_date": aggregate_dicts(by_date),
+        "daily_flow_summary": aggregate_dicts(daily_flow_summary),
+        "by_from_bank": aggregate_dicts(by_from_bank),
+        "by_to_bank": aggregate_dicts(by_to_bank),
+        "by_sender": rows_to_dicts(by_sender),
+    }
+
+
+def safe_backend_excel_path(path_text: str = "") -> Path:
+    base = Path(os.environ.get("AUDITSLIP_BACKEND_IMPORT_DIR", "/root/projects/auditslip/imports/backend"))
+    base.mkdir(parents=True, exist_ok=True)
+    if path_text:
+        path = Path(path_text).expanduser()
+        if not path.is_absolute():
+            path = base / path
+        return path
+    files = sorted([p for p in base.glob("*.xlsx") if p.is_file()], key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        raise FileNotFoundError(f"ไม่พบไฟล์ .xlsx ใน {base}")
+    return files[0]
+
+
+DASHBOARD_EXPORT_HEADERS = [
+    "company_name",
+    "chat_title",
+    "username",
+    "sender_name",
+    "message_id",
+    "caption",
+    "error",
+    "slip_date_display",
+    "slip_date_iso",
+    "slip_time",
+    "issuer_bank",
+    "seq",
+    "location",
+    "transaction_type",
+    "transferor_name",
+    "recipient_name",
+    "from_bank",
+    "from_account",
+    "to_bank",
+    "to_account",
+    "account_name",
+    "amount",
+    "fee",
+    "reference_no",
+    "aid",
+    "label",
+    "raw_text",
+    "confidence",
+    "is_duplicate",
+    "duplicate_of",
+    "settlement_id",
+    "created_at_iso",
+]
+
+DASHBOARD_DUPLICATE_HEADERS = [
+    "duplicate_message_id",
+    "matched_message_id",
+    "slip_date_display",
+    "slip_time",
+    "transferor_name",
+    "from_bank",
+    "from_account",
+    "to_bank",
+    "to_account",
+    "amount",
+    "reference_no",
+    "matched_reference_no",
+    "sender_name",
+    "matched_sender_name",
+    "created_at_iso",
+]
+
+CROSS_COMPANY_ACCOUNT_EXPORT_HEADERS = [
+    "company_name",
+    "chat_title",
+    "message_id",
+    "slip_date_display",
+    "slip_date_iso",
+    "slip_time",
+    "flow_label",
+    "matched_label",
+    "sender_name",
+    "transferor_name",
+    "recipient_name",
+    "from_bank",
+    "from_account",
+    "to_bank",
+    "to_account",
+    "amount",
+    "fee",
+    "reference_no",
+    "slip_image_url",
+    "created_at_iso",
+]
+
+BANK_EXPORT_FIELDS = {"issuer_bank", "from_bank", "to_bank"}
+
+
+def normalize_export_date(value: str) -> str:
+    display, iso = normalize_date_parts(value)
+    return iso or clean_display(value)
+
+
+def export_date_bounds(start_date: str = "", end_date: str = "") -> Tuple[str, str]:
+    start = normalize_export_date(start_date)
+    end = normalize_export_date(end_date)
+    if start and end and start > end:
+        start, end = end, start
+    return start, end
+
+
+def export_row_date(row: sqlite3.Row) -> str:
+    row_keys = set(row.keys())
+    iso_value = row["slip_date_iso"] if "slip_date_iso" in row_keys else ""
+    display_value = row["slip_date_display"] if "slip_date_display" in row_keys else ""
+    return normalize_match_date(iso_value or display_value)
+
+
+def export_row_in_date_range(row: sqlite3.Row, start_date: str = "", end_date: str = "") -> bool:
+    start, end = export_date_bounds(start_date, end_date)
+    if not start and not end:
+        return True
+    date_key = export_row_date(row)
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_key):
+        return False
+    if start and date_key < start:
+        return False
+    if end and date_key > end:
+        return False
+    return True
+
+
+def export_date_range_clause(start_date: str = "", end_date: str = "") -> Tuple[str, List[Any]]:
+    # Kept for older tests/callers, but export_dashboard_excel filters date ranges
+    # in Python so visible dates without slip_date_iso (for example 22/05/26 or Thai
+    # Buddhist-era labels) are not silently excluded by lexical SQL comparisons.
+    start, end = export_date_bounds(start_date, end_date)
+    clause = ""
+    params: List[Any] = []
+    date_expr = "COALESCE(NULLIF(slip_date_iso,''), slip_date_display)"
+    if start and end:
+        clause += f" AND {date_expr} BETWEEN ? AND ?"
+        params.extend([start, end])
+    elif start:
+        clause += f" AND {date_expr} >= ?"
+        params.append(start)
+    elif end:
+        clause += f" AND {date_expr} <= ?"
+        params.append(end)
+    return clause, params
+
+
+def export_where_clause(bot_key: str = "", chat_id: str = "", flow_type: str = "all", scope: str = "all", start_date: str = "", end_date: str = "") -> Tuple[str, List[Any]]:
+    requested_bot = clean_display(bot_key)
+    effective_scope = scope if not (start_date or end_date) else "all"
+    if chat_id:
+        clause, params, _ = scope_where(str(chat_id), effective_scope, success_only=False, bot_key=requested_bot)
+    else:
+        clause, params, _ = global_scope_where(effective_scope, success_only=False, bot_key=requested_bot)
+    clause, params = apply_flow_sql(clause, params, flow_type)
+    clause += " AND COALESCE(status,'')!='deleted'"
+    if not (start_date or end_date):
+        date_clause, date_params = export_date_range_clause(start_date, end_date)
+        clause += date_clause
+        params = [*params, *date_params]
+    return clause, params
+
+
+def safe_export_name(value: Any) -> str:
+    text = clean_display(value) or "export"
+    return re.sub(r"[^A-Za-z0-9ก-๙_.-]+", "-", text).strip("-._") or "export"
+
+
+def export_cell_value(row: sqlite3.Row, header: str) -> Any:
+    if header not in row.keys():
+        return ""
+    value = row[header]
+    return display_bank(value) if header in BANK_EXPORT_FIELDS else value
+
+
+def export_row_get(row: Any, key: str, default: Any = "") -> Any:
+    if isinstance(row, dict):
+        return row.get(key, default)
+    try:
+        if key in row.keys():
+            return row[key]
+    except Exception:
+        pass
+    return default
+
+
+def export_row_flow_type(row: Any) -> str:
+    explicit = normalize_flow_type(export_row_get(row, "flow_type", ""))
+    if explicit in {"deposit", "withdraw", "other"}:
+        return explicit
+    return flow_type_for_title(
+        export_row_get(row, "chat_title", ""),
+        export_row_get(row, "bot_key", ""),
+        export_row_get(row, "chat_id", ""),
+    )
+
+
+def export_row_is_duplicate(row: Any) -> bool:
+    try:
+        return bool(int(export_row_get(row, "is_duplicate", 0) or 0))
+    except Exception:
+        return False
+
+
+def counted_export_rows(rows: List[sqlite3.Row]) -> List[sqlite3.Row]:
+    return [r for r in rows if str(r["status"] or "") == "success" and not int(r["is_duplicate"] or 0)]
+
+
+def dashboard_slip_export_rows(rows: List[sqlite3.Row], flow_type: str = "all") -> List[List[Any]]:
+    target = normalize_flow_type(flow_type)
+    out: List[List[Any]] = []
+    for row in rows:
+        if export_row_is_duplicate(row):
+            continue
+        if target != "all" and export_row_flow_type(row) != target:
+            continue
+        out.append([export_cell_value(row, header) for header in DASHBOARD_EXPORT_HEADERS])
+    return out
+
+
+def cross_company_account_slip_export_rows(rows: List[Dict[str, Any]], flow_type: str = "all") -> List[List[Any]]:
+    target = normalize_flow_type(flow_type)
+    out: List[List[Any]] = []
+    for row in rows:
+        if export_row_is_duplicate(row):
+            continue
+        if target != "all" and export_row_flow_type(row) != target:
+            continue
+        out.append([cross_company_account_export_cell(row, header) for header in CROSS_COMPANY_ACCOUNT_EXPORT_HEADERS])
+    return out
+
+
+def export_group_summary(rows: List[sqlite3.Row], key_field: str, label: str) -> List[List[Any]]:
+    groups: Dict[str, Dict[str, Any]] = {}
+    for row in counted_export_rows(rows):
+        key = clean_company_name(row[key_field], row["bot_key"]) if key_field == "company_name" else clean_display(row[key_field])
+        key = key or label
+        group = groups.setdefault(key, {label: key, "count": 0, "amount": 0.0, "fee": 0.0})
+        group["count"] += 1
+        group["amount"] += float(row["amount"] or 0)
+        group["fee"] += float(row["fee"] or 0)
+    return [[g[label], g["count"], g["amount"], g["fee"]] for g in sorted(groups.values(), key=lambda g: (-float(g["amount"] or 0), str(g[label])))]
+
+
+def export_daily_summary(rows: List[sqlite3.Row]) -> List[List[Any]]:
+    groups: Dict[str, Dict[str, Any]] = {}
+    for row in counted_export_rows(rows):
+        date_key, date_label, sort_date = date_bucket(row["slip_date_display"], row["slip_date_iso"])
+        group = groups.setdefault(date_key, {"date": date_label, "sort_date": sort_date, "count": 0, "amount": 0.0, "fee": 0.0})
+        group["count"] += 1
+        group["amount"] += float(row["amount"] or 0)
+        group["fee"] += float(row["fee"] or 0)
+    ordered = sorted(groups.values(), key=lambda g: str(g.get("sort_date") or ""))
+    return [[g["date"], g["count"], g["amount"], g["fee"]] for g in ordered]
+
+
+def write_export_sheet(ws: Any, headers: List[str], rows: List[List[Any]]) -> None:
+    ws.append(headers)
+    for row in rows:
+        ws.append(row)
+    for cell in ws[1]:
+        font = copy(cell.font)
+        font.bold = True
+        cell.font = font
+
+
+def autofit_workbook(wb: Workbook) -> None:
+    for sheet in wb.worksheets:
+        for col in sheet.columns:
+            max_len = max(len(str(cell.value or "")) for cell in col)
+            sheet.column_dimensions[col[0].column_letter].width = min(max(12, max_len + 2), 48)
+
+
+def export_rows_for_selection(conn: sqlite3.Connection, bot_key: str = "", chat_id: str = "", flow_type: str = "all", scope: str = "all", start_date: str = "", end_date: str = "") -> List[sqlite3.Row]:
+    where, params = export_where_clause(bot_key=bot_key, chat_id=chat_id, flow_type=flow_type, scope=scope, start_date=start_date, end_date=end_date)
+    rows = conn.execute(
+        f"SELECT * FROM slips WHERE {where} ORDER BY COALESCE(NULLIF(slip_date_iso,''), slip_date_display), slip_time, created_at",
+        params,
+    ).fetchall()
+    if start_date or end_date:
+        rows = [row for row in rows if export_row_in_date_range(row, start_date, end_date)]
+    return rows
+
+
+def duplicate_export_rows(conn: sqlite3.Connection, rows: List[sqlite3.Row]) -> List[List[Any]]:
+    duplicate_rows = [row for row in rows if int(row["is_duplicate"] or 0)]
+    original_ids = [str(row["duplicate_of"] or "") for row in duplicate_rows if row["duplicate_of"]]
+    original_by_id: Dict[str, sqlite3.Row] = {}
+    if original_ids:
+        placeholders = ",".join("?" for _ in original_ids)
+        originals = conn.execute(f"SELECT * FROM slips WHERE id IN ({placeholders})", original_ids).fetchall()
+        original_by_id = {str(row["id"]): row for row in originals}
+    out = []
+    for row in duplicate_rows:
+        original = original_by_id.get(str(row["duplicate_of"] or ""))
+        out.append([
+            row["message_id"],
+            original["message_id"] if original else "",
+            row["slip_date_display"],
+            row["slip_time"],
+            row["transferor_name"],
+            display_bank(row["from_bank"]),
+            row["from_account"],
+            display_bank(row["to_bank"]),
+            row["to_account"],
+            row["amount"],
+            row["reference_no"],
+            original["reference_no"] if original else "",
+            row["sender_name"],
+            original["sender_name"] if original else "",
+            row["created_at_iso"],
+        ])
+    return out
+
+
+def export_dashboard_excel(db_path: Path, bot_key: str = "", chat_id: str = "", flow_type: str = "all", scope: str = "all", start_date: str = "", end_date: str = "", company_name: str = "") -> Path:
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    with connect(db_path) as conn:
+        rows = export_rows_for_selection(conn, bot_key=bot_key, chat_id=chat_id, flow_type=flow_type, scope=scope, start_date=start_date, end_date=end_date)
+        duplicate_rows = duplicate_export_rows(conn, rows)
+    wb = Workbook()
+    summary_ws = wb.active
+    assert summary_ws is not None
+    summary_ws.title = "SummaryByCompany"
+    write_export_sheet(summary_ws, ["company_name", "count", "amount", "fee"], export_group_summary(rows, "company_name", "company_name"))
+    transferor_ws = wb.create_sheet("SummaryByTransferor")
+    write_export_sheet(transferor_ws, ["transferor_name", "count", "amount", "fee"], export_group_summary(rows, "transferor_name", "transferor_name"))
+    daily_ws = wb.create_sheet("DailySummary")
+    write_export_sheet(daily_ws, ["date", "count", "amount", "fee"], export_daily_summary(rows))
+    slips_ws = wb.create_sheet("Slips")
+    write_export_sheet(slips_ws, DASHBOARD_EXPORT_HEADERS, dashboard_slip_export_rows(rows, "all"))
+    deposit_ws = wb.create_sheet("DepositSlips")
+    write_export_sheet(deposit_ws, DASHBOARD_EXPORT_HEADERS, dashboard_slip_export_rows(rows, "deposit"))
+    withdraw_ws = wb.create_sheet("WithdrawSlips")
+    write_export_sheet(withdraw_ws, DASHBOARD_EXPORT_HEADERS, dashboard_slip_export_rows(rows, "withdraw"))
+    dup_ws = wb.create_sheet("DuplicateSlips")
+    write_export_sheet(dup_ws, DASHBOARD_DUPLICATE_HEADERS, duplicate_rows)
+    autofit_workbook(wb)
+    label_parts = [safe_export_name(company_name or bot_key or "all"), normalize_flow_type(flow_type), normalize_export_date(start_date) or clean_display(scope or "all")]
+    if end_date:
+        label_parts.append(normalize_export_date(end_date))
+    out = EXPORT_DIR / ("auditslip-" + "-".join([p for p in label_parts if p]) + f"-{int(time.time())}.xlsx")
+    wb.save(out)
+    return out
+
+
+def export_dashboard_zip_by_company(db_path: Path, bot_key: str = "__all__", flow_type: str = "all", scope: str = "all", start_date: str = "", end_date: str = "") -> Path:
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    requested_bot = clean_display(bot_key)
+    with connect(db_path) as conn:
+        rows = export_rows_for_selection(conn, bot_key="" if requested_bot in {"__all__", "all", ""} else requested_bot, chat_id="", flow_type=flow_type, scope=scope, start_date=start_date, end_date=end_date)
+    companies: Dict[str, str] = {}
+    for row in rows:
+        row_bot = clean_display(row["bot_key"]) or "default"
+        companies[row_bot] = clean_company_name(row["company_name"], row_bot) or row_bot
+    if not companies:
+        raise FileNotFoundError("no slips for export selection")
+    zip_path = EXPORT_DIR / f"auditslip-by-company-{normalize_flow_type(flow_type)}-{int(time.time())}.zip"
+    generated: List[Path] = []
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for row_bot in sorted(companies, key=lambda b: company_sort_key(companies[b], b)):
+                path = export_dashboard_excel(db_path, bot_key=row_bot, chat_id="", flow_type=flow_type, scope=scope, start_date=start_date, end_date=end_date, company_name=companies[row_bot])
+                generated.append(path)
+                zf.write(path, arcname=f"{safe_export_name(row_bot)}-{safe_export_name(companies[row_bot])}.xlsx")
+    finally:
+        for path in generated:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+    return zip_path
+
+
+def cross_company_account_export_cell(row: Dict[str, Any], header: str) -> Any:
+    if header == "reference_no":
+        return row.get("reference_no") or row.get("reference") or ""
+    if header == "slip_image_url":
+        return row.get("image_url") or ""
+    value = row.get(header, "")
+    return display_bank(value) if header in BANK_EXPORT_FIELDS else value
+
+
+def export_cross_company_account_slips_excel(db_path: Path, flow_type: str = "all", scope: str = "all", search: str = "") -> Path:
+    """Export one account's counted slips across every company as a single workbook."""
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    query = clean_display(search)
+    if not query:
+        raise ValueError("missing cross-company account search")
+    with connect(db_path) as conn:
+        result = cross_company_account_slip_search_rows(conn, scope=scope, flow_type=flow_type, search=query, limit=0)
+    rows = list(result.get("rows") or [])
+    wb = Workbook()
+    summary_ws = wb.active
+    assert summary_ws is not None
+    summary_ws.title = "SummaryByCompany"
+    summary_rows = [[row.get("company_name") or row.get("bot_key") or "", int(row.get("count") or 0), float(row.get("amount") or 0)] for row in (result.get("companies") or [])]
+    write_export_sheet(summary_ws, ["company_name", "count", "amount"], summary_rows)
+    slips_ws = wb.create_sheet("CrossCompanyAccountSlips")
+    write_export_sheet(slips_ws, CROSS_COMPANY_ACCOUNT_EXPORT_HEADERS, cross_company_account_slip_export_rows(rows, "all"))
+    deposit_ws = wb.create_sheet("DepositSlips")
+    write_export_sheet(deposit_ws, CROSS_COMPANY_ACCOUNT_EXPORT_HEADERS, cross_company_account_slip_export_rows(rows, "deposit"))
+    withdraw_ws = wb.create_sheet("WithdrawSlips")
+    write_export_sheet(withdraw_ws, CROSS_COMPANY_ACCOUNT_EXPORT_HEADERS, cross_company_account_slip_export_rows(rows, "withdraw"))
+    autofit_workbook(wb)
+    out = EXPORT_DIR / f"auditslip-cross-company-account-{normalize_flow_type(flow_type)}-{safe_export_name(query)}-{safe_export_name(clean_display(scope or 'all'))}-{int(time.time())}.xlsx"
+    wb.save(out)
+    return out
+
+
+def resolve_export_selection(db_path: Path, chat_id: str = "", bot_key: str = "", flow_type: str = "all") -> Dict[str, Any]:
+    """Resolve an export request to a chat that belongs to the selected company/bot.
+
+    The dashboard UI can briefly have a stale chat dropdown after changing companies.
+    Never let that stale chat override the selected bot_key, otherwise Export Excel can
+    download a file for the previous company.
+    """
+    requested_chat = str(chat_id or "")
+    requested_bot = clean_display(bot_key) or "default"
+    flow_type_key = normalize_flow_type(flow_type)
+    flow_extra, flow_extra_params = flow_sql_clause(flow_type_key)
+    all_bots = requested_bot in {"__all__", "all"}
+
+    def row_payload(row: sqlite3.Row, stale: bool = False) -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "bot_key": str(row["bot_key"] or "default"),
+            "company_name": str(row["company_name"] or row["bot_key"] or ""),
+            "chat_id": str(row["chat_id"] or ""),
+            "chat_title": str(row["chat_title"] or row["chat_id"] or ""),
+            "stale_chat_replaced": bool(stale),
+            "flow_type": flow_type_for_title(row["chat_title"], row["bot_key"], row["chat_id"]),
+        }
+
+    base_select = """
+        SELECT COALESCE(NULLIF(bot_key,''),'default') AS bot_key,
+               COALESCE(MAX(NULLIF(company_name,'')), COALESCE(NULLIF(bot_key,''),'default')) AS company_name,
+               chat_id,
+               COALESCE(MAX(NULLIF(chat_title,'')), chat_id) AS chat_title,
+               COUNT(*) AS total_rows,
+               COALESCE(SUM(CASE WHEN status='success' AND COALESCE(is_duplicate,0)=0 AND settlement_id IS NULL THEN amount ELSE 0 END),0) AS open_amount
+        FROM slips
+    """
+    with connect(db_path) as conn:
+        if requested_chat:
+            if not all_bots:
+                row = conn.execute(
+                    base_select + f"""
+                    WHERE chat_id=? AND COALESCE(bot_key,'default')=? {flow_extra}
+                    GROUP BY COALESCE(NULLIF(bot_key,''),'default'), chat_id
+                    LIMIT 1
+                    """,
+                    (requested_chat, requested_bot, *flow_extra_params),
+                ).fetchone()
+                if row:
+                    return row_payload(row)
+            else:
+                row = conn.execute(
+                    base_select + f"""
+                    WHERE chat_id=? {flow_extra}
+                    GROUP BY COALESCE(NULLIF(bot_key,''),'default'), chat_id
+                    ORDER BY open_amount DESC, total_rows DESC
+                    LIMIT 1
+                    """,
+                    (requested_chat, *flow_extra_params),
+                ).fetchone()
+                if row:
+                    return row_payload(row)
+
+        where = ""
+        params: List[Any] = []
+        stale = bool(requested_chat and not all_bots)
+        if not all_bots:
+            where = "WHERE COALESCE(bot_key,'default')=?"
+            params.append(requested_bot)
+        else:
+            where = "WHERE 1=1"
+        where += flow_extra
+        params.extend(flow_extra_params)
+        row = conn.execute(
+            base_select + f"""
+            {where}
+            GROUP BY COALESCE(NULLIF(bot_key,''),'default'), chat_id
+            ORDER BY open_amount DESC, total_rows DESC
+            LIMIT 1
+            """,
+            params,
+        ).fetchone()
+        if row:
+            return row_payload(row, stale=stale)
+    return {"ok": False, "error": "no chat data for selected company", "bot_key": requested_bot, "chat_id": requested_chat}
+
+def dashboard_close_period(db_path: Path, chat_id: str, note: str = "", bot_key: str = "default", company_name: str = "") -> Dict[str, Any]:
+    if not chat_id:
+        return {"ok": False, "error": "missing chat_id"}
+    bot = AuditslipBot(token="", db_path=db_path, dry_run=True, bot_key=bot_key or "default", company_name=company_name or APP_NAME)
+    bot.init_db()
+    result = bot.close_period(chat_id, closed_by="dashboard", note=note or "dashboard close")
+    return {"ok": True, **result}
+
+
+def unmark_duplicate_slip(db_path: Path, slip_id: str, bot_key: str = "") -> Dict[str, Any]:
+    slip_id = clean_display(slip_id)
+    bot_key = clean_display(bot_key)
+    if not slip_id:
+        return {"ok": False, "error": "missing slip id"}
+    with connect(db_path) as conn:
+        clause = "id=? AND status='success' AND COALESCE(is_duplicate,0)=1"
+        params: List[Any] = [slip_id]
+        if bot_key and bot_key not in {"__all__", "all"}:
+            clause += " AND COALESCE(bot_key,'default')=?"
+            params.append(bot_key)
+        before = conn.execute(f"SELECT id, duplicate_of FROM slips WHERE {clause}", params).fetchone()
+        if not before:
+            return {"ok": False, "error": "duplicate slip not found"}
+        conn.execute(f"UPDATE slips SET is_duplicate=0, duplicate_of=NULL WHERE {clause}", params)
+        conn.commit()
+    return {"ok": True, "id": slip_id, "previous_duplicate_of": before["duplicate_of"]}
+
+
+def delete_dashboard_slip(db_path: Path, slip_id: str, bot_key: str = "", reason: str = "dashboard delete") -> Dict[str, Any]:
+    """Soft-delete one slip so it disappears from normal dashboard totals/lists.
+
+    The amount is kept as evidence in the row, but status becomes `deleted`, so
+    financial totals that count success/non-duplicate slips subtract it.
+    """
+    slip_id = clean_display(slip_id)
+    bot_key = clean_display(bot_key)
+    if not slip_id:
+        return {"ok": False, "error": "missing slip id"}
+    with connect(db_path) as conn:
+        clause = "id=?"
+        params: List[Any] = [slip_id]
+        if bot_key and bot_key not in {"__all__", "all"}:
+            clause += " AND COALESCE(bot_key,'default')=?"
+            params.append(bot_key)
+        row = conn.execute(
+            f"""
+            SELECT id, COALESCE(NULLIF(bot_key,''),'default') AS bot_key, chat_id,
+                   status, COALESCE(is_duplicate,0) AS is_duplicate,
+                   COALESCE(amount,0) AS amount, error
+            FROM slips
+            WHERE {clause}
+            """,
+            params,
+        ).fetchone()
+        if not row:
+            return {"ok": False, "error": "slip not found"}
+        amount = float(row["amount"] or 0)
+        previous_status = str(row["status"] or "")
+        was_counted = previous_status == "success" and int(row["is_duplicate"] or 0) == 0
+        if previous_status == "deleted":
+            return {
+                "ok": True,
+                "id": slip_id,
+                "bot_key": row["bot_key"],
+                "chat_id": row["chat_id"],
+                "previous_status": previous_status,
+                "removed_amount": 0.0,
+                "was_counted": False,
+                "already_deleted": True,
+            }
+        note = clean_display(reason) or "dashboard delete"
+        previous_error = clean_display(row["error"])
+        deleted_note = f"ลบจาก dashboard: {note}"
+        error_text = deleted_note if not previous_error else f"{previous_error} | {deleted_note}"
+        conn.execute(
+            f"UPDATE slips SET status='deleted', error=? WHERE {clause}",
+            [error_text, *params],
+        )
+        conn.commit()
+    return {
+        "ok": True,
+        "id": slip_id,
+        "bot_key": row["bot_key"],
+        "chat_id": row["chat_id"],
+        "previous_status": previous_status,
+        "removed_amount": amount,
+        "was_counted": was_counted,
+        "already_deleted": False,
+    }
+
+
+def render_dashboard_html(token: str = "") -> str:
+    return f"""<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Auditslip Dashboard</title>
+  <link rel="icon" href="data:," />
+  <script>if('scrollRestoration' in window.history)window.history.scrollRestoration='manual';window.scrollTo(0,0);</script>
+  <style>
+    :root {{ color-scheme: dark; --bg:#0b1020; --panel:#121a2f; --panel-2:#0f172a; --muted:#94a3b8; --text:#e5e7eb; --good:#22c55e; --warn:#f59e0b; --bad:#ef4444; --line:#26324d; --accent:#3b82f6; --accent-2:#8b5cf6; --soft:#17223a; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background:radial-gradient(circle at top left,#1e293b,#0b1020 42%); color:var(--text); overflow-x:hidden; }}
+    .topbar {{ min-height:72px; padding:14px 18px; display:flex; justify-content:space-between; gap:12px; align-items:center; border-bottom:1px solid var(--line); position:sticky; top:0; z-index:30; background:rgba(11,16,32,.92); backdrop-filter: blur(14px); }}
+    .header-title {{ min-width:0; flex:1; }}
+    .top-actions {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; justify-content:flex-end; min-width:260px; }}
+    .scope-chip {{ display:inline-flex; align-items:center; min-height:36px; max-width:360px; padding:7px 10px; border:1px solid rgba(59,130,246,.35); border-radius:999px; background:rgba(37,99,235,.18); color:#dbeafe; font-size:12px; font-weight:850; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+    .last-updated {{ color:var(--muted); font-size:11px; white-space:nowrap; }}
+    .admin-toggle {{ background:#334155; }}
+    h1 {{ margin:0; font-size:22px; letter-spacing:.01em; }}
+    .app-shell {{ display:flex; align-items:flex-start; }}
+    .icon-button {{ width:44px; height:44px; display:inline-flex; align-items:center; justify-content:center; border:1px solid var(--line); border-radius:14px; background:#111a2d; color:#dbeafe; box-shadow:0 8px 20px rgba(0,0,0,.16); }}
+    .side-menu {{ width:318px; max-width:318px; min-height:calc(100vh - 72px); max-height:calc(100vh - 72px); position:sticky; top:72px; align-self:flex-start; padding:14px; border-right:1px solid rgba(148,163,184,.18); background:linear-gradient(180deg,rgba(15,23,42,.96),rgba(11,16,32,.92)); box-shadow:20px 0 45px rgba(0,0,0,.20); overflow-y:auto; overscroll-behavior:contain; transition:width .18s ease, max-width .18s ease, padding .18s ease, transform .22s ease; }}
+    .side-scroll {{ display:grid; gap:12px; }}
+    .side-brand {{ display:flex; gap:10px; align-items:center; padding:12px; margin-bottom:12px; border:1px solid rgba(59,130,246,.22); border-radius:18px; background:linear-gradient(135deg,rgba(59,130,246,.18),rgba(139,92,246,.08)); }}
+    .side-close {{ margin-left:auto; display:none; width:38px; height:38px; border-radius:12px; }}
+    .side-scrim {{ display:none; position:fixed; inset:0; z-index:50; background:rgba(2,6,23,.62); backdrop-filter:blur(2px); }}
+    body.side-open .side-scrim {{ display:block; }}
+    .brand-mark {{ width:40px; height:40px; border-radius:14px; display:flex; align-items:center; justify-content:center; font-weight:900; background:linear-gradient(135deg,var(--accent),var(--accent-2)); box-shadow:0 10px 25px rgba(59,130,246,.24); }}
+    .brand-title {{ font-weight:850; line-height:1.15; }}
+    .brand-subtitle {{ color:var(--muted); font-size:12px; margin-top:2px; }}
+    .side-panel {{ border:1px solid rgba(148,163,184,.18); border-radius:18px; padding:12px; background:rgba(18,26,47,.72); box-shadow:0 12px 30px rgba(0,0,0,.14); }}
+    .side-heading {{ display:flex; justify-content:space-between; align-items:flex-end; gap:8px; margin:0 0 10px; padding-bottom:8px; border-bottom:1px solid rgba(148,163,184,.12); }}
+    .side-heading span {{ font-size:14px; font-weight:850; color:#f8fafc; }}
+    .side-heading small {{ color:var(--muted); font-size:11px; white-space:nowrap; }}
+    .side-field {{ display:grid; gap:5px; margin:8px 0; }}
+    .side-field span {{ color:#cbd5e1; font-size:12px; font-weight:700; }}
+    .side-actions {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:10px; }}
+    .side-actions.single {{ grid-template-columns:1fr; }}
+    .side-nav {{ display:grid; gap:7px; }}
+    .side-menu-item {{ width:100%; display:flex; gap:10px; align-items:center; text-align:left; padding:10px; border-radius:14px; background:rgba(15,23,42,.72); border:1px solid transparent; color:var(--text); }}
+    .side-menu-item:hover, .side-menu-item.active {{ border-color:rgba(59,130,246,.45); background:linear-gradient(135deg,rgba(37,99,235,.28),rgba(15,23,42,.8)); }}
+    .side-menu-icon {{ width:28px; height:28px; border-radius:10px; display:flex; align-items:center; justify-content:center; flex:0 0 auto; background:#1f2a44; color:#bfdbfe; font-size:14px; }}
+    .side-menu-text {{ min-width:0; }}
+    .side-menu-title {{ font-weight:800; font-size:13px; }}
+    .side-menu-desc {{ color:var(--muted); font-size:11px; margin-top:1px; }}
+    .side-company {{ width:100%; display:block; border:1px solid rgba(148,163,184,.15); border-radius:14px; padding:10px; margin-top:8px; background:rgba(15,23,42,.75); color:var(--text); text-align:left; }}
+    .side-company:hover {{ border-color:rgba(59,130,246,.45); background:rgba(30,41,59,.86); }}
+    .bot-list {{ display:grid; gap:8px; }}
+    .bot-row {{ border:1px solid rgba(148,163,184,.14); border-radius:13px; padding:9px; background:rgba(15,23,42,.62); }}
+    .bot-row .top {{ display:flex; justify-content:space-between; gap:8px; }}
+    .wrap {{ padding:18px; max-width:1280px; margin:0 auto; flex:1; min-width:0; }}
+    .grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:14px; }}
+    .operator-home-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }}
+    .operator-card {{ border:1px solid rgba(148,163,184,.16); border-radius:16px; padding:12px; background:linear-gradient(180deg,rgba(15,23,42,.92),rgba(15,23,42,.66)); min-width:0; }}
+    .operator-card .head {{ display:flex; justify-content:space-between; gap:8px; align-items:flex-start; }}
+    .operator-stats {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:10px; }}
+    .operator-stat {{ border:1px solid rgba(148,163,184,.12); border-radius:12px; padding:8px; background:rgba(2,6,23,.24); }}
+    .exception-list {{ display:grid; gap:8px; }}
+    .exception-item {{ display:flex; justify-content:space-between; align-items:center; gap:10px; border:1px solid rgba(148,163,184,.16); border-radius:14px; padding:10px; background:rgba(15,23,42,.70); }}
+    .exception-item strong {{ font-size:15px; }}
+    .flow-chart {{ display:grid; gap:9px; margin-top:10px; }}
+    .flow-chart-row {{ display:grid; grid-template-columns:minmax(72px,.65fr) minmax(0,2fr) minmax(112px,.75fr); gap:10px; align-items:center; padding:8px 0; border-bottom:1px solid rgba(148,163,184,.10); }}
+    .flow-chart-row:last-child {{ border-bottom:0; }}
+    .flow-bars {{ display:grid; gap:5px; min-width:0; }}
+    .flow-bar {{ height:16px; min-width:2px; border-radius:999px; box-shadow:inset 0 0 0 1px rgba(255,255,255,.08); }}
+    .flow-bar.withdraw {{ background:linear-gradient(90deg,#60a5fa,#2563eb); }}
+    .flow-bar.deposit {{ background:linear-gradient(90deg,#34d399,#059669); }}
+    .flow-chart-values {{ text-align:right; font-size:12px; color:#cbd5e1; font-variant-numeric:tabular-nums; }}
+    .flow-legend {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:6px; color:#cbd5e1; font-size:12px; }}
+    .legend-dot {{ width:10px; height:10px; display:inline-block; border-radius:999px; margin-right:4px; }}
+    .legend-dot.withdraw {{ background:#3b82f6; }} .legend-dot.deposit {{ background:#10b981; }}
+    body:not(.admin-mode) [data-admin-only="true"] {{ display:none !important; }}
+    .card {{ background:rgba(18,26,47,.94); border:1px solid var(--line); border-radius:16px; padding:16px; box-shadow:0 10px 30px rgba(0,0,0,.18); min-width:0; overflow:hidden; }}
+    .label {{ color:var(--muted); font-size:13px; }}
+    .value {{ font-size:28px; font-weight:800; margin-top:6px; }}
+    .good {{ color:var(--good); }} .warn {{ color:var(--warn); }} .bad {{ color:var(--bad); }}
+    .sections {{ display:grid; grid-template-columns: 1.2fr .8fr; gap:14px; margin-top:14px; }}
+    .menu-section[hidden] {{ display:none !important; }}
+    .responsive-table {{ width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }}
+    table {{ width:100%; border-collapse:collapse; font-size:13px; min-width:620px; }}
+    th,td {{ text-align:left; padding:9px 8px; border-bottom:1px solid var(--line); vertical-align:top; }}
+    th {{ color:#cbd5e1; font-weight:700; }}
+    td {{ overflow-wrap:anywhere; word-break:break-word; }}
+    th.action-col, td.action-cell {{ width:120px; min-width:120px; white-space:nowrap; overflow-wrap:normal; word-break:normal; text-align:center; }}
+    td.action-cell button {{ min-width:96px; white-space:nowrap; padding:9px 12px; border-radius:12px; }}
+    .num, .money-cell {{ white-space:nowrap; font-variant-numeric:tabular-nums; }}
+    .muted {{ color:var(--muted); }}
+    .pill {{ display:inline-block; padding:3px 8px; border-radius:999px; background:#1f2a44; font-size:12px; }}
+    .slip-cards {{ display:grid; gap:10px; }}
+    .slip-card {{ border:1px solid var(--line); border-radius:12px; padding:10px; background:#0f172a; display:grid; grid-template-columns:92px 1fr; gap:10px; align-items:start; }}
+    .slip-card.dupe-card {{ grid-template-columns:minmax(192px, auto) 1fr; }}
+    .dupe-thumbs {{ display:flex; gap:8px; align-items:flex-start; }}
+    .slip-card .top {{ display:flex; justify-content:space-between; gap:8px; align-items:center; }}
+    .slip-thumb {{ width:92px; height:122px; object-fit:cover; border-radius:10px; border:1px solid var(--line); background:#111827; }}
+    .slip-body {{ min-width:0; }}
+    .mini {{ font-size:12px; color:var(--muted); margin-top:4px; }}
+    .cross-company-list {{ display:grid; gap:12px; margin-top:10px; }}
+    .cross-company-card {{ display:grid; gap:12px; border:1px solid rgba(148,163,184,.18); border-radius:16px; padding:13px; background:linear-gradient(180deg,rgba(15,23,42,.95),rgba(15,23,42,.72)); box-shadow:0 8px 22px rgba(0,0,0,.12); min-width:0; }}
+    .cross-company-head {{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; padding-bottom:10px; border-bottom:1px solid rgba(148,163,184,.14); }}
+    .cross-company-account {{ font-size:15px; font-weight:900; color:#e5eefc; word-break:break-word; }}
+    .cross-company-bank {{ color:#cbd5e1; font-size:13px; margin-top:3px; }}
+    .cross-company-chips {{ display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }}
+    .cross-company-summary {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }}
+    .cross-company-stat {{ border:1px solid rgba(148,163,184,.12); border-radius:12px; padding:9px; background:rgba(2,6,23,.22); }}
+    .cross-company-stat .value {{ font-size:18px; margin-top:3px; }}
+    .cross-company-section-title {{ color:#cbd5e1; font-size:12px; font-weight:900; letter-spacing:.02em; margin-bottom:7px; }}
+    .cross-company-companies {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px; }}
+    .cross-company-company {{ border:1px solid rgba(59,130,246,.18); border-radius:14px; padding:10px; background:rgba(30,41,59,.36); min-width:0; }}
+    .cross-company-company-head {{ display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }}
+    .cross-company-company-name {{ font-weight:900; color:#f8fafc; }}
+    .cross-company-total {{ text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; color:#e2e8f0; }}
+    .cross-company-days {{ display:grid; gap:2px; margin-top:8px; }}
+    .cross-company-day-row {{ display:grid; grid-template-columns:minmax(74px,.8fr) minmax(0,1.2fr); gap:8px; padding:5px 0; border-top:1px solid rgba(148,163,184,.10); color:#cbd5e1; }}
+    .cross-company-day-row .day-amount {{ text-align:right; white-space:nowrap; font-variant-numeric:tabular-nums; color:#e5e7eb; }}
+    .cross-company-overall-days {{ border:1px dashed rgba(148,163,184,.18); border-radius:12px; padding:8px 10px; background:rgba(2,6,23,.18); }}
+    .reconcile-controls {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; align-items:end; margin-top:10px; }}
+    .reconcile-step {{ display:grid; gap:6px; color:#cbd5e1; font-size:12px; font-weight:850; }}
+    .reconcile-step span {{ color:#cbd5e1; }}
+    .reconcile-upload, .reconcile-preview, .reconcile-actions {{ grid-column:1/-1; }}
+    .reconcile-preview {{ border:1px solid rgba(59,130,246,.22); border-radius:12px; padding:10px; background:rgba(37,99,235,.10); color:#dbeafe; font-size:13px; }}
+    .reconcile-actions {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }}
+    a.button, button {{ color:white; text-decoration:none; background:#2563eb; border:0; border-radius:10px; padding:9px 12px; font-weight:700; cursor:pointer; }}
+    .toolbar {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }}
+    .danger {{ background:#dc2626; }}
+    .statusline {{ min-width:180px; color:var(--muted); font-size:13px; }}
+    .modal-backdrop {{ position:fixed; inset:0; z-index:100; display:none; align-items:center; justify-content:center; padding:18px; background:rgba(2,6,23,.72); backdrop-filter:blur(5px); }}
+    .modal-backdrop.open {{ display:flex; }}
+    .modal-card {{ width:min(440px,100%); border:1px solid rgba(148,163,184,.24); border-radius:18px; background:linear-gradient(180deg,#121a2f,#0f172a); box-shadow:0 30px 80px rgba(0,0,0,.42); padding:18px; }}
+    .modal-title {{ font-size:18px; font-weight:900; margin:0 0 8px; color:#f8fafc; }}
+    .modal-message {{ color:#cbd5e1; line-height:1.55; white-space:pre-wrap; }}
+    .modal-actions {{ display:flex; justify-content:flex-end; gap:8px; margin-top:16px; }}
+    .modal-cancel {{ background:#334155; }}
+    .modal-primary.danger {{ background:#dc2626; }}
+    select, input {{ width:100%; background:#0f172a; color:var(--text); border:1px solid var(--line); border-radius:12px; padding:9px 10px; max-width:100%; }}
+    details.side-panel summary {{ list-style:none; display:flex; justify-content:space-between; align-items:center; cursor:pointer; }}
+    details.side-panel summary::-webkit-details-marker {{ display:none; }}
+    details.side-panel summary span {{ font-size:14px; font-weight:850; }}
+    details.side-panel summary small {{ color:var(--muted); font-size:11px; }}
+    body.side-collapsed .side-menu {{ width:82px; padding:10px; }}
+    body.side-collapsed .brand-title, body.side-collapsed .brand-subtitle, body.side-collapsed .side-panel:not(.side-nav-panel):not(.side-menu-compact), body.side-collapsed .side-heading, body.side-collapsed .side-menu-desc, body.side-collapsed .side-menu-title {{ display:none; }}
+    body.side-collapsed .side-brand {{ justify-content:center; padding:10px; }}
+    body.side-collapsed .side-menu-item {{ justify-content:center; padding:10px 8px; }}
+    @media (max-width: 1100px) {{ .grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .operator-home-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .sections {{ grid-template-columns:1fr; }} .side-menu {{ width:292px; }} }}
+    @media (max-width: 780px) {{ .topbar {{ align-items:flex-start; flex-wrap:wrap; }} .top-actions {{ width:100%; justify-content:flex-start; min-width:0; }} .scope-chip {{ max-width:100%; }} .app-shell {{ display:block; }} .side-close {{ display:inline-flex; }} .side-menu {{ position:fixed; top:0; left:0; bottom:0; width:min(88vw,340px); max-width:min(88vw,340px); min-height:100dvh; max-height:100dvh; z-index:60; border-right:1px solid rgba(148,163,184,.22); border-bottom:0; border-radius:0 22px 22px 0; transform:translateX(-105%); }} body.side-open .side-menu {{ transform:translateX(0); }} body.side-collapsed .side-menu {{ width:min(88vw,340px); max-width:min(88vw,340px); padding:14px; }} body.side-collapsed .side-scroll {{ display:grid; }} body.side-collapsed .side-brand {{ margin-bottom:12px; justify-content:flex-start; padding:12px; }} body.side-collapsed .side-menu-item {{ justify-content:flex-start; padding:10px; }} .side-actions {{ grid-template-columns:1fr; }} }}
+    @media (max-width: 720px) {{ .slip-card {{ grid-template-columns:76px 1fr; }} .slip-card.dupe-card {{ grid-template-columns:1fr; }} .dupe-thumbs .slip-thumb {{ width:calc(50vw - 30px); max-width:120px; }} .slip-thumb {{ width:76px; height:104px; }} table {{ min-width:560px; }} }}
+    @media (max-width: 640px) {{
+      .responsive-table {{ overflow-x:visible; }}
+      .responsive-table table {{ min-width:0; border-collapse:separate; border-spacing:0 10px; }}
+      .responsive-table thead {{ display:none; }}
+      .responsive-table tbody, .responsive-table tr, .responsive-table td {{ display:block; width:100%; }}
+      .responsive-table tr {{ border:1px solid rgba(148,163,184,.18); border-radius:14px; padding:8px; margin-bottom:10px; background:#0f172a; box-shadow:0 8px 18px rgba(0,0,0,.10); }}
+      .responsive-table td {{ display:grid; grid-template-columns:minmax(104px,42%) 1fr; gap:8px; align-items:start; padding:7px 6px; border-bottom:1px solid rgba(148,163,184,.12); text-align:right; }}
+      .responsive-table td::before {{ content:attr(data-label); color:var(--muted); font-weight:800; text-align:left; }}
+      .responsive-table td:last-child {{ border-bottom:0; }}
+      .responsive-table td button {{ width:100%; }}
+      .responsive-table td.action-cell {{ width:100%; min-width:0; display:block; text-align:left; }}
+      .responsive-table td.action-cell::before {{ display:none; }}
+    }}
+    @media (max-width: 420px) {{ .responsive-table td {{ grid-template-columns:1fr; text-align:left; }} .responsive-table td::before {{ margin-bottom:2px; }} }}
+    @media (max-width: 560px) {{ .topbar {{ position:static; }} .wrap {{ padding:10px; }} .grid {{ grid-template-columns:1fr; }} .operator-home-grid {{ grid-template-columns:1fr; }} .value {{ font-size:24px; }} .card {{ padding:12px; border-radius:14px; }} h1 {{ font-size:20px; }} .cross-company-head, .cross-company-company-head {{ display:grid; }} .cross-company-chips {{ justify-content:flex-start; }} .cross-company-summary {{ grid-template-columns:1fr; }} .cross-company-companies {{ grid-template-columns:1fr; }} .cross-company-total {{ text-align:left; white-space:normal; }} .cross-company-day-row {{ grid-template-columns:1fr; gap:2px; }} .cross-company-day-row .day-amount {{ text-align:left; white-space:normal; }} }}
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <button id="sideMenuToggle" class="icon-button" type="button" onclick="toggleSideMenu()" aria-label="เปิด/ปิด side menu" aria-expanded="true">☰</button>
+    <div class="header-title"><h1>Auditslip Dashboard</h1><div class="muted">บริษัท · ฝาก/ถอน · รอบ · รายการที่ต้องจัดการ</div></div>
+    <div id="mobileTopActions" class="top-actions">
+      <span id="activeScopeChip" class="scope-chip">กำลังโหลด scope...</span>
+      <span id="lastUpdatedLabel" class="last-updated">ยังไม่อัปเดต</span>
+      <button id="topRefreshButton" type="button" onclick="refreshDashboardHome()">รีเฟรช</button>
+      <button id="adminModeToggle" class="admin-toggle" type="button" onclick="toggleAdminMode()">ตั้งค่า/Admin</button>
+    </div>
+  </header>
+  <div id="sideScrim" class="side-scrim" onclick="closeSideMenu()" aria-hidden="true"></div>
+  <div class="app-shell">
+    <aside id="sideMenu" class="side-menu" aria-label="ระบบ">
+      <div class="side-brand">
+        <div class="brand-mark">AS</div>
+        <div><div class="brand-title">ระบบ Auditslip</div><div class="brand-subtitle">ควบคุมบริษัท · ฝาก/ถอน · Export</div></div>
+        <button id="sideMenuClose" class="icon-button side-close" type="button" onclick="closeSideMenu()" aria-label="ปิด side menu">×</button>
+      </div>
+      <div class="side-scroll">
+        <section class="side-panel side-controls">
+          <div class="side-heading"><span>ควบคุมมุมมอง</span><small>เลือกข้อมูล</small></div>
+          <label class="side-field"><span>บริษัท</span><select id="botFilter" title="เลือกบริษัท"></select></label>
+          <label class="side-field"><span>ฝาก/ถอน</span><select id="flowFilter" title="เลือกกลุ่มฝาก/เติมมือหรือถอน"><option value="all">รวมทุกกลุ่ม</option><option value="withdraw">ทุกกลุ่มถอน</option><option value="deposit">ทุกกลุ่มฝาก/เติมมือ</option></select></label>
+          <label class="side-field"><span>กลุ่ม</span><select id="chat" title="เลือกกลุ่มของบริษัท"></select></label>
+          <label class="side-field"><span>รอบ</span><select id="scope"><option value="today" selected>วันนี้</option><option value="open">รอบเปิด</option><option value="all">ทั้งหมด</option></select></label>
+          <label class="side-field"><span>เลือกวันที่เดียว</span><input id="customDateFilter" type="date" title="เลือกวันที่เพื่อดูทุกตารางเฉพาะวันนั้น" /></label>
+          <label class="side-field"><span>ช่วงวันที่เริ่ม</span><input id="summaryStartDate" type="date" title="วันที่เริ่มสำหรับสรุปแดชบอร์ด" /></label>
+          <label class="side-field"><span>ช่วงวันที่สิ้นสุด</span><input id="summaryEndDate" type="date" title="วันที่สิ้นสุดสำหรับสรุปแดชบอร์ด" /></label>
+          <label class="side-field"><span>สถานะสลิป</span><select id="slipFilter"><option value="all">สลิปทั้งหมด</option><option value="success">เฉพาะไม่ซ้ำ</option><option id="duplicateOnly" value="duplicate">สลิปซ้ำที่จับแล้ว</option><option value="issues">อ่านไม่ชัด/ error</option></select></label>
+          <label class="side-field"><span>ค้นหา</span><input id="slipSearch" placeholder="ค้นหาสลิป / ค้นหาสลิปซ้ำ" /></label>
+          <div class="side-actions"><button onclick="load({{scrollTop:true}})">ค้นหา</button><button onclick="clearSlipSearch()">ล้างค้นหา</button><button onclick="load({{scrollTop:true}})">Refresh</button></div>
+        </section>
+
+        <details class="side-panel side-admin-panel" data-admin-only="true">
+          <summary><span>ตั้งค่าบอท Telegram</span><small>Admin/debug</small></summary>
+          <div id="botSettings" style="margin-top:10px"><div id="telegramBots" class="muted">โหลดข้อมูลบอท...</div></div>
+        </details>
+
+        <section class="side-panel side-nav-panel" data-legacy-label="เมนูฟังก์ชั่น">
+          <div class="side-heading"><span>เมนูหลัก</span><small>แยกฟังก์ชัน</small></div>
+          <div class="side-nav">
+            <button class="side-menu-item active" type="button" data-menu-target="section-operator-home" onclick="showMenuSection('section-operator-home')"><span class="side-menu-icon">★</span><span class="side-menu-text"><span class="side-menu-title">งานวันนี้</span><span class="side-menu-desc">ภาพรวม operator และรายการที่ต้องจัดการ</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="all" onclick="showAllMenuSections()"><span class="side-menu-icon">⌘</span><span class="side-menu-text"><span class="side-menu-title">แสดงทั้งหมด</span><span class="side-menu-desc">ทุกการ์ดและทุกตาราง</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-overview" onclick="showMenuSection('section-overview')"><span class="side-menu-icon">▦</span><span class="side-menu-text"><span class="side-menu-title">ภาพรวม</span><span class="side-menu-desc">ยอดรวมแยกบริษัท</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-company-accounts" onclick="showMenuSection('section-company-accounts')"><span class="side-menu-icon">🏦</span><span class="side-menu-text"><span class="side-menu-title">บัญชี/ค้นสลิป</span><span class="side-menu-desc">บัญชีรับเงินและดูรูปสลิปต่อบัญชี</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-date-sender" onclick="showMenuSection('section-date-sender')"><span class="side-menu-icon">◷</span><span class="side-menu-text"><span class="side-menu-title">วันที่/ผู้ส่งรูป</span><span class="side-menu-desc">ยอดรายวันและคนส่งรูป</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="limitSection" onclick="showMenuSection('limitSection')"><span class="side-menu-icon">↯</span><span class="side-menu-text"><span class="side-menu-title">ฝั่งถอน/วงเงิน</span><span class="side-menu-desc">วงเงินรายวัน/ผู้โอนถอน</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-deposit-slips" onclick="showMenuSection('section-deposit-slips')"><span class="side-menu-icon">＋</span><span class="side-menu-text"><span class="side-menu-title">ฝาก/เติมมือ</span><span class="side-menu-desc">สลิปลูกค้า ไม่มีวงเงิน</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-banks" onclick="showMenuSection('section-banks')"><span class="side-menu-icon">⇄</span><span class="side-menu-text"><span class="side-menu-title">ยอดธนาคาร</span><span class="side-menu-desc">ยอดแยกต้นทาง/ปลายทาง</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-bank-review" onclick="showMenuSection('section-bank-review')"><span class="side-menu-icon">◎</span><span class="side-menu-text"><span class="side-menu-title">รีเช็คธนาคาร</span><span class="side-menu-desc">OpenAI เช็กต้นทางที่ไม่ชัด</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-reconcile" onclick="showMenuSection('section-reconcile')"><span class="side-menu-icon">✓</span><span class="side-menu-text"><span class="side-menu-title">เทียบ Excel</span><span class="side-menu-desc">หลังบ้าน vs สลิป</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-duplicates" onclick="showMenuSection('section-duplicates')"><span class="side-menu-icon">⧉</span><span class="side-menu-text"><span class="side-menu-title">สลิปซ้ำ</span><span class="side-menu-desc">ตรวจคู่ซ้ำ/ยกเลิกซ้ำ</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-recent" onclick="showMenuSection('section-recent')"><span class="side-menu-icon">●</span><span class="side-menu-text"><span class="side-menu-title">Recent / Queue</span><span class="side-menu-desc">รายการล่าสุดและคิว OCR</span></span></button>
+          </div>
+        </section>
+
+        <section class="side-panel side-export-panel">
+          <div class="side-heading"><span>ส่งออก Excel</span><small>แยกบริษัท/ตามวัน</small></div>
+          <label class="side-field"><span>บริษัทที่ส่งออก</span><select id="exportCompanyFilter" title="เลือกบริษัทสำหรับ export และกรองทั้งหน้า"></select></label>
+          <label class="side-field"><span>วันที่เริ่ม</span><input id="exportStartDate" type="date" title="วันที่เริ่ม export" /></label>
+          <label class="side-field"><span>วันที่สิ้นสุด</span><input id="exportEndDate" type="date" title="วันที่สิ้นสุด export" /></label>
+          <div class="side-actions single"><a id="excel" class="button" href="#" target="exportDownloadFrame" onclick="return exportExcel()">Export Excel</a></div>
+          <iframe id="exportDownloadFrame" name="exportDownloadFrame" title="export download" hidden></iframe>
+          <!-- export_dashboard_zip_by_company -->
+        </section>
+
+        <section class="side-panel side-danger-panel" data-admin-only="true">
+          <div class="side-heading"><span>ปิดรอบ</span><small>เฉพาะกลุ่มที่เลือก</small></div>
+          <label class="side-field"><span>note ปิดรอบ</span><input id="closeNote" placeholder="note ปิดรอบ" /></label>
+          <div id="closeGuardHint" class="mini muted">ต้องเลือกบริษัทและกลุ่มเดียวก่อนปิดรอบ</div>
+          <div class="side-actions single"><button id="closePeriodButton" class="danger" onclick="closeOpenPeriod()">Close / เคลียร์ยอด</button></div>
+          <span id="statusline" class="statusline"></span>
+        </section>
+
+        <section class="side-panel side-company-panel" aria-label="submenu บริษัท">
+          <div class="side-heading"><span>บริษัท</span><small>เลือกบริษัท</small></div>
+          <div id="sideCompanies" class="muted">โหลดบริษัท...</div>
+        </section>
+      </div>
+    </aside>
+    <main class="wrap">
+    <section id="section-metrics" class="grid menu-section" data-always-visible="true">
+      <div class="card"><div class="label">ยอดถอนวันนี้/ช่วงที่เลือก</div><div id="withdrawAmount" class="value good">-</div></div>
+      <div class="card"><div class="label">สลิปถอน</div><div id="withdrawCount" class="value">-</div></div>
+      <div class="card"><div class="label">ยอดฝาก/เติมมือวันนี้/ช่วงที่เลือก</div><div id="depositAmount" class="value good">-</div></div>
+      <div class="card"><div class="label">สลิปฝาก/เติมมือ</div><div id="depositCount" class="value">-</div></div>
+      <div class="card"><div class="label">คิวรอ OCR</div><div id="queued" class="value warn">-</div></div>
+      <div class="card"><div class="label">processing / failed</div><div id="processing" class="value">-</div></div>
+      <div class="card"><div class="label">สลิปซ้ำตามช่วง</div><div id="duplicateCount" class="value warn">-</div><div id="duplicateAmount" class="mini"></div></div>
+      <div class="card"><div class="label">รีเช็คธนาคารต้นทาง</div><div id="sourceBankReviewCount" class="value warn">-</div><div class="mini">success ไม่ซ้ำ แต่ยังไม่เจอธนาคารต้นทางจริง ๆ · ปลายทางว่างไม่นับเป็น issue</div></div>
+    </section>
+    <section id="section-operator-home" class="sections menu-section" hidden>
+      <div class="card"><h3>งานวันนี้</h3><div class="mini">ภาพรวมบริษัท · ฝาก/ถอน · รอบ สำหรับ operator บนมือถือ</div><div id="operatorHome"></div></div>
+      <div class="card"><h3>รายการที่ต้องจัดการ</h3><div class="mini">รวมเฉพาะ exception ที่ควรเปิดดูต่อ: เกินวงเงิน, OCR issue, สลิปซ้ำ, รีเช็คธนาคาร</div><div id="exceptionQueue"></div></div>
+    </section>
+    <section id="section-overview" class="sections menu-section" hidden>
+      <div class="card"><h3>ภาพรวม / บริษัทที่เลือก</h3><div class="mini">เลือกทุกบริษัทเพื่อดูรวมทุกบริษัท หรือเลือกบริษัทเดียวเพื่อให้ทุกเมนูแสดงเฉพาะบริษัทนั้น</div><div id="companyOverview"></div></div>
+      <div class="card"><h3>ตัวกรองที่ใช้อยู่</h3><div id="activeSelectionSummary" class="muted">เลือกบริษัท/บอทจาก side menu</div></div>
+    </section>
+    <section id="section-company-accounts" class="sections menu-section" hidden>
+      <div class="card"><h3>บริษัทย่อย/บัญชีรับเงิน</h3><div class="toolbar"><input id="companyName" placeholder="ชื่อบริษัท" /><input id="accountBank" placeholder="ธนาคาร" /><input id="accountNo" placeholder="เลขบัญชีที่ใช้" /><input id="accountName" placeholder="ชื่อบัญชีที่ใช้" /><input id="accountDailyLimit" type="number" step="0.01" placeholder="วงเงิน/วัน" /><button onclick="saveCompanyAccount()">บันทึกบัญชีบริษัท</button></div><div id="companyAccounts"></div></div>
+      <div class="card"><h3>รายการรายบัญชีตามวันที่</h3><div class="mini">บัญชีของบริษัท/ผู้โอน แยกตามวัน บริษัท และกลุ่มฝาก/ถอน ไม่นับสลิปซ้ำ · [กลุ่มฝาก/เติมมือ] [กลุ่มถอน] · กด “ดูสลิปบัญชีนี้” เพื่อเปิดรูปสลิปของบัญชีนั้น</div><div id="companyAccountDaily"></div><h3>ค้นหารายการสลิปตามบัญชี</h3><div class="mini">พิมพ์เลขบัญชี/ชื่อ/ธนาคารในช่องค้นหา ระบบจะแสดงจำนวนสลิป ยอดรวม และรูปสลิปทีละใบใน scope ที่เลือก</div><div id="accountSlipSearch"></div><h3>บัญชีที่พบข้ามบริษัท</h3><div id="accountCrossCompany"></div><h3>ค้นหาสลิปบัญชีข้ามบริษัท</h3><div class="mini">ใช้คำค้นเดียวกัน แต่ค้นทุกบริษัทในวันที่/ฝากถอนที่เลือก เพื่อดูสลิปพร้อมรูปของบัญชีที่ซ้ำข้ามบริษัท</div><div id="crossCompanyAccountSlipSearch"></div></div>
+    </section>
+    <section id="section-date-sender" class="sections menu-section" hidden>
+      <div class="card"><h3>กราฟรายวัน ฝาก/ถอน</h3><div class="mini">นับเฉพาะสลิป success ไม่ซ้ำ แยกกลุ่มฝาก/เติมมือและถอนตามวันที่ของสลิป</div><div id="dailyFlowChart"></div></div>
+      <div class="card"><h3>ยอดแยกตามวันที่</h3><div id="byDate"></div></div>
+      <div class="card"><h3>ยอดแยกตามผู้ส่งรูป</h3><div id="bySender"></div></div>
+    </section>
+    <section id="limitSection" class="sections menu-section" hidden>
+      <div class="card"><h3>ฝั่งถอน · วงเงินรายวันต่อบัญชี</h3><div id="withdrawLimitSummary" class="mini">นับเฉพาะกลุ่มถอน ไม่รวมฝาก/เติมมือ</div><div class="mini">แยกตามวันที่ของสลิปและเลขบัญชีผู้โอน วงเงิน/วันจะ reset ทุกวัน และไม่นับสลิปซ้ำ</div><div id="byAccountDay"></div></div>
+      <div class="card"><h3>ฝั่งถอน · ตั้งวงเงินจากยอดรายวัน</h3><div class="mini">แสดงแยกตามวันเท่านั้น ไม่มีการเอาวันอื่นมารวมกัน วงเงินรายวัน reset ทุกวัน</div><div class="toolbar"><input id="limitKey" placeholder="เลือกบัญชีจากปุ่มตั้งวงเงิน" readonly /><input id="limitName" placeholder="ชื่อบัญชี" /><input id="limitBank" placeholder="ธนาคาร" /><input id="limitAccount" placeholder="เลขบัญชี" /><input id="limitAmount" type="number" step="0.01" placeholder="วงเงินต่อวัน" /><button onclick="saveAccountLimit()">บันทึกวงเงิน</button><span class="muted">ตั้งวงเงินบัญชี</span></div><div id="byTransferor"></div></div>
+    </section>
+    <section id="section-deposit-slips" class="sections menu-section" hidden>
+      <div class="card"><h3>ฝั่งฝาก/เติมมือ · สลิปลูกค้าฝาก/เติมมือ</h3><div id="depositCustomerSummary" class="mini">สลิปลูกค้า ไม่มีวงเงิน และไม่เอาไปรวมกับถอน/วงเงิน</div><div id="depositCustomerSlips"></div></div>
+    </section>
+    <section id="section-banks" class="sections menu-section" hidden>
+      <div class="card"><h3>ยอดแยกตามธนาคารต้นทาง/ผู้โอน</h3><div id="byFromBank"></div><h3>ธนาคารปลายทาง</h3><div id="byToBank"></div></div>
+      <div class="card"><h3>หมายเหตุธนาคาร</h3><div class="muted">ตัดตารางยอดแยกตาม issuer ออกแล้ว เหลือเฉพาะต้นทางและปลายทางที่ใช้ตรวจยอดจริง</div></div>
+    </section>
+    <section id="section-reconcile" class="sections menu-section" hidden>
+      <div class="card"><h3>เทียบ Excel หลังบ้าน</h3><div class="mini">ขั้นตอน: เลือกบริษัท → เลือกยอดฝาก/ถอน → อัปโหลด Excel ของบริษัทนั้น ระบบจะเทียบเฉพาะ scope ที่เลือก ไม่ปนบริษัทอื่น</div><div class="reconcile-controls"><label class="reconcile-step"><span>1 เลือกบริษัทก่อน</span><select id="reconcileCompanyFilter" title="เลือกบริษัทสำหรับเทียบหลังบ้าน"></select></label><label class="reconcile-step"><span>2 เลือกยอดฝาก/ถอน</span><select id="reconcileFlowFilter" title="เลือกยอดฝากหรือถอนสำหรับไฟล์หลังบ้าน"><option value="">เลือกยอดฝาก/ถอน</option><option value="withdraw">ยอดถอน</option><option value="deposit">ยอดฝาก/เติมมือ</option></select></label><label class="reconcile-step reconcile-upload"><span>3 อัปโหลด Excel ของบริษัทนี้</span><input id="backendExcelFile" type="file" accept=".xlsx,.xlsm" /></label><label class="reconcile-step reconcile-upload" data-admin-only="true"><span>หรือ path ไฟล์บน server</span><input id="backendExcel" placeholder="path หรือเว้นว่างเพื่อใช้ไฟล์ล่าสุด" /></label><div id="reconcileScopePreview" class="reconcile-preview">ไฟล์นี้จะถูกเทียบเฉพาะบริษัทและฝาก/ถอนที่เลือก</div><div class="reconcile-actions"><button onclick="runReconcile()">เทียบยอดตามบริษัท/ฝากถอนที่เลือก</button></div></div><div id="reconcile"></div></div>
+      <div class="card"><h3>สถานะข้อมูล</h3><div class="muted">ยอดรวมทุกแผงนับเฉพาะ success ที่ไม่ซ้ำ ยกเว้นการ์ดสลิปซ้ำที่แสดงเพื่อเช็กซ้ำโดยเฉพาะ</div></div>
+    </section>
+    <section id="section-duplicates" class="sections menu-section" hidden>
+      <div class="card"><h3>คู่สลิปซ้ำ</h3><div class="mini">แสดงใบที่ถูกจับว่าซ้ำ และซ้ำกับใบไหนเพื่อให้ตรวจย้อนหลังได้</div><div id="duplicatePairs"></div></div>
+    </section>
+    <section id="section-bank-review" class="sections menu-section" hidden>
+      <div class="card"><h3>รีเช็คธนาคารต้นทาง</h3><div class="mini">รายการ success ที่ยังหาธนาคารต้นทางไม่ได้จริง ๆ ใช้ OpenAI รีเช็คจากรูปสลิปได้</div><div class="toolbar" style="margin:8px 0" data-admin-only="true"><button onclick="openaiBankRecheckAll(this)">OpenAI รีเช็คทั้งหมดในขอบเขตนี้</button></div><div id="sourceBankReview"></div></div>
+    </section>
+    <section id="section-recent" class="sections menu-section" hidden>
+      <div class="card"><h3>Recent slips</h3><div id="recent"></div></div>
+      <div class="card"><h3>Queue / Issues</h3><div id="issues"></div><h3>Provider usage</h3><div id="usage"></div></div>
+    </section>
+    </main>
+  </div>
+  <div id="dashboardModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="dashboardModalTitle" aria-hidden="true">
+    <div class="modal-card">
+      <div id="dashboardModalTitle" class="modal-title">แจ้งเตือน</div>
+      <div id="dashboardModalMessage" class="modal-message"></div>
+      <div class="modal-actions">
+        <button id="dashboardModalCancel" type="button" class="modal-cancel">ยกเลิก</button>
+        <button id="dashboardModalOk" type="button" class="modal-primary">ตกลง</button>
+      </div>
+    </div>
+  </div>
+<script>
+let transferorRows = [];
+let currentSnapshot = null;
+const SIDE_MENU_KEY = 'auditslip.sideMenuCollapsed';
+const ADMIN_MODE_KEY = 'auditslip.adminMode';
+const ACTION_HEADER = {{'X-Auditslip-Action':'dashboard'}};
+let dashboardModalResolver = null;
+function dashboardModalElements() {{
+  return {{
+    root: document.getElementById('dashboardModal'),
+    title: document.getElementById('dashboardModalTitle'),
+    message: document.getElementById('dashboardModalMessage'),
+    ok: document.getElementById('dashboardModalOk'),
+    cancel: document.getElementById('dashboardModalCancel')
+  }};
+}}
+function closeDashboardModal(result=false) {{
+  const el = dashboardModalElements();
+  if (el.root) {{ el.root.classList.remove('open'); el.root.setAttribute('aria-hidden', 'true'); }}
+  const resolver = dashboardModalResolver;
+  dashboardModalResolver = null;
+  if (resolver) resolver(result);
+}}
+function showDashboardModal(options={{}}) {{
+  return new Promise(resolve => {{
+    const el = dashboardModalElements();
+    if (!el.root) {{ resolve(true); return; }}
+    dashboardModalResolver = resolve;
+    if (el.title) el.title.textContent = options.title || 'แจ้งเตือน';
+    if (el.message) el.message.textContent = options.message || '';
+    if (el.ok) {{
+      el.ok.textContent = options.confirmText || 'ตกลง';
+      el.ok.classList.toggle('danger', Boolean(options.danger));
+      el.ok.onclick = () => closeDashboardModal(true);
+    }}
+    if (el.cancel) {{
+      el.cancel.textContent = options.cancelText || 'ยกเลิก';
+      el.cancel.style.display = options.showCancel === false ? 'none' : '';
+      el.cancel.onclick = () => closeDashboardModal(false);
+    }}
+    el.root.classList.add('open');
+    el.root.setAttribute('aria-hidden', 'false');
+    if (el.ok) el.ok.focus();
+  }});
+}}
+function dashboardNotify(message, title='แจ้งเตือน') {{ return showDashboardModal({{title, message, showCancel:false, confirmText:'ตกลง'}}); }}
+function dashboardConfirm(message, title='ยืนยัน', danger=false) {{ return showDashboardModal({{title, message, showCancel:true, confirmText:'ยืนยัน', cancelText:'ยกเลิก', danger}}); }}
+document.addEventListener('keydown', (event) => {{ if (event.key === 'Escape' && dashboardModalResolver) closeDashboardModal(false); }});
+if ('scrollRestoration' in window.history) window.history.scrollRestoration = 'manual';
+window.scrollTo(0, 0);
+function safeStorageGet(key) {{ try {{ return window.localStorage.getItem(key); }} catch (e) {{ return null; }} }}
+function safeStorageSet(key, value) {{ try {{ window.localStorage.setItem(key, value); }} catch (e) {{}} }}
+function isMobileSideMenu() {{ return window.matchMedia('(max-width: 780px)').matches; }}
+function applySideMenuState() {{
+  const mobile = isMobileSideMenu();
+  const collapsed = safeStorageGet(SIDE_MENU_KEY) === '1';
+  if (mobile) {{
+    document.body.classList.remove('side-collapsed');
+  }} else {{
+    document.body.classList.remove('side-open');
+    document.body.classList.toggle('side-collapsed', collapsed);
+  }}
+  const open = document.body.classList.contains('side-open');
+  const btn = document.getElementById('sideMenuToggle');
+  if (btn) {{
+    btn.textContent = mobile ? (open ? '×' : '☰') : (collapsed ? '☰' : '×');
+    btn.setAttribute('aria-expanded', String(mobile ? open : !collapsed));
+  }}
+}}
+function openSideMenu() {{
+  document.body.classList.add('side-open');
+  applySideMenuState();
+}}
+function closeSideMenu() {{
+  document.body.classList.remove('side-open');
+  applySideMenuState();
+}}
+function toggleSideMenu() {{
+  if (isMobileSideMenu()) {{
+    if (document.body.classList.contains('side-open')) closeSideMenu(); else openSideMenu();
+    return;
+  }}
+  const next = document.body.classList.contains('side-collapsed') ? '0' : '1';
+  safeStorageSet(SIDE_MENU_KEY, next);
+  applySideMenuState();
+}}
+window.addEventListener('resize', applySideMenuState);
+function closeSideMenuIfMobile() {{
+  if (isMobileSideMenu()) closeSideMenu();
+}}
+function scrollDashboardTop(smooth=true) {{
+  const target = document.getElementById('section-metrics') || document.body;
+  if (target && target.scrollIntoView) target.scrollIntoView({{behavior: smooth ? 'smooth' : 'auto', block:'start'}});
+  window.scrollTo({{top:0, left:0, behavior: smooth ? 'smooth' : 'auto'}});
+}}
+function refreshDashboardHome() {{
+  showMenuSection('section-operator-home', {{scroll:false, persist:false}});
+  return load({{home:true, scrollTop:true, smooth:false}});
+}}
+function setActiveMenu(target) {{
+  document.querySelectorAll('[data-menu-target]').forEach(btn => btn.classList.toggle('active', String(btn.dataset.menuTarget || '') === String(target || 'all')));
+}}
+function showAllMenuSections(options={{}}) {{
+  document.querySelectorAll('.menu-section').forEach(section => section.hidden = false);
+  setActiveMenu('all');
+  closeSideMenuIfMobile();
+  if (options && options.scrollTop) scrollDashboardTop();
+}}
+function showMenuSection(target, options={{}}) {{
+  if (!target || target === 'all') return showAllMenuSections(options);
+  document.querySelectorAll('.menu-section').forEach(section => {{
+    section.hidden = !(section.dataset.alwaysVisible === 'true' || section.id === target);
+  }});
+  setActiveMenu(target);
+  const section = document.getElementById(target);
+  if (options.scroll !== false && section) section.scrollIntoView({{behavior:'smooth', block:'start'}});
+  closeSideMenuIfMobile();
+}}
+applySideMenuState();
+applyAdminMode();
+let initialMenuApplied = false;
+function splitChatValue(value) {{
+  const raw = String(value || '');
+  const parts = raw.split('|');
+  if (parts.length < 2) return {{bot_key:'', chat_id:raw, flow_type:'all'}};
+  return {{bot_key: parts[0] || '', chat_id: parts[1] || '', flow_type: parts[2] || 'all'}};
+}}
+function selectedChatParts() {{ return splitChatValue(document.getElementById('chat').value || ''); }}
+function selectedBotKey() {{ return document.getElementById('botFilter').value || selectedChatParts().bot_key || ''; }}
+function query(params={{}}) {{
+  const p = new URLSearchParams();
+  Object.entries(params).forEach(([k,v]) => {{ if (v !== undefined && v !== null && String(v) !== '') p.set(k, v); }});
+  const qs = p.toString();
+  return qs ? '?' + qs : '';
+}}
+function postHeaders(extra={{}}) {{ return {{...ACTION_HEADER, 'Content-Type':'application/json', ...extra}}; }}
+function scopeName(value) {{ return value === 'open' ? 'รอบเปิด' : (value === 'today' ? 'วันนี้' : (value === 'all' ? 'ทั้งหมด' : value || '-')); }}
+function isSingleChatSelected() {{
+  const parts = selectedChatParts();
+  return Boolean(parts.chat_id && parts.chat_id !== '__all__' && selectedBotKey() !== '__all__');
+}}
+function closeOpenPeriodGuard() {{
+  const ok = isSingleChatSelected();
+  const btn = document.getElementById('closePeriodButton');
+  const hint = document.getElementById('closeGuardHint');
+  if (btn) btn.disabled = !ok;
+  if (hint) hint.textContent = ok ? 'พร้อมปิดรอบเฉพาะกลุ่มที่เลือก' : 'ต้องเลือกบริษัทและกลุ่มเดียวก่อนปิดรอบ';
+  return ok;
+}}
+function updateTopStatus(data, selectedBot, activeFlow) {{
+  const chip = document.getElementById('activeScopeChip');
+  const updated = document.getElementById('lastUpdatedLabel');
+  const botRow = (data.telegram_bots || []).find(b => b.bot_key === selectedBot) || {{}};
+  const company = selectedBot === '__all__' ? 'ทุกบริษัท' : (botRow.company_name || selectedBot || '-');
+  const scope = data.scope_label || scopeName(data.scope || document.getElementById('scope').value || 'today');
+  if (chip) chip.textContent = company + ' · ' + flowName(data.flow_type || activeFlow) + ' · ' + scope;
+  const now = new Date();
+  if (updated) updated.textContent = 'อัปเดตล่าสุด ' + now.toLocaleTimeString('th-TH', {{hour:'2-digit', minute:'2-digit', second:'2-digit'}});
+}}
+function applyAdminMode() {{
+  const enabled = safeStorageGet(ADMIN_MODE_KEY) === '1';
+  document.body.classList.toggle('admin-mode', enabled);
+  const btn = document.getElementById('adminModeToggle');
+  if (btn) btn.textContent = enabled ? 'ปิด Admin' : 'ตั้งค่า/Admin';
+}}
+function toggleAdminMode() {{
+  const enabled = safeStorageGet(ADMIN_MODE_KEY) === '1';
+  safeStorageSet(ADMIN_MODE_KEY, enabled ? '0' : '1');
+  applyAdminMode();
+}}
+function money(n) {{ return Number(n || 0).toLocaleString('th-TH', {{minimumFractionDigits:2, maximumFractionDigits:2}}); }}
+function limitMoney(n) {{ return Number(n || 0) > 0 ? money(n) : '-'; }}
+function nameWithCompany(r) {{
+  const name = r.name || r.display_name || '-';
+  const company = r.company_name || '';
+  return company ? (name + ' (' + company + ')') : name;
+}}
+function esc(s) {{ return String(s ?? '').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c])); }}
+function table(rows, cols) {{
+  if (!rows || !rows.length) return '<div class="muted">ไม่มีข้อมูล</div>';
+  return '<div class="responsive-table"><table><thead><tr>'+cols.map(c=>'<th>'+esc(c[0])+'</th>').join('')+'</tr></thead><tbody>'+
+    rows.map(r=>'<tr>'+cols.map(c=>'<td>'+esc(typeof c[1]==='function'?c[1](r):r[c[1]])+'</td>').join('')+'</tr>').join('')+'</tbody></table></div>';
+}}
+function enhanceResponsiveTables(root=document) {{
+  (root || document).querySelectorAll('.responsive-table table').forEach(tbl => {{
+    const headers = Array.from(tbl.querySelectorAll('thead th')).map(th => (th.textContent || '').trim());
+    tbl.querySelectorAll('tbody tr').forEach(tr => {{
+      Array.from(tr.children).forEach((td, i) => {{ if (headers[i]) td.setAttribute('data-label', headers[i]); }});
+    }});
+  }});
+}}
+function aggregateTable(rows) {{ return table(rows, [['ชื่อ','name'], ['สลิป','count'], ['ยอด', r => money(r.amount)]]); }}
+function sourceBankTable(rows) {{ return aggregateTable(rows); }}
+function dailyAccountLimitTable(rows) {{
+  if (!rows || !rows.length) return '<div class="muted">ไม่มีข้อมูล</div>';
+  return '<div class="responsive-table"><table><thead><tr><th>วันที่</th><th>บัญชีผู้โอน (บริษัท)</th><th>เลขบัญชี</th><th>สลิป</th><th>ยอดวันนั้น</th><th>วงเงิน/วัน</th><th>เหลือ/เกิน</th></tr></thead><tbody>'+
+    rows.map(r => '<tr>'+[
+      '<td>'+esc(r.date || r.date_key || '-')+'</td>',
+      '<td>'+esc(nameWithCompany(r))+'</td>',
+      '<td>'+esc(r.account || '-')+'</td>',
+      '<td>'+esc(r.count || 0)+'</td>',
+      '<td>'+money(r.amount)+'</td>',
+      '<td>'+limitMoney(r.daily_limit ?? r.limit_amount)+'</td>',
+      '<td class="'+(r.over_limit?'bad':'')+'">'+(Number((r.daily_limit ?? r.limit_amount)||0)>0 ? money(r.remaining_amount) : '-')+'</td>'
+    ].join('')+'</tr>').join('')+'</tbody></table></div>';
+}}
+function transferorLimitTable(rows) {{
+  transferorRows = rows || [];
+  if (!transferorRows.length) return '<div class="muted">ไม่มีข้อมูล</div>';
+  return '<div class="responsive-table"><table><thead><tr><th>วันที่</th><th>บัญชีผู้โอน (บริษัท)</th><th>บัญชี</th><th>สลิป</th><th>ยอดวันนั้น</th><th>วงเงิน/วัน</th><th>เหลือ/เกินวันนั้น</th><th class="action-col">จัดการ</th></tr></thead><tbody>'+
+    transferorRows.map((r, i) => '<tr>'+[
+      '<td>'+esc(r.date || r.date_key || '-')+'</td>',
+      '<td>'+esc(nameWithCompany(r))+'</td>',
+      '<td>'+esc(r.account || '-')+'</td>',
+      '<td>'+esc(r.count || 0)+'</td>',
+      '<td class="money-cell">'+money(r.amount)+'</td>',
+      '<td class="money-cell">'+limitMoney(r.daily_limit ?? r.limit_amount)+'</td>',
+      '<td class="money-cell '+(r.over_limit?'bad':'')+'">'+(Number((r.daily_limit ?? r.limit_amount)||0)>0 ? money(r.remaining_amount) : '-')+'</td>',
+      '<td class="action-cell"><button onclick="pickLimitIndex('+i+')">ตั้งวงเงิน</button></td>'
+    ].join('')+'</tr>').join('')+'</tbody></table></div>';
+}}
+function dateTable(rows) {{ return table(rows, [['วันที่','date'], ['สลิป','count'], ['ยอด', r => money(r.amount)]]); }}
+function renderDailyFlowChart(rows) {{
+  if (!rows || !rows.length) return '<div class="muted">ยังไม่มีข้อมูลรายวันใน scope นี้</div>';
+  const maxAmount = Math.max(1, ...rows.map(r => Math.max(Number(r.withdraw_amount || 0), Number(r.deposit_amount || 0), Number(r.other_amount || 0))));
+  const bar = (cls, amount) => '<div class="flow-bar bar '+cls+'" style="width:'+Math.max(2, Math.round((Number(amount || 0) / maxAmount) * 100))+'%"></div>';
+  return '<div class="flow-legend"><span><i class="legend-dot withdraw"></i>ถอน</span><span><i class="legend-dot deposit"></i>ฝาก/เติมมือ</span></div>'+
+    '<div class="flow-chart">'+rows.map(r => {{
+      const other = Number(r.other_amount || 0) ? '<div class="mini">อื่นๆ '+money(r.other_amount || 0)+'</div>' : '';
+      return '<div class="flow-chart-row">'
+        + '<div><b>'+esc(r.date || r.date_key || '-')+'</b><div class="mini">รวม '+esc(r.total_count || 0)+' สลิป</div></div>'
+        + '<div class="flow-bars">'+bar('withdraw', r.withdraw_amount || 0)+bar('deposit', r.deposit_amount || 0)+'</div>'
+        + '<div class="flow-chart-values"><div>ถอน '+money(r.withdraw_amount || 0)+' / '+esc(r.withdraw_count || 0)+'</div><div>ฝาก '+money(r.deposit_amount || 0)+' / '+esc(r.deposit_count || 0)+'</div>'+other+'</div>'
+        + '</div>';
+    }}).join('')+'</div>';
+}}
+function flowName(value) {{ return value === 'deposit' ? 'ฝาก/เติมมือ' : (value === 'withdraw' ? 'ถอน' : (value === 'other' ? 'อื่นๆ' : 'รวมทุกกลุ่ม')); }}
+function flowChipName(value) {{ return value === 'deposit' ? 'กลุ่มฝาก/เติมมือ' : (value === 'withdraw' ? 'กลุ่มถอน' : (value === 'other' ? 'กลุ่มอื่นๆ' : 'รวมทุกกลุ่ม')); }}
+function renderCompanyAccountDaily(rows) {{
+  if (!rows || !rows.length) return '<div class="muted">ไม่มีรายการรายบัญชีตามวันที่</div>';
+  return '<div class="responsive-table"><table><thead><tr><th>บริษัท</th><th>วันที่</th><th>กลุ่ม</th><th>บทบาทบัญชี</th><th>ธนาคาร</th><th>เลขบัญชี</th><th>สลิป</th><th>ยอด</th><th>กลุ่ม Telegram</th><th class="action-col">ดูรายการ</th></tr></thead><tbody>'+
+    rows.map(r => '<tr>'+[
+      '<td>'+esc(r.company_name || r.bot_key || '-')+'</td>',
+      '<td>'+esc(r.date || r.date_key || '-')+'</td>',
+      '<td>['+esc(flowChipName(r.flow_type))+']</td>',
+      '<td>'+esc(r.account_role || '-')+'</td>',
+      '<td>'+esc(r.bank || '-')+'</td>',
+      '<td>'+esc(r.account || '-')+'</td>',
+      '<td>'+esc(r.count || 0)+'</td>',
+      '<td>'+money(r.amount)+'</td>',
+      '<td>'+esc((r.chat_titles || []).join(', '))+'</td>',
+      '<td class="action-cell"><button type="button" data-account-search="'+esc(String(r.account || ''))+'">ดูสลิปบัญชีนี้</button></td>'
+    ].join('')+'</tr>').join('')+'</tbody></table></div>';
+}}
+function pickAccountSearch(queryText, crossCompany=false) {{
+  const input = document.getElementById('slipSearch');
+  if (!input || !queryText) return;
+  input.value = queryText;
+  if (crossCompany) {{
+    const flow = document.getElementById('flowFilter').value || 'all';
+    document.getElementById('botFilter').value = '__all__';
+    const exportCompany = document.getElementById('exportCompanyFilter');
+    if (exportCompany) exportCompany.value = '__all__';
+    document.getElementById('chat').value = '__all__||' + flow;
+  }}
+  showMenuSection('section-company-accounts', {{scroll:false}});
+  load({{scrollTop:true}});
+}}
+function wireAccountSearchButtons() {{
+  document.querySelectorAll('[data-account-search]').forEach(btn => {{
+    btn.onclick = function() {{ pickAccountSearch(this.dataset.accountSearch || ''); }};
+  }});
+  document.querySelectorAll('[data-cross-account-search]').forEach(btn => {{
+    btn.onclick = function() {{ pickAccountSearch(this.dataset.crossAccountSearch || '', true); }};
+  }});
+}}
+function renderAccountSlipSearch(result) {{
+  const queryText = result && result.query ? String(result.query) : '';
+  if (!queryText) return '<div class="muted">กรอกเลขบัญชี/ชื่อ/ธนาคารในช่องค้นหา หรือกด “ดูสลิปบัญชีนี้” จากตารางด้านบน</div>';
+  const rows = (result && result.rows) || [];
+  const summary = '<div class="good"><b>ผลค้นหา: '+esc(queryText)+'</b></div><div class="mini">พบ '+esc((result && result.count) || 0)+' สลิป · ยอดรวม '+money((result && result.amount) || 0)+(result && result.truncated ? ' · แสดงเฉพาะรายการแรก ๆ' : '')+'</div>';
+  if (!rows.length) return summary + '<div class="muted">ไม่พบสลิปของบัญชีนี้ในบริษัท/วัน/ฝากถอนที่เลือก</div>';
+  return summary + '<div class="slip-cards">'+rows.map(r => {{
+    const image = thumb(r.image_url, 'account slip');
+    const banks = [r.from_bank, r.to_bank].filter(Boolean).join(' → ') || r.issuer_bank || '-';
+    const accounts = [r.from_account, r.to_account].filter(Boolean).join(' → ') || '-';
+    const names = [r.transferor_name, r.recipient_name].filter(Boolean).join(' → ') || r.sender_name || '-';
+    return '<div class="slip-card">'+image+'<div class="slip-body"><div class="top"><b>'+esc(r.company_name || r.bot_key || '-')+'</b><span class="pill">'+esc(r.flow_label || flowName(r.flow_type))+'</span></div>'
+      + '<div class="mini">'+esc(r.slip_date_text || ((r.date || r.date_key || '')+' '+(r.slip_time || '')))+' · msg '+esc(r.message_id || '-')+' · '+esc(r.matched_label || '-')+'</div>'
+      + '<div>'+esc(names)+'</div><div class="mini">'+esc(banks)+' · '+esc(accounts)+'</div>'
+      + '<div>ยอด <b>'+money(r.amount || 0)+'</b></div>'
+      + '<div class="mini">ref '+esc(r.reference || r.reference_no || '-')+'</div>'
+      + '</div></div>';
+  }}).join('')+'</div>';
+}}
+function renderCrossCompanyAccountSlipSearch(result) {{
+  const queryText = result && result.query ? String(result.query) : '';
+  if (!queryText) return '<div class="muted">กรอกเลขบัญชี/ชื่อ/ธนาคาร หรือกด “ดูสลิปข้ามบริษัท” เพื่อค้นทุกบริษัทในวันที่/ฝากถอนที่เลือก</div>';
+  const rows = (result && result.rows) || [];
+  const companies = (result && result.companies) || [];
+  const companyLine = companies.length ? '<div class="mini">บริษัทที่พบ: '+companies.map(c => esc(c.company_name || c.bot_key || '-')+' '+money(c.amount || 0)+' / '+esc(c.count || 0)+' สลิป').join(' · ')+'</div>' : '';
+  const summary = '<div class="good"><b>ค้นข้ามบริษัท: '+esc(queryText)+'</b></div><div class="mini">พบ '+esc((result && result.count) || 0)+' สลิป · '+esc((result && result.company_count) || 0)+' บริษัท · ยอดรวม '+money((result && result.amount) || 0)+(result && result.truncated ? ' · แสดงเฉพาะรายการแรก ๆ' : '')+'</div>'+companyLine;
+  const exportLink = Number((result && result.count) || 0) > 0 ? '<div class="toolbar" style="margin:8px 0"><a class="button" target="exportDownloadFrame" href="'+esc(buildCrossCompanyAccountExcelUrl(queryText))+'">ส่งออก Excel ข้ามบริษัท</a></div>' : '';
+  if (!rows.length) return summary + exportLink + '<div class="muted">ไม่พบสลิปของบัญชีนี้ข้ามบริษัทในวันที่/ฝากถอนที่เลือก</div>';
+  return summary + exportLink + '<div class="slip-cards">'+rows.map(r => {{
+    const image = thumb(r.image_url, 'cross company account slip');
+    const banks = [r.from_bank, r.to_bank].filter(Boolean).join(' → ') || r.issuer_bank || '-';
+    const accounts = [r.from_account, r.to_account].filter(Boolean).join(' → ') || '-';
+    const names = [r.transferor_name, r.recipient_name].filter(Boolean).join(' → ') || r.sender_name || '-';
+    return '<div class="slip-card">'+image+'<div class="slip-body"><div class="top"><b>'+esc(r.company_name || r.bot_key || '-')+'</b><span class="pill">'+esc(r.flow_label || flowName(r.flow_type))+'</span></div>'
+      + '<div class="mini">'+esc(r.slip_date_text || ((r.date || r.date_key || '')+' '+(r.slip_time || '')))+' · msg '+esc(r.message_id || '-')+' · '+esc(r.matched_label || '-')+'</div>'
+      + '<div>'+esc(names)+'</div><div class="mini">'+esc(banks)+' · '+esc(accounts)+'</div>'
+      + '<div>ยอด <b>'+money(r.amount || 0)+'</b></div>'
+      + '<div class="mini">ref '+esc(r.reference || r.reference_no || '-')+'</div>'
+      + '</div></div>';
+  }}).join('')+'</div>';
+}}
+function renderAccountCrossCompany(rows) {{
+  if (!rows || !rows.length) return '<div class="muted">ยังไม่พบบัญชีเดียวกันข้ามบริษัทในช่วงนี้</div>';
+  const dayRows = (days) => (days || []).map(d => '<div class="cross-company-day-row"><span>'+esc(d.date || d.date_key || '-')+'</span><span class="day-amount">'+money(d.amount || 0)+' / '+esc(d.count || 0)+' สลิป</span></div>').join('') || '<div class="muted">ไม่มีรายวัน</div>';
+  const companyCards = (companies) => (companies || []).map(c => '<div class="cross-company-company">'
+    + '<div class="cross-company-company-head"><div class="cross-company-company-name">'+esc(c.company_name || c.bot_key || '-')+'</div><div class="cross-company-total">'+money(c.amount || 0)+' / '+esc(c.count || 0)+' สลิป</div></div>'
+    + '<div class="cross-company-days">'+dayRows(c.days)+'</div>'
+    + '</div>').join('') || '<div class="muted">ไม่มีบริษัท</div>';
+  return '<div class="cross-company-list">'+rows.map(r => '<article class="cross-company-card">'
+    + '<div class="cross-company-head"><div><div class="label">บัญชี</div><div class="cross-company-account">'+esc(r.account || '-')+'</div><div class="cross-company-bank">ธนาคาร '+esc(r.bank || '-')+'</div></div><div class="cross-company-chips">'+esc((r.flow_labels || []).map(v => '['+v+']').join(' '))+'</div></div>'
+    + '<div class="cross-company-summary"><div class="cross-company-stat"><div class="label">สลิปรวมบัญชีนี้</div><div class="value">'+esc(r.total_count || 0)+'</div></div><div class="cross-company-stat"><div class="label">รวมบัญชีนี้</div><div class="value good">'+money(r.total_amount || 0)+'</div></div></div>'
+    + '<div class="toolbar"><button type="button" data-cross-account-search="'+esc(String(r.account || ''))+'">ดูสลิปข้ามบริษัท</button></div>'
+    + '<div><div class="cross-company-section-title">แยกตามบริษัท · ไปอยู่บริษัทไหน / ยอดเท่าไหร่</div><div class="cross-company-companies">'+companyCards(r.companies)+'</div></div>'
+    + '<div class="cross-company-overall-days"><div class="cross-company-section-title">ยอดรายวันรวม</div><div class="cross-company-days">'+dayRows(r.days)+'</div></div>'
+    + '</article>').join('')+'</div>';
+}}
+function renderCompanyOverview(rows) {{
+  if (!rows || !rows.length) return '<div class="muted">ยังไม่มีข้อมูลบริษัท</div>';
+  return '<div class="responsive-table"><table><thead><tr><th>บริษัท</th><th>ยอดรวมเปิด</th><th>สลิปรวม</th><th>ยอดถอน</th><th>สลิปถอน</th><th>ยอดฝาก</th><th>สลิปฝาก</th><th>ซ้ำ</th><th>คิว</th><th></th></tr></thead><tbody>'+
+    rows.map(r => '<tr>'+[
+      '<td>'+esc(r.company_name || r.bot_key || '-')+'</td>',
+      '<td>'+money(r.open_amount)+'</td>',
+      '<td>'+esc(r.open_count || 0)+'</td>',
+      '<td>'+money(r.withdraw_open_amount || 0)+'</td>',
+      '<td>'+esc(r.withdraw_open_count || 0)+'</td>',
+      '<td>'+money(r.deposit_open_amount || 0)+'</td>',
+      '<td>'+esc(r.deposit_open_count || 0)+'</td>',
+      '<td>'+esc(r.duplicate_count || 0)+'</td>',
+      '<td>'+esc((r.queued||0)+' / '+(r.processing||0)+' / '+(r.failed||0))+'</td>',
+      '<td><button data-company-bot-key="'+esc(String(r.bot_key || 'default'))+'">เปิด</button></td>'
+    ].join('')+'</tr>').join('')+'</tbody></table></div>';
+}}
+function renderSideCompanies(rows) {{
+  if (!rows || !rows.length) return '<div class="muted">ยังไม่มีข้อมูลบริษัท</div>';
+  return rows.map(r => '<button type="button" class="side-company" data-company-bot-key="'+esc(String(r.bot_key || 'default'))+'"><b>'+esc(r.company_name || r.bot_key || '-')+'</b><div class="mini">ถอน '+money(r.withdraw_open_amount || 0)+' / '+esc(r.withdraw_open_count || 0)+' สลิป · ฝาก '+money(r.deposit_open_amount || 0)+' / '+esc(r.deposit_open_count || 0)+' สลิป · ซ้ำ '+esc(r.duplicate_count || 0)+'</div></button>').join('');
+}}
+function renderOperatorHome(rows) {{
+  if (!rows || !rows.length) return '<div class="muted">ยังไม่มีข้อมูลบริษัท</div>';
+  return '<div class="operator-home-grid">'+rows.map(r => {{
+    const issueCount = Number(r.failed || 0) + Number(r.processing || 0) + Number(r.queued || 0);
+    const dupe = Number(r.duplicate_count || 0);
+    const warn = issueCount || dupe;
+    return '<button type="button" class="operator-card" data-company-bot-key="'+esc(String(r.bot_key || 'default'))+'">'
+      + '<div class="head"><b>'+esc(r.company_name || r.bot_key || '-')+'</b><span class="pill '+(warn?'warn':'good')+'">'+(warn?'ต้องดู':'ปกติ')+'</span></div>'
+      + '<div class="operator-stats"><div class="operator-stat"><div class="mini">ถอน</div><b>'+money(r.withdraw_open_amount || 0)+'</b><div class="mini">'+esc(r.withdraw_open_count || 0)+' สลิป</div></div>'
+      + '<div class="operator-stat"><div class="mini">ฝาก</div><b>'+money(r.deposit_open_amount || 0)+'</b><div class="mini">'+esc(r.deposit_open_count || 0)+' สลิป</div></div></div>'
+      + '<div class="mini">ซ้ำ '+esc(dupe)+' · คิว/ประมวลผล/failed '+esc((r.queued||0)+'/'+(r.processing||0)+'/'+(r.failed||0))+'</div>'
+      + '</button>';
+  }}).join('')+'</div>';
+}}
+function renderExceptionQueue(data) {{
+  const items = [];
+  const summary = data.exception_summary || {{}};
+  const overLimitRows = (data.by_account_day || []).filter(r => r.over_limit);
+  const overLimitCount = Number(summary.over_limit_count || overLimitRows.length || 0);
+  if (overLimitCount) items.push({{title:'เกินวงเงินรายวัน', count:overLimitCount, target:'limitSection', detail:overLimitRows.slice(0,3).map(r => (r.company_name || r.name || '-')+' '+(r.date || '')+' '+money(Math.abs(r.remaining_amount || 0))).join(' · ') || 'เปิดดูบัญชีที่เกินวงเงิน'}});
+  const issueRows = data.issues || [];
+  const issueCount = Number(summary.issue_count || issueRows.length || 0);
+  if (issueCount) items.push({{title:'OCR issue / อ่านไม่ชัด', count:issueCount, target:'section-recent', detail:issueRows.slice(0,3).map(r => (r.company_name || r.bot_key || '-')+' msg '+(r.message_id || '-')).join(' · ') || 'มีรายการอ่านไม่ชัดใน scope นี้'}});
+  const bankRows = data.source_bank_review || [];
+  const bankReviewCount = Number(summary.bank_review_count || data.totals.source_bank_review_count || bankRows.length || 0);
+  if (bankReviewCount) items.push({{title:'รอรีเช็คธนาคารต้นทาง', count:bankReviewCount, target:'section-bank-review', detail:bankRows.slice(0,3).map(r => (r.company_name || r.bot_key || '-')+' '+money(r.amount || 0)).join(' · ') || 'มีสลิปที่ต้องเติมธนาคารต้นทาง'}});
+  const dupeRows = data.duplicate_pairs || [];
+  const dupeCount = Number(summary.duplicate_count || data.totals.selected_duplicate_count || dupeRows.length || 0);
+  if (dupeCount) items.push({{title:'สลิปซ้ำ', count:dupeCount, target:'section-duplicates', detail:dupeRows.slice(0,3).map(r => (r.company_name || r.bot_key || '-')+' '+money(r.amount || r.original_amount || 0)).join(' · ') || 'มีสลิปซ้ำใน scope นี้'}});
+  const queueCount = Number(summary.queue_attention_count || 0);
+  if (queueCount) items.push({{title:'คิว OCR / processing / failed', count:queueCount, target:'section-recent', detail:'รอ '+(data.jobs.queued || 0)+' · processing '+(data.jobs.processing || 0)+' · failed '+(data.jobs.failed || 0)}});
+  if (!items.length) return '<div class="good"><b>ไม่มีรายการที่ต้องจัดการใน scope นี้</b></div><div class="mini">ถ้าต้องการดูรายละเอียดทั้งหมด เปิดเมนูแสดงทั้งหมด</div>';
+  return '<div class="exception-list">'+items.map(item => '<button type="button" class="exception-item" data-menu-jump="'+esc(item.target)+'"><span><strong>'+esc(item.title)+'</strong><div class="mini">'+esc(item.detail || '-')+'</div></span><span class="pill warn">'+esc(item.count)+'</span></button>').join('')+'</div>';
+}}
+function wireExceptionButtons() {{
+  document.querySelectorAll('[data-menu-jump]').forEach(btn => {{
+    btn.onclick = function() {{ showMenuSection(this.dataset.menuJump || 'all'); }};
+  }});
+}}
+function wireCompanyButtons() {{
+  document.querySelectorAll('[data-company-bot-key]').forEach(btn => {{
+    btn.onclick = function() {{ pickCompany(this.dataset.companyBotKey || '__all__'); }};
+  }});
+}}
+function pickCompany(botKey) {{
+  document.getElementById('botFilter').value = botKey;
+  const exportCompany = document.getElementById('exportCompanyFilter');
+  if (exportCompany) exportCompany.value = botKey;
+  document.getElementById('chat').value = botKey + '||' + (document.getElementById('flowFilter').value || 'all');
+  showAllMenuSections();
+  load({{scrollTop:true}});
+}}
+function recentCards(rows) {{
+  if (!rows || !rows.length) return '<div class="muted">ไม่มีข้อมูล</div>';
+  return '<div class="slip-cards">'+rows.slice(0,24).map(r => {{
+    const image = r.image_url ? '<a href="'+esc(r.image_url)+'" target="_blank" rel="noopener"><img class="slip-thumb" loading="lazy" src="'+esc(r.image_url)+'" alt="slip image" /></a>' : '<div class="slip-thumb muted" style="display:flex;align-items:center;justify-content:center">ไม่มีรูป</div>';
+    const dup = Number(r.is_duplicate||0) ? '<div class="mini bad">สลิปซ้ำที่จับแล้ว · ไม่นับในยอดรวม</div>' : '';
+    const company = r.company_name ? '<div class="mini">บริษัท: '+esc(r.company_name)+' · Bot: '+esc(r.bot_key || '')+'</div>' : '';
+    return '<div class="slip-card">'+image+'<div class="slip-body"><div class="top"><b>'+esc(r.transferor_name || r.sender_name || '(ไม่ทราบชื่อ)')+'</b><span class="pill">'+esc(r.status)+(Number(r.is_duplicate||0)?' · ซ้ำ':'')+'</span></div><div class="mini">'+esc(r.slip_date_text || '')+' · '+esc([r.from_bank, r.to_bank].filter(Boolean).join(' → ') || r.issuer_bank || '')+'</div>'+company+'<div>ยอด <b>'+money(r.amount)+'</b></div>'+dup+'<div class="toolbar" style="margin-top:8px" data-admin-only="true"><button class="danger" data-delete-slip-id="'+esc(String(r.id || ''))+'" onclick="deleteSlip(this.dataset.deleteSlipId)">ลบรายการนี้</button></div></div></div>';
+  }}).join('')+'</div>';
+}}
+function thumb(url, label) {{
+  return url ? '<a href="'+esc(url)+'" target="_blank" rel="noopener"><img class="slip-thumb" loading="lazy" src="'+esc(url)+'" alt="'+esc(label||'slip')+'" /></a>' : '<div class="slip-thumb muted" style="display:flex;align-items:center;justify-content:center">ไม่มีรูป</div>';
+}}
+function renderQueueIssues(jobs, issues) {{
+  const jobRows = (jobs || []).slice(0,20);
+  const issueRows = (issues || []).slice(0,40);
+  let html = '';
+  if (jobRows.length) {{
+    html += '<h4>คิว OCR</h4>' + table(jobRows, [['สถานะ','status'], ['msg', 'message_id'], ['attempts', r => (r.attempts||0)+'/'+(r.max_attempts||0)], ['error','error']]);
+  }}
+  if (!issueRows.length) {{
+    html += '<div class="muted">ไม่มีรายการ error/อ่านไม่ชัด</div>';
+    return html;
+  }}
+  html += '<div class="toolbar" style="margin:8px 0" data-admin-only="true"><button onclick="reprocessAllIssues(this)">รี OCR Issues ในขอบเขตนี้</button></div>';
+  html += '<div class="slip-cards">'+issueRows.map(r => {{
+    const image = thumb(r.image_url, 'issue slip');
+    const who = r.transferor_name || r.sender_name || r.username || '(ไม่ทราบชื่อ)';
+    const detail = 'msg '+esc(r.message_id || '-')+' · '+esc(r.slip_date_text || r.created_at_iso || '')+' · '+esc(r.company_name || r.bot_key || '');
+    const amount = Number(r.amount || 0) ? money(r.amount) : '-';
+    const conf = r.confidence !== undefined && r.confidence !== null ? Number(r.confidence || 0).toFixed(2) : '-';
+    return '<div class="slip-card">'+image+'<div class="slip-body"><div class="top"><b>'+esc(who)+'</b><span class="pill">'+esc(r.status || 'issue')+'</span></div><div class="mini">'+detail+'</div><div class="bad">'+esc(r.error || '-')+'</div><div class="mini">ยอด: '+amount+' · confidence: '+esc(conf)+'</div>'+(r.raw_text ? '<div class="mini">OCR: '+esc(r.raw_text)+'</div>' : '')+'<div class="toolbar" style="margin-top:8px" data-admin-only="true"><button data-slip-id="'+esc(String(r.id || ''))+'" onclick="reprocessIssue(this.dataset.slipId, this)">รี OCR</button><button class="danger" data-delete-slip-id="'+esc(String(r.id || ''))+'" onclick="deleteSlip(this.dataset.deleteSlipId)">ลบรายการนี้</button></div></div></div>';
+  }}).join('')+'</div>';
+  return html;
+}}
+async function reprocessIssue(slipId, btn, reload=true) {{
+  if (!slipId) return;
+  const status = document.getElementById('statusline');
+  const oldText = btn ? btn.textContent : '';
+  if (btn) {{ btn.disabled = true; btn.textContent = 'กำลังรี OCR...'; }}
+  if (status) status.textContent = 'กำลังรี OCR issue...';
+  try {{
+    const res = await fetch('/api/slip/reprocess'+query(), {{method:'POST', headers:postHeaders(), body: JSON.stringify({{id: slipId, bot_key: selectedBotKey()}})}});
+    const data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || res.status);
+    if (status) status.textContent = 'รี OCR แล้ว: '+data.status+(data.error ? ' · '+data.error : '')+' · '+money(data.amount || 0);
+    if (reload) await load();
+    return data;
+  }} catch (e) {{
+    const message = 'รี OCR ไม่สำเร็จ: '+(e && e.message ? e.message : e);
+    if (status) status.textContent = message;
+    await dashboardNotify(message);
+    return null;
+  }} finally {{
+    if (btn) {{ btn.disabled = false; btn.textContent = oldText || 'รี OCR'; }}
+  }}
+}}
+async function reprocessAllIssues(btn) {{
+  const rows = (currentSnapshot && currentSnapshot.issues) || [];
+  if (!rows.length) return await dashboardNotify('ไม่มี Issues ให้รี OCR');
+  if (!await dashboardConfirm('รี OCR Issues ในขอบเขตนี้ '+rows.length+' รายการที่โหลดมา?')) return;
+  const oldText = btn ? btn.textContent : '';
+  if (btn) {{ btn.disabled = true; btn.textContent = 'กำลังรี OCR ทั้งหมด...'; }}
+  let ok = 0, fail = 0;
+  for (const row of rows) {{
+    const result = await reprocessIssue(row.id, null, false);
+    if (result && result.ok) ok += 1; else fail += 1;
+  }}
+  if (btn) {{ btn.disabled = false; btn.textContent = oldText || 'รี OCR Issues ในขอบเขตนี้'; }}
+  const status = document.getElementById('statusline');
+  if (status) status.textContent = 'รี OCR Issues เสร็จ: สำเร็จ '+ok+' / fail '+fail;
+  await load();
+}}
+function renderDuplicatePairs(rows) {{
+  if (!rows || !rows.length) return '<div class="muted">ยังไม่พบสลิปซ้ำในช่วงนี้</div>';
+  return '<div class="slip-cards">'+rows.map(r => {{
+    const dupImg = thumb(r.duplicate_image_url, 'duplicate slip');
+    const origImg = thumb(r.original_image_url, 'original slip');
+    const banks = [r.from_bank, r.to_bank].filter(Boolean).join(' → ') || r.issuer_bank || '-';
+    const originalBanks = [r.original_from_bank, r.original_to_bank].filter(Boolean).join(' → ') || r.original_issuer_bank || banks || '-';
+    const ref = r.reference_no || r.seq || r.aid || '-';
+    const originalRef = r.original_reference_no || r.original_seq || r.original_aid || '-';
+    return '<div class="slip-card dupe-card">'
+      + '<div class="dupe-thumbs">'+dupImg+origImg+'</div>'
+      + '<div class="slip-body"><div class="top"><b>สลิปซ้ำ</b><span class="pill">ซ้ำกับใบต้นฉบับ</span></div>'
+      + '<div><b>ข้อมูลใบซ้ำ</b>: '+esc((r.slip_date_display || r.slip_date_iso || '')+' '+(r.slip_time || ''))+' · '+esc(r.transferor_name || '(ไม่ทราบผู้โอน)')+' → '+esc(r.recipient_name || '-')+'</div>'
+      + '<div class="mini">'+esc(banks)+' · ref '+esc(ref)+' · msg '+esc(r.duplicate_message_id || '-')+'</div>'
+      + '<div><b>ข้อมูลต้นฉบับ</b>: '+esc((r.original_slip_date_display || r.original_slip_date_iso || '')+' '+(r.original_slip_time || ''))+' · '+esc(r.original_transferor_name || r.transferor_name || '(ไม่ทราบผู้โอน)')+' → '+esc(r.original_recipient_name || r.recipient_name || '-')+'</div>'
+      + '<div class="mini">'+esc(originalBanks)+' · ref '+esc(originalRef)+' · msg '+esc(r.original_message_id || '-')+'</div>'
+      + '<div>ยอด <b>'+money(r.amount || r.original_amount)+'</b></div>'
+      + '<div class="toolbar" style="margin-top:8px"><button data-dupe-id="'+esc(String(r.duplicate_id || ''))+'">ยกเลิกการนับซ้ำใบนี้</button></div>'
+      + '</div></div>';
+  }}).join('')+'</div>';
+}}
+function sourceBankReviewCards(rows) {{
+  if (!rows || !rows.length) return '<div class="muted">ไม่มีสลิปที่ต้องรีเช็คธนาคารต้นทาง</div>';
+  return '<div class="slip-cards">'+rows.map(r => {{
+    const image = thumb(r.image_url, 'source bank review slip');
+    const hint = 'issuer: '+esc(r.issuer_bank || '-')+' · ปลายทาง: '+esc(r.to_bank || '-')+' · ต้นทาง: '+esc(r.from_bank || '(ยังไม่เจอ)');
+    return '<div class="slip-card">'+image+'<div class="slip-body"><div class="top"><b>'+esc(r.transferor_name || r.sender_name || '(ไม่ทราบชื่อ)')+'</b><span class="pill">รีเช็คต้นทาง</span></div><div class="mini">ยอดนี้นับเข้าแดชบอร์ดแล้ว ถ้าเป็น success ไม่ซ้ำ · รีเช็คเพื่อเติมธนาคารต้นทางให้แผงธนาคารและวงเงินครบ</div><div class="mini">'+esc(r.slip_date_text || '')+' · msg '+esc(r.message_id || '-')+'</div><div>'+hint+'</div><div>ยอด <b>'+money(r.amount)+'</b></div><div class="toolbar" style="margin-top:8px" data-admin-only="true"><button data-slip-id="'+esc(String(r.id || ''))+'" onclick="openaiBankRecheck(this.dataset.slipId, this)">OpenAI รีเช็คธนาคาร</button><button class="danger" data-delete-slip-id="'+esc(String(r.id || ''))+'" onclick="deleteSlip(this.dataset.deleteSlipId)">ลบรายการนี้</button></div></div></div>';
+  }}).join('')+'</div>';
+}}
+
+async function openaiBankRecheck(slipId, btn, ask=true, reload=true) {{
+  if (!slipId) return;
+  if (ask) {{
+    const ok = await dashboardConfirm('ยืนยันให้ OpenAI รีเช็คธนาคารจากรูปสลิปใบนี้?\\n\\nระบบจะอัปเดตเฉพาะ field ที่ยังว่าง/ไม่ทราบ และอาจใช้เวลาสักครู่');
+    if (!ok) return;
+  }}
+  const status = document.getElementById('statusline');
+  const oldText = btn ? btn.textContent : '';
+  if (btn) {{ btn.disabled = true; btn.textContent = 'กำลังรีเช็ค...'; }}
+  if (status) status.textContent = 'OpenAI กำลังรีเช็คธนาคาร...';
+  try {{
+    const res = await fetch('/api/bank-review/openai'+query(), {{method:'POST', headers:postHeaders(), body: JSON.stringify({{id: slipId, apply: true}})}});
+    let data = {{}};
+    try {{ data = await res.json(); }} catch (e) {{ data = {{error: 'อ่านผลลัพธ์จาก server ไม่ได้'}}; }}
+    if (!res.ok || !data.ok) {{
+      const message = 'รีเช็คไม่สำเร็จ: ' + (data.error || res.status);
+      if (status) status.textContent = message;
+      await dashboardNotify(message);
+      return;
+    }}
+    const applied = Object.entries(data.applied || {{}}).map(([k,v]) => k+'='+v).join(', ') || 'ไม่มี field ใหม่';
+    const message = 'OpenAI รีเช็คแล้ว: ' + applied;
+    if (status) status.textContent = message;
+    if (ask) await dashboardNotify(message);
+    if (reload) await load();
+  }} catch (e) {{
+    const message = 'รีเช็คไม่สำเร็จ: ' + (e && e.message ? e.message : e);
+    if (status) status.textContent = message;
+    await dashboardNotify(message);
+  }} finally {{
+    if (btn) {{ btn.disabled = false; btn.textContent = oldText || 'OpenAI รีเช็คธนาคาร'; }}
+  }}
+}}
+
+async function openaiBankRecheckAllScope(btn) {{
+  const summary = (currentSnapshot && currentSnapshot.exception_summary) || {{}};
+  const total = Number(summary.bank_review_count || (currentSnapshot && currentSnapshot.totals && currentSnapshot.totals.source_bank_review_count) || 0);
+  if (!total) return await dashboardNotify('ไม่มีรายการที่ต้องรีเช็คในขอบเขตนี้');
+  if (!await dashboardConfirm('ยืนยันให้ OpenAI รีเช็คธนาคารต้นทางทั้งหมด '+total+' รายการในบริษัท/กลุ่ม/วันที่ที่เลือก?\\n\\nระบบจะอัปเดตเฉพาะ field ธนาคารที่ยังว่างหรือไม่ทราบ')) return;
+  const status = document.getElementById('statusline');
+  const oldText = btn ? btn.textContent : '';
+  if (btn) {{ btn.disabled = true; btn.textContent = 'กำลังรีเช็คทั้ง scope...'; }}
+  if (status) status.textContent = 'OpenAI กำลังรีเช็คธนาคารทั้ง scope...';
+  try {{
+    const parts = selectedChatParts();
+    const payload = {{
+      chat_id: (parts.bot_key === selectedBotKey()) ? (parts.chat_id || '') : '',
+      bot_key: selectedBotKey(),
+      flow_type: document.getElementById('flowFilter').value || parts.flow_type || 'all',
+      scope: currentSnapshot ? (currentSnapshot.scope || document.getElementById('scope').value || 'open') : (document.getElementById('scope').value || 'open'),
+      slip_search: document.getElementById('slipSearch').value || '',
+      apply: true
+    }};
+    const res = await fetch('/api/bank-review/openai-all'+query(), {{method:'POST', headers:postHeaders(), body: JSON.stringify(payload)}});
+    const data = await res.json();
+    const message = 'รีเช็คธนาคารทั้ง scope เสร็จ: สำเร็จ '+(data.ok_count || 0)+' / fail '+(data.fail_count || 0)+' / ทั้งหมด '+(data.total_count || total);
+    if (status) status.textContent = message;
+    if (!res.ok && !data.ok) await dashboardNotify(message);
+    await load();
+  }} catch (e) {{
+    const message = 'รีเช็คทั้ง scope ไม่สำเร็จ: ' + (e && e.message ? e.message : e);
+    if (status) status.textContent = message;
+    await dashboardNotify(message);
+  }} finally {{
+    if (btn) {{ btn.disabled = false; btn.textContent = oldText || 'OpenAI รีเช็คทั้งหมดในขอบเขตนี้'; }}
+  }}
+}}
+const openaiBankRecheckAll = openaiBankRecheckAllScope;
+
+async function unmarkDuplicate(slipId) {{
+  if (!slipId) return;
+  if (!await dashboardConfirm('ยืนยันยกเลิกการนับซ้ำของใบนี้? ใบนี้จะกลับไปนับในยอดรวม')) return;
+  const res = await fetch('/api/duplicate/unmark'+query(), {{method:'POST', headers:postHeaders(), body: JSON.stringify({{id: slipId, bot_key: selectedBotKey()}})}});
+  const data = await res.json();
+  if (!res.ok || !data.ok) return await dashboardNotify(data.error || 'ยกเลิกไม่สำเร็จ');
+  await load();
+}}
+async function deleteSlip(slipId) {{
+  if (!slipId) return;
+  if (!await dashboardConfirm('ยืนยันลบรายการนี้? ถ้าเป็นสลิปที่นับยอดอยู่ ระบบจะหักยอดออกจากแดชบอร์ดทันที', 'ยืนยันลบรายการ', true)) return;
+  const status = document.getElementById('statusline');
+  if (status) status.textContent = 'กำลังลบรายการ...';
+  const res = await fetch('/api/slip/delete'+query(), {{method:'POST', headers:postHeaders(), body: JSON.stringify({{id: slipId, bot_key: selectedBotKey(), reason: 'dashboard operator delete'}})}});
+  const data = await res.json();
+  if (!res.ok || !data.ok) {{ if (status) status.textContent = 'ลบไม่สำเร็จ: ' + (data.error || res.status); return await dashboardNotify(data.error || 'ลบไม่สำเร็จ'); }}
+  if (status) status.textContent = 'ลบรายการแล้ว · หักยอดออก ' + money(data.removed_amount || 0);
+  await load();
+}}
+function wireDuplicateButtons() {{
+  document.querySelectorAll('[data-dupe-id]').forEach(function(btn) {{
+    btn.onclick = function() {{ unmarkDuplicate(this.dataset.dupeId); }};
+  }});
+}}
+function pickLimitIndex(index) {{
+  const r = transferorRows[index] || {{}};
+  pickLimit(r.limit_key || '', r.display_name || r.name || '', r.bank || '', r.account || '', Number((r.limit_amount ?? r.daily_limit) || 0));
+}}
+function pickLimit(limitKey, name, bank, account, amount) {{
+  document.getElementById('limitKey').value = limitKey;
+  document.getElementById('limitName').value = name;
+  document.getElementById('limitBank').value = bank;
+  document.getElementById('limitAccount').value = account;
+  document.getElementById('limitAmount').value = amount || '';
+}}
+async function saveAccountLimit() {{
+  const parts = selectedChatParts();
+  const payload = {{chat_id: parts.chat_id, limit_key: document.getElementById('limitKey').value, display_name: document.getElementById('limitName').value, bank: document.getElementById('limitBank').value, account: document.getElementById('limitAccount').value, limit_amount: Number(document.getElementById('limitAmount').value || 0)}};
+  if (!payload.chat_id || !payload.limit_key) return await dashboardNotify('เลือกบัญชีจากปุ่มตั้งวงเงินก่อน');
+  const res = await fetch('/api/account-limit'+query(), {{method:'POST', headers:postHeaders(), body: JSON.stringify(payload)}});
+  const data = await res.json();
+  if (!res.ok || !data.ok) return await dashboardNotify(data.error || 'บันทึกไม่สำเร็จ');
+  await load();
+}}
+function renderTelegramBots(rows) {{
+  if (!rows || !rows.length) return '<div class="muted">ยังไม่มีข้อมูลบอท</div>';
+  return '<div class="bot-list">'+rows.map(b => '<div class="bot-row"><div class="top"><b>'+esc(b.company_name || b.bot_key || '-')+'</b><span class="pill">'+(b.has_token ? 'พร้อมใช้' : 'ไม่มี token')+'</span></div><div class="mini">bot: '+esc(b.bot_key || '-')+' · token: '+(b.has_token ? 'ตั้งค่าแล้ว' : 'ยังไม่ตั้งค่า')+'</div></div>').join('')+'</div>';
+}}
+function renderCompanyAccounts(rows) {{
+  return table(rows || [], [['บริษัท','company_name'], ['ธนาคาร','bank'], ['เลขบัญชี','account_no'], ['ชื่อบัญชี','account_name'], ['วงเงิน/วัน', r => limitMoney(r.daily_limit)]]);
+}}
+async function saveCompanyAccount() {{
+  const parts = selectedChatParts();
+  const payload = {{
+    bot_key: selectedBotKey() || parts.bot_key || (currentSnapshot && currentSnapshot.selected_bot_key) || 'default',
+    chat_id: parts.chat_id,
+    company_name: document.getElementById('companyName').value || '',
+    bank: document.getElementById('accountBank').value || '',
+    account_no: document.getElementById('accountNo').value || '',
+    account_name: document.getElementById('accountName').value || '',
+    daily_limit: Number(document.getElementById('accountDailyLimit').value || 0)
+  }};
+  if (!payload.chat_id || !payload.company_name || !payload.account_no) return await dashboardNotify('กรอกบริษัทและเลขบัญชีก่อน');
+  const res = await fetch('/api/company-account'+query(), {{method:'POST', headers:postHeaders(), body: JSON.stringify(payload)}});
+  const data = await res.json();
+  if (!res.ok || !data.ok) return await dashboardNotify(data.error || 'บันทึกบัญชีไม่สำเร็จ');
+  await load();
+}}
+function reconcileSummary(data) {{
+  if (!data) return '<div class="muted">ยังไม่ได้เทียบ</div>';
+  if (!data.ok) return '<div class="bad">'+esc(data.error || 'reconcile failed')+'</div>';
+  const complete = (data.missing.count||0) === 0 && (data.extra.count||0) === 0;
+  const verdict = complete ? 'ผลเทียบยอด: ครบ' : 'ผลเทียบยอด: ไม่ครบ';
+  const scope = data.scope || {{}};
+  const cards = '<div class="'+(complete?'good':'warn')+'"><b>'+verdict+'</b></div>'
+    + '<div id="reconcile_scope" class="mini">บริษัท/Bot: '+esc(scope.bot_key || '__all__')+' · กลุ่ม: '+esc(scope.flow_label || scope.flow_type || 'รวมทุกกลุ่ม')+' · ช่วง: '+esc(scope.date_scope || '-')+'</div>'
+    + '<div class="muted">หลังบ้าน '+(data.backend.count||0)+' รายการ · '+money(data.backend.amount)+' | สลิป '+(data.slips.count||0)+' รายการ · '+money(data.slips.amount)+' | match '+(data.matched.count||0)+' | ขาด '+(data.missing.count||0)+' | เกิน '+(data.extra.count||0)+' | diff '+money(data.diff_amount)+'</div>';
+  const matchRows = (data.matched.rows || []).map(m => ({{...m.backend, status:'ตรงกัน', slip_source:(m.slip||{{}}).source || '', slip_name:(m.slip||{{}}).name || '', slip_time:(m.slip||{{}}).time || '', score:m.score}}));
+  const missing = table(data.missing_in_slips, [['สถานะ', r => 'หลังบ้านมี แต่ไม่พบในสลิป'], ['วันที่','date'], ['เวลา','time'], ['ชื่อ','name'], ['ธนาคาร','bank'], ['ไฟล์/แหล่งที่มา','source'], ['ref/รหัส','reference'], ['ยอด', r => money(r.amount)]]);
+  const extra = table(data.extra_slips, [['สถานะ', r => 'สลิปมี แต่ไม่พบในหลังบ้าน'], ['วันที่','date'], ['เวลา','time'], ['ชื่อ','name'], ['ธนาคาร','bank'], ['ไฟล์/แหล่งที่มา','source'], ['ref/รหัส','reference'], ['ยอด', r => money(r.amount)]]);
+  const matched = table(matchRows, [['สถานะ','status'], ['วันที่','date'], ['เวลา','time'], ['ชื่อ','name'], ['ธนาคาร','bank'], ['ไฟล์/แหล่งที่มา','source'], ['ref/รหัส','reference'], ['ยอด', r => money(r.amount)], ['score','score']]);
+  const dailyRows = [
+    ...(data.daily.backend || []).map(r => ({{...r, source:'หลังบ้าน'}})),
+    ...(data.daily.slips || []).map(r => ({{...r, source:'สลิป'}})),
+  ];
+  const daily = table(dailyRows, [['แหล่ง','source'], ['วันที่','date'], ['รายการ','count'], ['ยอด', r => money(r.amount)]]);
+  return cards + '<h4>สรุปรายวัน</h4>' + daily + '<h4>รายการที่ตรงกัน</h4>' + matched + '<h4>หลังบ้านมี แต่ไม่พบในสลิป</h4>' + missing + '<h4>สลิปมี แต่ไม่พบในหลังบ้าน</h4>' + extra;
+}}
+function updateReconcileScopePreview() {{
+  const botEl = document.getElementById('reconcileCompanyFilter');
+  const flowEl = document.getElementById('reconcileFlowFilter');
+  const scopeEl = document.getElementById('scope');
+  const box = document.getElementById('reconcileScopePreview');
+  if (!box || !botEl || !flowEl) return;
+  const bot = botEl.value || '__all__';
+  const botLabel = botEl.selectedOptions && botEl.selectedOptions[0] ? botEl.selectedOptions[0].textContent : bot;
+  const flow = flowEl.value || '';
+  const ready = bot && bot !== '__all__' && (flow === 'deposit' || flow === 'withdraw');
+  if (!ready) {{
+    box.innerHTML = '<b>เลือกบริษัทและฝาก/ถอนก่อนอัปโหลดไฟล์หลังบ้าน</b><div class="mini">ป้องกันการเอาไฟล์บริษัทหนึ่งไปเทียบกับยอดอีกบริษัทหรืออีกฝั่ง</div>';
+    return;
+  }}
+  box.innerHTML = 'ไฟล์นี้จะถูกเทียบเฉพาะ <b>'+esc(botLabel)+'</b> · <b>'+esc(flowName(flow))+'</b> · '+esc(scopeName(scopeEl ? scopeEl.value : 'all'));
+}}
+async function runReconcile() {{
+  const guardScopeMsg = 'เลือกบริษัทและฝาก/ถอนก่อนอัปโหลดไฟล์หลังบ้าน';
+  const bot = document.getElementById('reconcileCompanyFilter').value || '__all__';
+  const flow = document.getElementById('reconcileFlowFilter').value || '';
+  const scope = document.getElementById('scope').value || 'all';
+  const excel_path = document.getElementById('backendExcel').value || '';
+  const file = document.getElementById('backendExcelFile').files[0];
+  const box = document.getElementById('reconcile');
+  if (bot === '__all__' || !bot) {{
+    const msg = 'เลือกบริษัทก่อนอัปโหลด/เทียบไฟล์หลังบ้าน';
+    box.innerHTML = '<div class="bad">'+esc(msg)+'</div>';
+    await dashboardNotify(msg);
+    return;
+  }}
+  if (flow !== 'deposit' && flow !== 'withdraw') {{
+    const msg = 'เลือกยอดฝาก/ถอนก่อนอัปโหลดไฟล์หลังบ้าน';
+    box.innerHTML = '<div class="bad">'+esc(msg)+'</div>';
+    await dashboardNotify(msg);
+    return;
+  }}
+  if (!file && !excel_path) {{
+    const msg = 'อัปโหลด Excel ของบริษัทนี้ก่อน หรือใส่ path ไฟล์บน server';
+    box.innerHTML = '<div class="bad">'+esc(msg)+'</div>';
+    await dashboardNotify(msg);
+    return;
+  }}
+  box.innerHTML = '<div class="muted">กำลังเทียบยอดเฉพาะบริษัท/ฝากถอนที่เลือก...</div>';
+  let res;
+  if (file) {{
+    const form = new FormData();
+    form.append('chat_id', '');
+    form.append('bot_key', bot);
+    form.append('flow_type', flow);
+    form.append('scope', scope);
+    form.append('excel', file);
+    res = await fetch('/api/reconcile'+query(), {{method:'POST', headers:ACTION_HEADER, body: form}});
+  }} else {{
+    res = await fetch('/api/reconcile'+query(), {{method:'POST', headers:postHeaders(), body: JSON.stringify({{chat_id:'', bot_key:bot, flow_type:flow, scope, excel_path}})}});
+  }}
+  const data = await res.json();
+  box.innerHTML = reconcileSummary(data);
+  enhanceResponsiveTables(box);
+}}
+async function load(options={{}}) {{
+  const botEl = document.getElementById('botFilter');
+  const exportCompanyEl = document.getElementById('exportCompanyFilter');
+  const chatEl = document.getElementById('chat');
+  const flowEl = document.getElementById('flowFilter');
+  const scopeEl = document.getElementById('scope');
+  const customDateEl = document.getElementById('customDateFilter');
+  const summaryStartEl = document.getElementById('summaryStartDate');
+  const summaryEndEl = document.getElementById('summaryEndDate');
+  const slipFilterEl = document.getElementById('slipFilter');
+  const slipSearchEl = document.getElementById('slipSearch');
+  const current = splitChatValue(chatEl.value || '');
+  const currentBot = botEl.value || current.bot_key || '';
+  const currentFlow = flowEl.value || current.flow_type || 'all';
+  const currentDate = customDateEl ? (customDateEl.value || '') : '';
+  const summaryStart = summaryStartEl ? (summaryStartEl.value || '') : '';
+  const summaryEnd = summaryEndEl ? (summaryEndEl.value || '') : '';
+  const rangeScope = (summaryStart || summaryEnd) ? `range:${{summaryStart}}..${{summaryEnd}}` : '';
+  const currentScope = rangeScope || currentDate || scopeEl.value || 'today';
+  const currentFilter = slipFilterEl.value || 'all';
+  const currentSearch = slipSearchEl.value || '';
+  const requestChat = (current.bot_key === currentBot && (currentFlow === 'all' || current.flow_type === currentFlow)) ? current.chat_id : '';
+  const res = await fetch('/api/summary'+query({{chat_id: requestChat, bot_key: currentBot, flow_type: currentFlow, scope: currentScope, slip_filter: currentFilter, slip_search: currentSearch}}), {{cache:'no-store'}});
+  if (!res.ok) {{ document.body.innerHTML = '<main class="wrap"><div class="card bad">Unauthorized or dashboard unavailable</div></main>'; return; }}
+  const data = await res.json();
+  currentSnapshot = data;
+  const selectedBot = data.selected_bot_key || currentBot || '__all__';
+  const companyOptions = '<option value="__all__">ทุกบริษัท</option>' + (data.telegram_bots || []).map(b => '<option value="'+esc(b.bot_key)+'">'+esc(b.company_name || b.bot_key)+'</option>').join('');
+  botEl.innerHTML = companyOptions;
+  botEl.value = selectedBot || '__all__';
+  if (exportCompanyEl) {{
+    exportCompanyEl.innerHTML = companyOptions;
+    exportCompanyEl.value = selectedBot || '__all__';
+  }}
+  const reconcileCompanyFilter = document.getElementById('reconcileCompanyFilter');
+  if (reconcileCompanyFilter) {{
+    reconcileCompanyFilter.innerHTML = companyOptions;
+    reconcileCompanyFilter.value = selectedBot && selectedBot !== '__all__' ? selectedBot : (reconcileCompanyFilter.value || '__all__');
+  }}
+  flowEl.value = data.flow_type || currentFlow || 'all';
+  const activeFlow = flowEl.value || 'all';
+  const reconcileFlowFilter = document.getElementById('reconcileFlowFilter');
+  if (reconcileFlowFilter && !reconcileFlowFilter.value && (activeFlow === 'deposit' || activeFlow === 'withdraw')) {{ reconcileFlowFilter.value = activeFlow; }}
+  const chatRows = (data.chats || []).filter(c => String(c.bot_key || 'default') === String(selectedBot || 'default') && (activeFlow === 'all' || String(c.flow_type || 'other') === activeFlow));
+  if (selectedBot === '__all__') {{
+    chatEl.disabled = true;
+    chatEl.innerHTML = '<option value="__all__||'+esc(activeFlow)+'">รวมทุกบริษัท · '+flowName(activeFlow)+'</option>';
+  }} else if (chatRows.length) {{
+    chatEl.disabled = false;
+    const allLabel = activeFlow === 'all' ? 'ทุกกลุ่มของบริษัทนี้' : ('ทุกกลุ่ม'+flowName(activeFlow)+'ของบริษัทนี้');
+    chatEl.innerHTML = '<option value="'+esc((selectedBot || 'default')+'||'+activeFlow)+'">'+esc(allLabel)+'</option>' + chatRows.map(c => '<option value="'+esc((c.bot_key || 'default')+'|'+c.chat_id+'|'+(c.flow_type || 'other'))+'">'+esc('['+flowChipName(c.flow_type)+'] '+(c.chat_title || c.chat_id))+' ('+money(c.open_amount)+')</option>').join('');
+    const selectedValue = (selectedBot || 'default') + '|' + (data.selected_chat_id || '') + '|' + (data.flow_type || activeFlow);
+    chatEl.value = data.selected_chat_id ? selectedValue : ((selectedBot || 'default')+'||'+activeFlow);
+  }} else {{
+    chatEl.disabled = true;
+    const noChatLabel = activeFlow === 'all' ? 'ยังไม่มีกลุ่มของบริษัทนี้' : ('ยังไม่มีกลุ่ม'+flowName(activeFlow)+'ของบริษัทนี้');
+    chatEl.innerHTML = '<option value="'+esc((selectedBot || 'default')+'||'+activeFlow)+'">'+esc(noChatLabel)+'</option>';
+  }}
+  document.getElementById('withdrawAmount').textContent = money(data.totals.withdraw_limit_amount || 0);
+  document.getElementById('withdrawCount').textContent = data.totals.withdraw_limit_count || 0;
+  document.getElementById('depositAmount').textContent = money(data.totals.deposit_customer_amount || 0);
+  document.getElementById('depositCount').textContent = data.totals.deposit_customer_count || 0;
+  document.getElementById('queued').textContent = data.jobs.queued || 0;
+  document.getElementById('processing').textContent = (data.jobs.processing || 0) + ' / ' + (data.jobs.failed || 0);
+  document.getElementById('duplicateCount').textContent = data.totals.selected_duplicate_count || 0;
+  document.getElementById('duplicateAmount').textContent = 'ยอดซ้ำ ' + money(data.totals.selected_duplicate_amount || 0);
+  document.getElementById('sourceBankReviewCount').textContent = data.totals.source_bank_review_count || 0;
+  if (data.scope && ['today','open','all'].includes(String(data.scope))) scopeEl.value = data.scope;
+  if (customDateEl && /^\d{{4}}-\d{{2}}-\d{{2}}$/.test(data.scope || '')) {{
+    customDateEl.value = data.scope;
+    if (summaryStartEl) summaryStartEl.value = '';
+    if (summaryEndEl) summaryEndEl.value = '';
+    scopeEl.value = 'all';
+  }} else if (String(data.scope || '').startsWith('range:')) {{
+    const rangeText = String(data.scope || '').slice(6);
+    const rangeParts = rangeText.split('..');
+    if (summaryStartEl) summaryStartEl.value = rangeParts[0] || '';
+    if (summaryEndEl) summaryEndEl.value = rangeParts[1] || '';
+    if (customDateEl) customDateEl.value = '';
+    scopeEl.value = 'all';
+  }} else if (customDateEl && !currentDate) {{
+    customDateEl.value = '';
+  }}
+  if (data.slip_filter) slipFilterEl.value = data.slip_filter;
+  if (document.activeElement !== slipSearchEl) slipSearchEl.value = data.slip_search || currentSearch || '';
+  document.getElementById('companyOverview').innerHTML = renderCompanyOverview(data.company_summary);
+  document.getElementById('operatorHome').innerHTML = renderOperatorHome(data.company_summary);
+  document.getElementById('exceptionQueue').innerHTML = renderExceptionQueue(data);
+  wireExceptionButtons();
+  document.getElementById('sideCompanies').innerHTML = renderSideCompanies(data.company_menu || data.company_summary);
+  wireCompanyButtons();
+  document.getElementById('botSettings').innerHTML = renderTelegramBots(data.telegram_bots);
+  updateTopStatus(data, selectedBot, activeFlow);
+  closeOpenPeriodGuard();
+  const activeSummary = document.getElementById('activeSelectionSummary');
+  if (activeSummary) activeSummary.innerHTML = '<div><b>'+esc(selectedBot === '__all__' ? 'ทุกบริษัท' : (selectedBot || '-'))+'</b> · '+esc(flowName(data.flow_type || activeFlow))+' · '+esc(data.scope_label || data.scope || scopeName(data.scope || ''))+'</div><div class="mini">ใช้ตัวกรองและส่งออก Excel ได้จาก side menu ด้านซ้าย</div>';
+  document.getElementById('companyAccounts').innerHTML = renderCompanyAccounts(data.company_accounts);
+  document.getElementById('companyAccountDaily').innerHTML = renderCompanyAccountDaily(data.company_account_daily);
+  document.getElementById('accountSlipSearch').innerHTML = renderAccountSlipSearch(data.account_slip_search);
+  document.getElementById('accountCrossCompany').innerHTML = renderAccountCrossCompany(data.account_cross_company);
+  document.getElementById('crossCompanyAccountSlipSearch').innerHTML = renderCrossCompanyAccountSlipSearch(data.cross_company_account_slip_search);
+  wireAccountSearchButtons();
+  const selectedBotRow = (data.telegram_bots || []).find(b => b.bot_key === selectedBot) || {{}};
+  if (!document.getElementById('companyName').value) document.getElementById('companyName').value = selectedBotRow.company_name || selectedBot || '';
+  document.getElementById('dailyFlowChart').innerHTML = renderDailyFlowChart(data.daily_flow_summary);
+  document.getElementById('byDate').innerHTML = dateTable(data.by_date);
+  const withdrawSummary = document.getElementById('withdrawLimitSummary');
+  const depositSummary = document.getElementById('depositCustomerSummary');
+  if (withdrawSummary) withdrawSummary.textContent = 'ฝั่งถอน/วงเงิน: ' + (data.totals.withdraw_limit_count || 0) + ' สลิป · ' + money(data.totals.withdraw_limit_amount || 0) + ' · ไม่รวมฝาก/เติมมือ';
+  if (depositSummary) depositSummary.textContent = 'ฝั่งฝาก/เติมมือ: ' + (data.totals.deposit_customer_count || 0) + ' สลิป · ' + money(data.totals.deposit_customer_amount || 0) + ' · สลิปลูกค้า ไม่มีวงเงิน';
+  if (data.limit_check_enabled === false) {{
+    const limitNote = '<div class="muted">กลุ่มฝาก/เติมมือ ไม่ต้องเช็กวงเงิน</div>';
+    document.getElementById('byAccountDay').innerHTML = limitNote;
+    document.getElementById('byTransferor').innerHTML = limitNote;
+  }} else {{
+    document.getElementById('byAccountDay').innerHTML = dailyAccountLimitTable(data.by_account_day);
+    document.getElementById('byTransferor').innerHTML = transferorLimitTable(data.by_account_day);
+  }}
+  document.getElementById('depositCustomerSlips').innerHTML = recentCards(data.deposit_customer_slips || []);
+  document.getElementById('bySender').innerHTML = aggregateTable(data.by_sender);
+  document.getElementById('byFromBank').innerHTML = sourceBankTable(data.by_from_bank);
+  document.getElementById('byToBank').innerHTML = aggregateTable(data.by_to_bank);
+  document.getElementById('duplicatePairs').innerHTML = renderDuplicatePairs(data.duplicate_pairs);
+  wireDuplicateButtons();
+  document.getElementById('sourceBankReview').innerHTML = sourceBankReviewCards(data.source_bank_review);
+  document.getElementById('recent').innerHTML = recentCards(data.recent);
+  document.getElementById('issues').innerHTML = renderQueueIssues(data.jobs_recent || [], data.issues || []);
+  document.getElementById('usage').innerHTML = table(data.provider_usage, [['provider','provider'], ['model','model'], ['status','status'], ['count','count']]);
+  enhanceResponsiveTables();
+  updateReconcileScopePreview();
+  updateExcel();
+  if (!initialMenuApplied || (options && options.home)) {{ initialMenuApplied = true; showMenuSection('section-operator-home', {{scroll:false, persist:false}}); }}
+  if (options && options.scrollTop) scrollDashboardTop(options.smooth !== false);
+}}
+function selectedDashboardScope() {{
+  const scopeEl = document.getElementById('scope');
+  const customDateEl = document.getElementById('customDateFilter');
+  const summaryStartEl = document.getElementById('summaryStartDate');
+  const summaryEndEl = document.getElementById('summaryEndDate');
+  const customDate = customDateEl ? (customDateEl.value || '') : '';
+  const summaryStart = summaryStartEl ? (summaryStartEl.value || '') : '';
+  const summaryEnd = summaryEndEl ? (summaryEndEl.value || '') : '';
+  const rangeScope = (summaryStart || summaryEnd) ? `range:${{summaryStart}}..${{summaryEnd}}` : '';
+  return rangeScope || customDate || (scopeEl ? scopeEl.value : '') || 'today';
+}}
+function buildCrossCompanyAccountExcelUrl(queryText) {{
+  const parts = selectedChatParts();
+  const flow = document.getElementById('flowFilter').value || parts.flow_type || 'all';
+  const scope = (currentSnapshot && currentSnapshot.scope) || selectedDashboardScope();
+  return '/api/export' + query({{bot_key:'__all__', flow_type:flow, scope, cross_account_search:queryText || ''}});
+}}
+function buildExcelUrl() {{
+  const parts = selectedChatParts();
+  const exportBot = (document.getElementById('exportCompanyFilter') || {{}}).value || '';
+  const bot = exportBot || selectedBotKey() || parts.bot_key;
+  const scope = document.getElementById('scope').value || 'today';
+  const flow = document.getElementById('flowFilter').value || parts.flow_type || 'all';
+  const start_date = document.getElementById('exportStartDate').value || '';
+  const end_date = document.getElementById('exportEndDate').value || '';
+  let chat = (parts.bot_key === bot && (flow === 'all' || parts.flow_type === flow)) ? parts.chat_id : '';
+  if (currentSnapshot && String(currentSnapshot.selected_bot_key || '') === String(bot || '')) {{
+    chat = currentSnapshot.selected_chat_id || chat;
+  }}
+  return '/api/export' + query({{chat_id:chat, bot_key:bot, flow_type:flow, scope, start_date, end_date}});
+}}
+function updateExcel() {{
+  document.getElementById('excel').href = buildExcelUrl();
+}}
+function exportExcel() {{
+  updateExcel();
+  const status = document.getElementById('statusline');
+  if (status) status.textContent = 'กำลังส่งออก Excel ตามบริษัท/ช่วงวันที่ที่เลือก...';
+  return true;
+}}
+function clearSlipSearch() {{
+  document.getElementById('slipSearch').value = '';
+  load({{scrollTop:true}});
+}}
+async function closeOpenPeriod() {{
+  const parts = selectedChatParts();
+  const chat = parts.chat_id;
+  const bot = selectedBotKey() || parts.bot_key;
+  const note = document.getElementById('closeNote').value || 'dashboard close';
+  const status = document.getElementById('statusline');
+  if (!chat) {{ status.textContent = 'ยังไม่มีห้องให้ปิดรอบ'; return; }}
+  if (!await dashboardConfirm('ยืนยันปิดรอบ/เคลียร์ยอดเปิดของห้องนี้? ประวัติจะไม่ถูกลบ', 'ยืนยันปิดรอบ', true)) return;
+  status.textContent = 'กำลังปิดรอบ...';
+  const res = await fetch('/api/close'+query(), {{
+    method: 'POST',
+    headers: postHeaders(),
+    body: JSON.stringify({{chat_id: chat, bot_key: bot, company_name: (currentSnapshot && currentSnapshot.company_accounts && currentSnapshot.company_accounts[0] && currentSnapshot.company_accounts[0].company_name) || '', note}})
+  }});
+  const data = await res.json();
+  if (!res.ok || !data.ok) {{ status.textContent = 'ปิดรอบไม่สำเร็จ: ' + (data.error || res.status); return; }}
+  status.textContent = 'ปิดรอบแล้ว ' + data.closed_count + ' สลิป · ' + money(data.total_amount);
+  await load({{scrollTop:true}});
+}}
+document.getElementById('botFilter').addEventListener('change', () => load({{scrollTop:true}}));
+document.getElementById('exportCompanyFilter').addEventListener('change', () => {{
+  const bot = document.getElementById('exportCompanyFilter').value || '__all__';
+  const flow = document.getElementById('flowFilter').value || 'all';
+  document.getElementById('botFilter').value = bot;
+  document.getElementById('chat').value = bot + '||' + flow;
+  load({{scrollTop:true}});
+}});
+document.getElementById('flowFilter').addEventListener('change', () => load({{scrollTop:true}}));
+document.getElementById('chat').addEventListener('change', () => load({{scrollTop:true}}));
+document.getElementById('scope').addEventListener('change', () => {{
+  document.getElementById('customDateFilter').value = '';
+  document.getElementById('summaryStartDate').value = '';
+  document.getElementById('summaryEndDate').value = '';
+  load({{scrollTop:true}});
+}});
+const customDateEl = document.getElementById('customDateFilter');
+const summaryStartDateEl = document.getElementById('summaryStartDate');
+const summaryEndDateEl = document.getElementById('summaryEndDate');
+customDateEl.addEventListener('change', () => {{
+  if (customDateEl.value) {{
+    document.getElementById('scope').value = 'all';
+    summaryStartDateEl.value = '';
+    summaryEndDateEl.value = '';
+  }}
+  load({{scrollTop:true}});
+}});
+summaryStartDateEl.addEventListener('change', () => {{ if (summaryStartDateEl.value || summaryEndDateEl.value) {{ customDateEl.value = ''; document.getElementById('scope').value = 'all'; }} load({{scrollTop:true}}); }});
+summaryEndDateEl.addEventListener('change', () => {{ if (summaryStartDateEl.value || summaryEndDateEl.value) {{ customDateEl.value = ''; document.getElementById('scope').value = 'all'; }} load({{scrollTop:true}}); }});
+document.getElementById('slipFilter').addEventListener('change', () => load({{scrollTop:true}}));
+document.getElementById('reconcileCompanyFilter').addEventListener('change', updateReconcileScopePreview);
+document.getElementById('reconcileFlowFilter').addEventListener('change', updateReconcileScopePreview);
+document.getElementById('exportStartDate').addEventListener('change', updateExcel);
+document.getElementById('exportEndDate').addEventListener('change', updateExcel);
+document.getElementById('slipSearch').addEventListener('keydown', (event) => {{ if (event.key === 'Enter') load({{scrollTop:true}}); }});
+load({{home:true, scrollTop:true, smooth:false}}); setInterval(load, 10000);
+</script>
+</body>
+</html>"""
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    server_version = "AuditslipDashboard/1.0"
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        return
+
+    def token_from_request(self) -> str:
+        parsed = urlparse(self.path)
+        q = parse_qs(parsed.query)
+        if q.get("token"):
+            return q["token"][0]
+        cookie = self.headers.get("Cookie", "")
+        for part in cookie.split(";"):
+            if "=" in part:
+                k, v = part.strip().split("=", 1)
+                if k == COOKIE_NAME:
+                    return v
+        return ""
+
+    def authorized(self) -> bool:
+        return bool(DASHBOARD_TOKEN) and self.token_from_request() == DASHBOARD_TOKEN
+
+    def cookie_attrs(self) -> str:
+        attrs = ["HttpOnly", "SameSite=Lax", "Path=/"]
+        if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
+            attrs.append("Secure")
+        return "; ".join(attrs)
+
+    def csrf_authorized(self) -> bool:
+        return self.headers.get("X-Auditslip-Action", "") == "dashboard"
+
+    def security_headers(self) -> Dict[str, str]:
+        return {
+            "Content-Security-Policy": "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https: http:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'",
+            "X-Frame-Options": "DENY",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, no-store",
+        }
+
+    def send_bytes(self, status: int, body: bytes, content_type: str, extra_headers: Dict[str, str] | None = None) -> None:
+        self.send_response(status)
+        headers = self.security_headers()
+        headers.update(extra_headers or {})
+        headers["Content-Type"] = content_type
+        headers["Content-Length"] = str(len(body))
+        for k, v in headers.items():
+            self.send_header(k, v)
+        if self.token_from_request() == DASHBOARD_TOKEN:
+            self.send_header("Set-Cookie", f"{COOKIE_NAME}={DASHBOARD_TOKEN}; {self.cookie_attrs()}")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_json(self, obj: Any, status: int = 200) -> None:
+        self.send_bytes(status, json.dumps(obj, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/health":
+            self.send_json({"ok": True, "app": APP_NAME})
+            return
+        if not self.authorized():
+            self.send_bytes(HTTPStatus.UNAUTHORIZED, b"Unauthorized", "text/plain; charset=utf-8")
+            return
+        if parsed.path in {"/", "/index.html"}:
+            self.send_bytes(200, render_dashboard_html().encode("utf-8"), "text/html; charset=utf-8")
+            return
+        if parsed.path == "/api/summary":
+            q = parse_qs(parsed.query)
+            chat_id = (q.get("chat_id") or [""])[0]
+            bot_key = (q.get("bot_key") or [""])[0]
+            scope = (q.get("scope") or ["today"])[0]
+            flow_type = (q.get("flow_type") or ["all"])[0]
+            slip_filter = (q.get("slip_filter") or ["all"])[0]
+            slip_search = (q.get("slip_search") or [""])[0]
+            self.send_json(dashboard_snapshot(DB_PATH, chat_id=chat_id, bot_key=bot_key, flow_type=flow_type, scope=scope, slip_filter=slip_filter, slip_search=slip_search))
+            return
+        if parsed.path == "/api/slip-image":
+            q = parse_qs(parsed.query)
+            slip_id = (q.get("id") or [""])[0]
+            try:
+                body, mime = fetch_slip_image(DB_PATH, slip_id)
+                self.send_bytes(200, body, mime, {"Cache-Control": "private, max-age=86400"})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 404)
+            return
+        if parsed.path == "/api/export":
+            q = parse_qs(parsed.query)
+            chat_id = (q.get("chat_id") or [""])[0]
+            bot_key = (q.get("bot_key") or ["default"])[0] or "default"
+            scope = (q.get("scope") or ["open"])[0]
+            flow_type = (q.get("flow_type") or ["all"])[0]
+            start_date = (q.get("start_date") or [""])[0]
+            end_date = (q.get("end_date") or [""])[0]
+            cross_account_search = (q.get("cross_account_search") or [""])[0]
+            try:
+                if clean_display(cross_account_search):
+                    path = export_cross_company_account_slips_excel(DB_PATH, flow_type=flow_type, scope=scope, search=cross_account_search)
+                    body = path.read_bytes()
+                    self.send_bytes(
+                        200,
+                        body,
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        {"Content-Disposition": f'attachment; filename="{path.name}"'},
+                    )
+                    return
+                requested_all = clean_display(bot_key) in {"__all__", "all"}
+                if requested_all and not chat_id:
+                    path = export_dashboard_zip_by_company(DB_PATH, bot_key=bot_key, flow_type=flow_type, scope=scope, start_date=start_date, end_date=end_date)
+                    body = path.read_bytes()
+                    self.send_bytes(
+                        200,
+                        body,
+                        "application/zip",
+                        {"Content-Disposition": f'attachment; filename="{path.name}"'},
+                    )
+                    return
+                if chat_id:
+                    selection = resolve_export_selection(DB_PATH, chat_id=chat_id, bot_key=bot_key, flow_type=flow_type)
+                    if not selection.get("ok"):
+                        self.send_json(selection, 404)
+                        return
+                    chat_id = str(selection["chat_id"])
+                    bot_key = str(selection["bot_key"])
+                    company_name = str(selection.get("company_name") or APP_NAME)
+                else:
+                    company_name = ""
+                path = export_dashboard_excel(DB_PATH, bot_key=bot_key, chat_id=chat_id, flow_type=flow_type, scope=scope, start_date=start_date, end_date=end_date, company_name=company_name)
+                body = path.read_bytes()
+                self.send_bytes(
+                    200,
+                    body,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    {"Content-Disposition": f'attachment; filename="{path.name}"'},
+                )
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 400)
+            return
+        self.send_json({"ok": False, "error": "not found"}, 404)
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        if not self.authorized():
+            self.send_bytes(HTTPStatus.UNAUTHORIZED, b"Unauthorized", "text/plain; charset=utf-8")
+            return
+        if not self.csrf_authorized():
+            self.send_json({"ok": False, "error": "missing action header"}, HTTPStatus.FORBIDDEN)
+            return
+        content_type = self.headers.get("Content-Type", "")
+        payload: Dict[str, Any] = {}
+        uploaded_excel_path = ""
+        if "multipart/form-data" in content_type:
+            form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type})
+            for key in ["chat_id", "bot_key", "company_name", "flow_type", "scope", "excel_path", "note", "bank", "account_no", "account_name", "daily_limit"]:
+                if key in form and not getattr(form[key], "filename", None):
+                    payload[key] = form.getfirst(key, "")
+            if "excel" in form and getattr(form["excel"], "filename", None):
+                base = Path(os.environ.get("AUDITSLIP_BACKEND_IMPORT_DIR", "/root/projects/auditslip/imports/backend"))
+                base.mkdir(parents=True, exist_ok=True)
+                filename = re.sub(r"[^A-Za-z0-9_.-]+", "-", Path(form["excel"].filename).name) or "backend.xlsx"
+                uploaded_excel_path = str(base / f"upload-{int(time.time())}-{filename}")
+                with open(uploaded_excel_path, "wb") as out:
+                    out.write(form["excel"].file.read())
+        else:
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            raw = self.rfile.read(length).decode("utf-8") if length else ""
+            if raw:
+                if "application/json" in content_type:
+                    try:
+                        payload = json.loads(raw)
+                    except Exception:
+                        payload = {}
+                else:
+                    payload = {k: v[0] for k, v in parse_qs(raw).items()}
+        if parsed.path == "/api/close":
+            chat_id = str(payload.get("chat_id") or "")
+            bot_key = str(payload.get("bot_key") or "default")
+            company_name = str(payload.get("company_name") or "")
+            note = str(payload.get("note") or "dashboard close")
+            result = dashboard_close_period(DB_PATH, chat_id, note, bot_key=bot_key, company_name=company_name)
+            self.send_json(result, 200 if result.get("ok") else 400)
+            return
+        if parsed.path == "/api/account-limit":
+            try:
+                result = save_account_limit(
+                    DB_PATH,
+                    str(payload.get("chat_id") or ""),
+                    str(payload.get("limit_key") or ""),
+                    str(payload.get("display_name") or ""),
+                    str(payload.get("bank") or ""),
+                    str(payload.get("account") or ""),
+                    parse_number(payload.get("limit_amount")),
+                )
+                self.send_json(result)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 400)
+            return
+        if parsed.path == "/api/company-account":
+            try:
+                result = save_company_account(
+                    DB_PATH,
+                    bot_key=str(payload.get("bot_key") or "default"),
+                    chat_id=str(payload.get("chat_id") or ""),
+                    company_name=str(payload.get("company_name") or ""),
+                    bank=str(payload.get("bank") or ""),
+                    account_no=str(payload.get("account_no") or ""),
+                    account_name=str(payload.get("account_name") or ""),
+                    daily_limit=parse_number(payload.get("daily_limit")),
+                )
+                self.send_json(result)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 400)
+            return
+        if parsed.path == "/api/duplicate/unmark":
+            result = unmark_duplicate_slip(DB_PATH, str(payload.get("id") or payload.get("slip_id") or ""), str(payload.get("bot_key") or ""))
+            self.send_json(result, 200 if result.get("ok") else 400)
+            return
+        if parsed.path == "/api/slip/delete":
+            result = delete_dashboard_slip(
+                DB_PATH,
+                str(payload.get("id") or payload.get("slip_id") or ""),
+                str(payload.get("bot_key") or ""),
+                str(payload.get("reason") or "dashboard operator delete"),
+            )
+            self.send_json(result, 200 if result.get("ok") else 400)
+            return
+        if parsed.path == "/api/slip/reprocess":
+            try:
+                result = reprocess_dashboard_slip(
+                    DB_PATH,
+                    str(payload.get("id") or payload.get("slip_id") or ""),
+                    str(payload.get("bot_key") or ""),
+                )
+                self.send_json(result, 200 if result.get("ok") else 400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 400)
+            return
+        if parsed.path == "/api/bank-review/openai":
+            try:
+                result = openai_bank_double_check_slip(
+                    DB_PATH,
+                    str(payload.get("id") or payload.get("slip_id") or ""),
+                    apply=str(payload.get("apply", "true")).strip().lower() not in {"0", "false", "no"},
+                )
+                self.send_json(result, 200 if result.get("ok") else 400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 400)
+            return
+        if parsed.path == "/api/bank-review/openai-all":
+            try:
+                q = parse_qs(parsed.query)
+                result = openai_bank_recheck_scope(
+                    DB_PATH,
+                    chat_id=str(payload.get("chat_id") or (q.get("chat_id") or [""])[0] or ""),
+                    bot_key=str(payload.get("bot_key") or (q.get("bot_key") or [""])[0] or ""),
+                    scope=str(payload.get("scope") or (q.get("scope") or ["open"])[0] or "open"),
+                    flow_type=str(payload.get("flow_type") or (q.get("flow_type") or ["all"])[0] or "all"),
+                    search=str(payload.get("slip_search") or (q.get("slip_search") or [""])[0] or ""),
+                    apply=str(payload.get("apply", "true")).strip().lower() not in {"0", "false", "no"},
+                )
+                self.send_json(result, 200 if result.get("ok") else 207)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 400)
+            return
+        if parsed.path == "/api/reconcile":
+            try:
+                chat_id = str(payload.get("chat_id") or "")
+                bot_key = str(payload.get("bot_key") or "")
+                flow_type = str(payload.get("flow_type") or "all")
+                scope = str(payload.get("scope") or "all")
+                excel_path = safe_backend_excel_path(uploaded_excel_path or str(payload.get("excel_path") or ""))
+                if not excel_path.exists():
+                    self.send_json({"ok": False, "error": f"excel not found: {excel_path}"}, 404)
+                    return
+                result = reconcile_backend_excel(DB_PATH, excel_path, chat_id=chat_id, scope=scope, bot_key=bot_key, flow_type=flow_type)
+                self.send_json(result)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 400)
+            return
+        self.send_json({"ok": False, "error": "not found"}, 404)
+
+
+def main() -> None:
+    if not DASHBOARD_TOKEN:
+        raise SystemExit("AUDITSLIP_DASHBOARD_TOKEN is required")
+    httpd = ThreadingHTTPServer((HOST, PORT), DashboardHandler)
+    print(f"Auditslip dashboard listening on http://{HOST}:{PORT}", flush=True)
+    httpd.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

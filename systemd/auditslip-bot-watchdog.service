@@ -1,0 +1,10 @@
+[Unit]
+Description=Auditslip service/dashboard/OCR watchdog
+After=network-online.target auditslip-bot.service auditslip-dashboard.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/projects/auditslip
+EnvironmentFile=-/etc/auditslip/auditslip.env
+ExecStart=/root/projects/auditslip/auditslip-watchdog.sh
