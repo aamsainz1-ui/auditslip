@@ -2518,6 +2518,65 @@ def create_pending_action(
         return int(cur.lastrowid)
 
 
+def request_pending_action_once(
+    db_path: Path,
+    *,
+    action: str,
+    payload: Any,
+    requested_by: str,
+    request_id: str = "",
+    ttl_hours: int = PENDING_ACTION_TTL_HOURS,
+) -> Dict[str, Any]:
+    """Create one pending action, reusing an identical pending request if it exists.
+
+    Dashboard delete buttons are easy to tap repeatedly on mobile.  Because risky
+    mutations require two-person approval, the first tap must create a pending row;
+    subsequent taps for the same action/payload should explain the existing pending
+    request instead of creating duplicate approvals that still do not remove the card.
+    """
+    ensure_pending_actions_table(db_path)
+    expire_old_pending_actions(db_path)
+    payload_json = json.dumps(_sanitize_mutation_payload(payload), ensure_ascii=False, default=str)
+    with connect(db_path) as conn:
+        existing = conn.execute(
+            """
+            SELECT id, request_id, expires_at
+            FROM pending_actions
+            WHERE action=? AND payload_json=? AND status='pending'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (action, payload_json),
+        ).fetchone()
+    if existing:
+        return {
+            "ok": True,
+            "status": "pending",
+            "pending_id": int(existing["id"]),
+            "request_id": str(existing["request_id"] or ""),
+            "expires_at": existing["expires_at"],
+            "expires_in_hours": ttl_hours,
+            "already_pending": True,
+        }
+    new_request_id = request_id or uuid.uuid4().hex[:12]
+    pending_id = create_pending_action(
+        db_path,
+        action=action,
+        payload=payload,
+        requested_by=requested_by,
+        request_id=new_request_id,
+        ttl_hours=ttl_hours,
+    )
+    return {
+        "ok": True,
+        "status": "pending",
+        "pending_id": pending_id,
+        "request_id": new_request_id,
+        "expires_in_hours": ttl_hours,
+        "already_pending": False,
+    }
+
+
 def load_pending_action(db_path: Path, pending_id: int) -> Dict[str, Any]:
     """Return pending row as dict or {} if missing."""
     ensure_pending_actions_table(db_path)
@@ -4823,7 +4882,7 @@ function recentCards(rows) {{
     const image = r.image_url ? '<a href="'+esc(r.image_url)+'" target="_blank" rel="noopener"><img class="slip-thumb" loading="lazy" src="'+esc(r.image_url)+'" alt="slip image" /></a>' : '<div class="slip-thumb muted" style="display:flex;align-items:center;justify-content:center">ไม่มีรูป</div>';
     const dup = Number(r.is_duplicate||0) ? '<div class="mini bad">สลิปซ้ำที่จับแล้ว · ไม่นับในยอดรวม</div>' : '';
     const company = r.company_name ? '<div class="mini">บริษัท: '+esc(r.company_name)+' · Bot: '+esc(r.bot_key || '')+'</div>' : '';
-    return '<div class="slip-card">'+image+'<div class="slip-body"><div class="top"><b>'+esc(r.transferor_name || r.sender_name || '(ไม่ทราบชื่อ)')+'</b><span class="pill">'+esc(r.status)+(Number(r.is_duplicate||0)?' · ซ้ำ':'')+'</span></div><div class="mini">'+esc(r.slip_date_text || '')+' · '+esc([r.from_bank, r.to_bank].filter(Boolean).join(' → ') || r.issuer_bank || '')+'</div>'+company+'<div>ยอด <b>'+money(r.amount)+'</b></div>'+dup+'<div class="toolbar" style="margin-top:8px" data-admin-only="true"><button class="danger" data-delete-slip-id="'+esc(String(r.id || ''))+'" onclick="deleteSlip(this.dataset.deleteSlipId)">ลบรายการนี้</button></div></div></div>';
+    return '<div class="slip-card">'+image+'<div class="slip-body"><div class="top"><b>'+esc(r.transferor_name || r.sender_name || '(ไม่ทราบชื่อ)')+'</b><span class="pill">'+esc(r.status)+(Number(r.is_duplicate||0)?' · ซ้ำ':'')+'</span></div><div class="mini">'+esc(r.slip_date_text || '')+' · '+esc([r.from_bank, r.to_bank].filter(Boolean).join(' → ') || r.issuer_bank || '')+'</div>'+company+'<div>ยอด <b>'+money(r.amount)+'</b></div>'+dup+'<div class="toolbar" style="margin-top:8px" data-admin-only="true"><button class="danger" data-delete-slip-id="'+esc(String(r.id || ''))+'" onclick="deleteSlip(this.dataset.deleteSlipId)">ขอลบรายการนี้</button></div></div></div>';
   }}).join('')+'</div>';
 }}
 function thumb(url, label) {{
@@ -4847,7 +4906,7 @@ function renderQueueIssues(jobs, issues) {{
     const detail = 'msg '+esc(r.message_id || '-')+' · '+esc(r.slip_date_text || r.created_at_iso || '')+' · '+esc(r.company_name || r.bot_key || '');
     const amount = Number(r.amount || 0) ? money(r.amount) : '-';
     const conf = r.confidence !== undefined && r.confidence !== null ? Number(r.confidence || 0).toFixed(2) : '-';
-    return '<div class="slip-card">'+image+'<div class="slip-body"><div class="top"><b>'+esc(who)+'</b><span class="pill">'+esc(r.status || 'issue')+'</span></div><div class="mini">'+detail+'</div><div class="bad">'+esc(r.error || '-')+'</div><div class="mini">ยอด: '+amount+' · confidence: '+esc(conf)+'</div>'+(r.raw_text ? '<div class="mini">OCR: '+esc(r.raw_text)+'</div>' : '')+'<div class="toolbar" style="margin-top:8px" data-admin-only="true"><button data-slip-id="'+esc(String(r.id || ''))+'" onclick="reprocessIssue(this.dataset.slipId, this)">รี OCR</button><button class="danger" data-delete-slip-id="'+esc(String(r.id || ''))+'" onclick="deleteSlip(this.dataset.deleteSlipId)">ลบรายการนี้</button></div></div></div>';
+    return '<div class="slip-card">'+image+'<div class="slip-body"><div class="top"><b>'+esc(who)+'</b><span class="pill">'+esc(r.status || 'issue')+'</span></div><div class="mini">'+detail+'</div><div class="bad">'+esc(r.error || '-')+'</div><div class="mini">ยอด: '+amount+' · confidence: '+esc(conf)+'</div>'+(r.raw_text ? '<div class="mini">OCR: '+esc(r.raw_text)+'</div>' : '')+'<div class="toolbar" style="margin-top:8px" data-admin-only="true"><button data-slip-id="'+esc(String(r.id || ''))+'" onclick="reprocessIssue(this.dataset.slipId, this)">รี OCR</button><button class="danger" data-delete-slip-id="'+esc(String(r.id || ''))+'" onclick="deleteSlip(this.dataset.deleteSlipId)">ขอลบรายการนี้</button></div></div></div>';
   }}).join('')+'</div>';
   return html;
 }}
@@ -4915,7 +4974,7 @@ function sourceBankReviewCards(rows) {{
   return '<div class="slip-cards">'+rows.map(r => {{
     const image = thumb(r.image_url, 'source bank review slip');
     const hint = 'issuer: '+esc(r.issuer_bank || '-')+' · ปลายทาง: '+esc(r.to_bank || '-')+' · ต้นทาง: '+esc(r.from_bank || '(ยังไม่เจอ)');
-    return '<div class="slip-card">'+image+'<div class="slip-body"><div class="top"><b>'+esc(r.transferor_name || r.sender_name || '(ไม่ทราบชื่อ)')+'</b><span class="pill">รีเช็คต้นทาง</span></div><div class="mini">ยอดนี้นับเข้าแดชบอร์ดแล้ว ถ้าเป็น success ไม่ซ้ำ · รีเช็คเพื่อเติมธนาคารต้นทางให้แผงธนาคารและวงเงินครบ</div><div class="mini">'+esc(r.slip_date_text || '')+' · msg '+esc(r.message_id || '-')+'</div><div>'+hint+'</div><div>ยอด <b>'+money(r.amount)+'</b></div><div class="toolbar" style="margin-top:8px" data-admin-only="true"><button data-slip-id="'+esc(String(r.id || ''))+'" onclick="openaiBankRecheck(this.dataset.slipId, this)">OpenAI รีเช็คธนาคาร</button><button class="danger" data-delete-slip-id="'+esc(String(r.id || ''))+'" onclick="deleteSlip(this.dataset.deleteSlipId)">ลบรายการนี้</button></div></div></div>';
+    return '<div class="slip-card">'+image+'<div class="slip-body"><div class="top"><b>'+esc(r.transferor_name || r.sender_name || '(ไม่ทราบชื่อ)')+'</b><span class="pill">รีเช็คต้นทาง</span></div><div class="mini">ยอดนี้นับเข้าแดชบอร์ดแล้ว ถ้าเป็น success ไม่ซ้ำ · รีเช็คเพื่อเติมธนาคารต้นทางให้แผงธนาคารและวงเงินครบ</div><div class="mini">'+esc(r.slip_date_text || '')+' · msg '+esc(r.message_id || '-')+'</div><div>'+hint+'</div><div>ยอด <b>'+money(r.amount)+'</b></div><div class="toolbar" style="margin-top:8px" data-admin-only="true"><button data-slip-id="'+esc(String(r.id || ''))+'" onclick="openaiBankRecheck(this.dataset.slipId, this)">OpenAI รีเช็คธนาคาร</button><button class="danger" data-delete-slip-id="'+esc(String(r.id || ''))+'" onclick="deleteSlip(this.dataset.deleteSlipId)">ขอลบรายการนี้</button></div></div></div>';
   }}).join('')+'</div>';
 }}
 
@@ -4998,12 +5057,19 @@ async function unmarkDuplicate(slipId) {{
 }}
 async function deleteSlip(slipId) {{
   if (!slipId) return;
-  if (!await dashboardConfirm('ยืนยันลบรายการนี้? ถ้าเป็นสลิปที่นับยอดอยู่ ระบบจะหักยอดออกจากแดชบอร์ดทันที', 'ยืนยันลบรายการ', true)) return;
+  if (!await dashboardConfirm('ยืนยันส่งคำขอลบรายการนี้? รายการจะยังไม่หายจนกว่าจะมีผู้อนุมัติอีกคน และระบบจะหักยอดเมื่อ execute แล้ว', 'ส่งคำขอลบรายการ', true)) return;
   const status = document.getElementById('statusline');
-  if (status) status.textContent = 'กำลังลบรายการ...';
-  const res = await fetch('/api/slip/delete'+query(), {{method:'POST', headers:postHeaders(), body: JSON.stringify({{id: slipId, bot_key: selectedBotKey(), reason: 'dashboard operator delete'}})}});
+  if (status) status.textContent = 'กำลังส่งคำขอลบรายการ...';
+  const res = await fetch('/api/slip/delete'+query({{approval:'request'}}), {{method:'POST', headers:postHeaders(), body: JSON.stringify({{id: slipId, bot_key: selectedBotKey(), reason: 'dashboard operator delete'}})}});
   const data = await res.json();
-  if (!res.ok || !data.ok) {{ if (status) status.textContent = 'ลบไม่สำเร็จ: ' + (data.error || res.status); return await dashboardNotify(data.error || 'ลบไม่สำเร็จ'); }}
+  if (!res.ok || !data.ok) {{ if (status) status.textContent = 'ส่งคำขอลบไม่สำเร็จ: ' + (data.error || res.status); return await dashboardNotify(data.error || 'ส่งคำขอลบไม่สำเร็จ'); }}
+  if (data.status === 'pending') {{
+    const pendingMessage = (data.already_pending ? 'มีคำขอลบค้างอยู่แล้ว' : 'ส่งคำขอลบแล้ว') + ' · รออนุมัติ #' + (data.pending_id || '-');
+    if (status) status.textContent = pendingMessage;
+    await dashboardNotify(pendingMessage + ' รายการจะยังอยู่ในหน้านี้จนกว่าจะอนุมัติและ execute');
+    await load();
+    return;
+  }}
   if (status) status.textContent = 'ลบรายการแล้ว · หักยอดออก ' + money(data.removed_amount || 0);
   await load();
 }}
@@ -6129,7 +6195,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             approval_mode = self.parse_approval_param()
             if approval_mode == "request":
                 request_id = uuid.uuid4().hex[:12]
-                pending_id = create_pending_action(
+                pending_result = request_pending_action_once(
                     DB_PATH,
                     action="slip.delete",
                     payload=payload,
@@ -6137,8 +6203,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     request_id=request_id,
                 )
                 slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
-                record_endpoint_mutation(DB_PATH, "delete.request", actor=actor_fp, request_id=request_id, bot_key=str(payload.get("bot_key") or ""), slip_id=slip_id_in, payload=payload, result_status="pending", result_summary=f"pending_id={pending_id}")
-                self.send_json({"ok": True, "status": "pending", "pending_id": pending_id, "request_id": request_id, "expires_in_hours": PENDING_ACTION_TTL_HOURS})
+                record_endpoint_mutation(
+                    DB_PATH,
+                    "delete.request",
+                    actor=actor_fp,
+                    request_id=str(pending_result.get("request_id") or request_id),
+                    bot_key=str(payload.get("bot_key") or ""),
+                    slip_id=slip_id_in,
+                    payload=payload,
+                    result_status="pending",
+                    result_summary=f"pending_id={pending_result.get('pending_id')} already_pending={pending_result.get('already_pending')}",
+                )
+                self.send_json(pending_result)
                 return
             # approval_mode == "execute"
             try:

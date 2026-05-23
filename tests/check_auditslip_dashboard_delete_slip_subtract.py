@@ -79,7 +79,7 @@ assert after_wd["totals"]["selected_success_amount"] == 1000.0, after_wd["totals
 assert [r["id"] for r in after_wd["recent"]] == ["WD_KEEP"], after_wd["recent"]
 
 html = Dash.render_dashboard_html("test-token")
-for marker in ["deleteSlip", "/api/slip/delete", "data-delete-slip-id", "ลบรายการนี้", "หักยอดออก"]:
+for marker in ["deleteSlip", "/api/slip/delete", "data-delete-slip-id", "ขอลบรายการนี้", "หักยอดออก"]:
     assert marker in html, marker
 
 print("ok: dashboard delete subtracts slip amount and hides deleted rows")
