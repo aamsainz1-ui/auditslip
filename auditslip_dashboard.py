@@ -2001,8 +2001,31 @@ def ensure_dashboard_mutation_log_table(db_path: Path) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dashboard_mutation_log_ts ON dashboard_mutation_log(ts_iso)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dashboard_mutation_log_action ON dashboard_mutation_log(action)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dashboard_mutation_log_slip ON dashboard_mutation_log(slip_id)")
+        # Phase B1: hash-chain columns (idempotent on re-run; columns may already exist).
+        try:
+            conn.execute("ALTER TABLE dashboard_mutation_log ADD COLUMN prev_hash TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE dashboard_mutation_log ADD COLUMN entry_hash TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mutation_entry_hash ON dashboard_mutation_log(entry_hash)")
         conn.commit()
     _MUTATION_LOG_READY = True
+
+
+# Phase B1: canonical hash for mutation rows.
+# IMPORTANT: keep this byte-identical to tools/verify_audit_chain.py::compute_mutation_hash.
+# 'id' is AUTOINCREMENT (unknown when the writer computes the hash), and 'entry_hash' is the
+# field being computed; both must be excluded so the writer's hash matches the verifier's.
+_MUTATION_HASH_EXCLUDE_KEYS = ("id", "entry_hash")
+
+
+def compute_mutation_hash(prev_hash: str, row: Dict[str, Any]) -> str:
+    canonical_obj = {k: row[k] for k in sorted(row.keys()) if k not in _MUTATION_HASH_EXCLUDE_KEYS}
+    canonical = json.dumps(canonical_obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(((prev_hash or "") + "|" + canonical).encode("utf-8")).hexdigest()
 
 
 _MUTATION_PAYLOAD_REDACT_KEYS = {"token", "cookie", "authorization", "auth", "password", "secret"}
@@ -2036,27 +2059,67 @@ def record_mutation(
     result_status: str = "ok",
     result_summary: str = "",
 ) -> None:
-    """Append row to dashboard_mutation_log. Failure must not break the original mutation."""
+    """Append row to dashboard_mutation_log. Failure must not break the original mutation.
+
+    Phase B1: each row is hash-chained to its predecessor. Fetch-prev-then-insert runs in a
+    single BEGIN IMMEDIATE transaction so concurrent writers cannot race on prev_hash. If hash
+    computation or insert fails we still swallow the exception (matches existing posture: do not
+    break the caller's mutation), which means a missing row is invisible to the verifier --
+    deliberate tradeoff -- see commit message.
+    """
     try:
         ensure_dashboard_mutation_log_table(db_path)
-        with connect(db_path) as conn:
+        row_data = {
+            "ts_iso": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "action": action,
+            "actor": actor or "",
+            "chat_id": chat_id or "",
+            "bot_key": bot_key or "",
+            "slip_id": slip_id or "",
+            "payload_json": json.dumps(_sanitize_mutation_payload(payload), ensure_ascii=False, default=str),
+            "result_status": result_status,
+            "result_summary": (result_summary or "")[:500],
+        }
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        # Manual transaction control so BEGIN IMMEDIATE actually takes the reserved lock.
+        conn.isolation_level = None
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            prev_row = conn.execute(
+                "SELECT entry_hash FROM dashboard_mutation_log ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            prev_hash = (prev_row["entry_hash"] if prev_row else "") or ""
+            row_for_hash = dict(row_data)
+            row_for_hash["prev_hash"] = prev_hash
+            entry_hash = compute_mutation_hash(prev_hash, row_for_hash)
             conn.execute(
                 "INSERT INTO dashboard_mutation_log "
-                "(ts_iso, action, actor, chat_id, bot_key, slip_id, payload_json, result_status, result_summary) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                "(ts_iso, action, actor, chat_id, bot_key, slip_id, payload_json, result_status, result_summary, prev_hash, entry_hash) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    dt.datetime.now(dt.timezone.utc).isoformat(),
-                    action,
-                    actor or "",
-                    chat_id or "",
-                    bot_key or "",
-                    slip_id or "",
-                    json.dumps(_sanitize_mutation_payload(payload), ensure_ascii=False, default=str),
-                    result_status,
-                    (result_summary or "")[:500],
+                    row_data["ts_iso"],
+                    row_data["action"],
+                    row_data["actor"],
+                    row_data["chat_id"],
+                    row_data["bot_key"],
+                    row_data["slip_id"],
+                    row_data["payload_json"],
+                    row_data["result_status"],
+                    row_data["result_summary"],
+                    prev_hash,
+                    entry_hash,
                 ),
             )
-            conn.commit()
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
     except Exception:
         logger.exception("record_mutation failed action=%s", action)
 
@@ -2065,6 +2128,103 @@ def record_endpoint_mutation(db_path: Path, action: str, *, actor: str = "", req
     """Thin wrapper around record_mutation that prefixes the per-request request_id into the result_summary."""
     prefix = f"req={request_id} " if request_id else ""
     record_mutation(db_path, action, actor=actor, chat_id=chat_id, bot_key=bot_key, slip_id=slip_id, payload=payload, result_status=result_status, result_summary=(prefix + (result_summary or "")))
+
+
+# Phase B1: parse a 'request_id' (12-hex) prefix stamped by record_endpoint_mutation back out
+# of result_summary, so the tail endpoint can surface it without leaking the full summary text.
+_REQUEST_ID_PREFIX_RE = re.compile(r"^req=([0-9a-fA-F]{8,32})\s")
+
+
+def _extract_request_id(result_summary: str) -> str:
+    if not result_summary:
+        return ""
+    m = _REQUEST_ID_PREFIX_RE.match(result_summary)
+    return m.group(1) if m else ""
+
+
+def verify_mutation_chain(db_path: Path) -> Dict[str, Any]:
+    """Walk dashboard_mutation_log in id order; recompute each entry_hash from stored prev_hash
+    and the row's content. Returns the first divergence (by id) or ok=True if all match.
+
+    Cross-validates the chain links too: row N's prev_hash must equal row N-1's entry_hash.
+    """
+    ensure_dashboard_mutation_log_table(db_path)
+    total = 0
+    first_bad_id: Any = None
+    first_bad_reason: Any = None
+    with connect(db_path) as conn:
+        cursor = conn.execute(
+            "SELECT id, ts_iso, action, actor, chat_id, bot_key, slip_id, payload_json, "
+            "       result_status, result_summary, prev_hash, entry_hash "
+            "FROM dashboard_mutation_log ORDER BY id ASC"
+        )
+        last_entry_hash = ""
+        for row in cursor:
+            total += 1
+            row_dict = dict(row)
+            stored_entry_hash = row_dict.get("entry_hash") or ""
+            stored_prev_hash = row_dict.get("prev_hash") or ""
+            if first_bad_id is None and stored_prev_hash != last_entry_hash:
+                first_bad_id = row_dict["id"]
+                first_bad_reason = (
+                    f"prev_hash mismatch: row {row_dict['id']} stores prev_hash="
+                    f"{stored_prev_hash[:12]}... but prior entry_hash was {last_entry_hash[:12]}..."
+                )
+            recomputed = compute_mutation_hash(stored_prev_hash, row_dict)
+            if first_bad_id is None and recomputed != stored_entry_hash:
+                first_bad_id = row_dict["id"]
+                first_bad_reason = (
+                    f"entry_hash mismatch: row {row_dict['id']} stores {stored_entry_hash[:12]}..."
+                    f" but recomputed {recomputed[:12]}..."
+                )
+            last_entry_hash = stored_entry_hash
+    return {
+        "ok": first_bad_id is None,
+        "total_rows": total,
+        "first_bad_id": first_bad_id,
+        "first_bad_reason": first_bad_reason,
+        "verified_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+
+
+def mutation_chain_tail(db_path: Path, limit: int = 50) -> List[Dict[str, Any]]:
+    """Return the last N entries of dashboard_mutation_log (newest first), WITHOUT the raw payload.
+
+    result_summary is truncated to 200 chars. payload_json is intentionally omitted because it
+    can carry account numbers in some endpoints; for full payload access use the standalone
+    verifier with direct DB read (auditor scenario).
+    """
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 50
+    if limit < 1:
+        limit = 1
+    if limit > 500:
+        limit = 500
+    ensure_dashboard_mutation_log_table(db_path)
+    out: List[Dict[str, Any]] = []
+    with connect(db_path) as conn:
+        cursor = conn.execute(
+            "SELECT id, ts_iso, actor, action, result_status, result_summary, prev_hash, entry_hash "
+            "FROM dashboard_mutation_log ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        for row in cursor:
+            d = dict(row)
+            summary = (d.get("result_summary") or "")[:200]
+            out.append({
+                "id": d["id"],
+                "ts": d.get("ts_iso") or "",
+                "actor_fingerprint": d.get("actor") or "",
+                "action": d.get("action") or "",
+                "request_id": _extract_request_id(d.get("result_summary") or ""),
+                "result_status": d.get("result_status") or "",
+                "result_summary": summary,
+                "prev_hash": (d.get("prev_hash") or "")[:12],
+                "entry_hash": (d.get("entry_hash") or "")[:12],
+            })
+    return out
 
 
 def openai_bank_double_check_slip(db_path: Path, slip_id: str, apply: bool = True) -> Dict[str, Any]:
@@ -4833,6 +4993,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 logger.exception("api_export failed")
                 self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+            return
+        if parsed.path == "/api/audit-chain/verify":
+            try:
+                self.send_json(verify_mutation_chain(DB_PATH))
+            except Exception as exc:
+                logger.exception("api_audit_chain_verify failed")
+                self.send_json({"ok": False, "error": safe_error(exc)}, 500)
+            return
+        if parsed.path == "/api/audit-chain/tail":
+            q = parse_qs(parsed.query)
+            limit_str = (q.get("limit") or ["50"])[0]
+            try:
+                self.send_json({"ok": True, "entries": mutation_chain_tail(DB_PATH, limit=int(limit_str or 50))})
+            except Exception as exc:
+                logger.exception("api_audit_chain_tail failed")
+                self.send_json({"ok": False, "error": safe_error(exc)}, 500)
             return
         self.send_json({"ok": False, "error": "not found"}, 404)
 
