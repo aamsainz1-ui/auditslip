@@ -1974,6 +1974,180 @@ def ensure_bank_review_log_table(conn: sqlite3.Connection) -> None:
     )
 
 
+_DASHBOARD_TOKENS_READY = False
+_DASHBOARD_TOKENS_BOOTSTRAPPED = False
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256((token or "").encode("utf-8", "replace")).hexdigest()
+
+
+def ensure_dashboard_tokens_table(db_path: Path) -> None:
+    """Create dashboard_tokens table (idempotent). Stores only sha256 hashes, never raw tokens."""
+    global _DASHBOARD_TOKENS_READY
+    if _DASHBOARD_TOKENS_READY:
+        return
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dashboard_tokens (
+              token_hash TEXT PRIMARY KEY,
+              role TEXT NOT NULL DEFAULT 'viewer',
+              label TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              last_used_at TEXT DEFAULT NULL,
+              revoked_at TEXT DEFAULT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dashboard_tokens_role ON dashboard_tokens(role)")
+        conn.commit()
+    _DASHBOARD_TOKENS_READY = True
+
+
+def bootstrap_dashboard_admin_token(db_path: Path, legacy_token: str) -> None:
+    """If the dashboard_tokens table is empty AND a legacy token is set, register it as admin."""
+    global _DASHBOARD_TOKENS_BOOTSTRAPPED
+    if _DASHBOARD_TOKENS_BOOTSTRAPPED:
+        return
+    if not legacy_token:
+        _DASHBOARD_TOKENS_BOOTSTRAPPED = True
+        return
+    ensure_dashboard_tokens_table(db_path)
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT COUNT(*) AS c FROM dashboard_tokens").fetchone()
+        count = int(row["c"]) if row else 0
+        if count == 0:
+            conn.execute(
+                "INSERT INTO dashboard_tokens(token_hash, role, label) VALUES (?,?,?)",
+                (_hash_token(legacy_token), "admin", "legacy-bootstrap"),
+            )
+            conn.commit()
+            print("Dashboard token registered as admin (legacy). Use /api/tokens to manage.", flush=True)
+    _DASHBOARD_TOKENS_BOOTSTRAPPED = True
+
+
+def lookup_dashboard_token_role(db_path: Path, token: str) -> str:
+    """Return the role for a token (sha256 lookup). Empty string if missing/revoked.
+
+    Updates last_used_at on a successful (non-revoked) lookup.
+    """
+    if not token:
+        return ""
+    ensure_dashboard_tokens_table(db_path)
+    th = _hash_token(token)
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT role, revoked_at FROM dashboard_tokens WHERE token_hash=?",
+            (th,),
+        ).fetchone()
+        if not row:
+            return ""
+        if row["revoked_at"]:
+            return ""
+        try:
+            conn.execute(
+                "UPDATE dashboard_tokens SET last_used_at=? WHERE token_hash=?",
+                (dt.datetime.now(dt.timezone.utc).isoformat(), th),
+            )
+            conn.commit()
+        except Exception:
+            pass
+        return str(row["role"] or "")
+
+
+def dashboard_token_is_registered(db_path: Path, token: str) -> bool:
+    """Return True if the token hash exists in dashboard_tokens (revoked or not).
+
+    Used to decide whether the legacy DASHBOARD_TOKEN env fallback applies: once a
+    token is registered, the DB is the source of truth — even for the legacy admin.
+    This closes the revoke bypass where env-token holders kept admin after the
+    bootstrap row was revoked.
+    """
+    if not token:
+        return False
+    ensure_dashboard_tokens_table(db_path)
+    th = _hash_token(token)
+    try:
+        with connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM dashboard_tokens WHERE token_hash=? LIMIT 1",
+                (th,),
+            ).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def list_dashboard_tokens(db_path: Path) -> List[Dict[str, Any]]:
+    ensure_dashboard_tokens_table(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT token_hash, role, label, created_at, last_used_at, revoked_at "
+            "FROM dashboard_tokens ORDER BY created_at DESC"
+        ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append({
+            "token_hash_prefix": str(r["token_hash"])[:12],
+            "role": r["role"],
+            "label": r["label"],
+            "created_at": r["created_at"],
+            "last_used_at": r["last_used_at"],
+            "revoked_at": r["revoked_at"],
+        })
+    return out
+
+
+def create_dashboard_token(db_path: Path, role: str, label: str) -> Dict[str, Any]:
+    role = (role or "").strip().lower()
+    if role not in {"admin", "auditor", "operator", "viewer"}:
+        return {"ok": False, "error": "invalid role"}
+    label = (label or "").strip()[:120]
+    ensure_dashboard_tokens_table(db_path)
+    import secrets as _secrets
+    token = _secrets.token_hex(32)
+    th = _hash_token(token)
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO dashboard_tokens(token_hash, role, label) VALUES (?,?,?)",
+            (th, role, label),
+        )
+        conn.commit()
+    return {"ok": True, "token": token, "token_hash_prefix": th[:12], "role": role, "label": label}
+
+
+def revoke_dashboard_token(db_path: Path, token_hash_prefix: str) -> Dict[str, Any]:
+    prefix = (token_hash_prefix or "").strip().lower()
+    if len(prefix) < 6:
+        return {"ok": False, "error": "prefix too short"}
+    ensure_dashboard_tokens_table(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT token_hash, role, revoked_at FROM dashboard_tokens WHERE token_hash LIKE ?",
+            (prefix + "%",),
+        ).fetchall()
+        if not rows:
+            return {"ok": False, "error": "token not found"}
+        if len(rows) > 1:
+            return {"ok": False, "error": "prefix is ambiguous"}
+        target = rows[0]
+        if target["revoked_at"]:
+            return {"ok": False, "error": "already revoked"}
+        if (target["role"] or "") == "admin":
+            active_admin_row = conn.execute(
+                "SELECT COUNT(*) AS c FROM dashboard_tokens WHERE role='admin' AND revoked_at IS NULL"
+            ).fetchone()
+            if int(active_admin_row["c"] if active_admin_row else 0) <= 1:
+                return {"ok": False, "error": "cannot revoke last admin"}
+        conn.execute(
+            "UPDATE dashboard_tokens SET revoked_at=? WHERE token_hash=?",
+            (dt.datetime.now(dt.timezone.utc).isoformat(), target["token_hash"]),
+        )
+        conn.commit()
+    return {"ok": True, "token_hash_prefix": target["token_hash"][:12]}
+
+
 _MUTATION_LOG_READY = False
 
 
@@ -2001,8 +2175,31 @@ def ensure_dashboard_mutation_log_table(db_path: Path) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dashboard_mutation_log_ts ON dashboard_mutation_log(ts_iso)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dashboard_mutation_log_action ON dashboard_mutation_log(action)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_dashboard_mutation_log_slip ON dashboard_mutation_log(slip_id)")
+        # Phase B1: hash-chain columns (idempotent on re-run; columns may already exist).
+        try:
+            conn.execute("ALTER TABLE dashboard_mutation_log ADD COLUMN prev_hash TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE dashboard_mutation_log ADD COLUMN entry_hash TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_mutation_entry_hash ON dashboard_mutation_log(entry_hash)")
         conn.commit()
     _MUTATION_LOG_READY = True
+
+
+# Phase B1: canonical hash for mutation rows.
+# IMPORTANT: keep this byte-identical to tools/verify_audit_chain.py::compute_mutation_hash.
+# 'id' is AUTOINCREMENT (unknown when the writer computes the hash), and 'entry_hash' is the
+# field being computed; both must be excluded so the writer's hash matches the verifier's.
+_MUTATION_HASH_EXCLUDE_KEYS = ("id", "entry_hash")
+
+
+def compute_mutation_hash(prev_hash: str, row: Dict[str, Any]) -> str:
+    canonical_obj = {k: row[k] for k in sorted(row.keys()) if k not in _MUTATION_HASH_EXCLUDE_KEYS}
+    canonical = json.dumps(canonical_obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(((prev_hash or "") + "|" + canonical).encode("utf-8")).hexdigest()
 
 
 _MUTATION_PAYLOAD_REDACT_KEYS = {"token", "cookie", "authorization", "auth", "password", "secret"}
@@ -2036,27 +2233,67 @@ def record_mutation(
     result_status: str = "ok",
     result_summary: str = "",
 ) -> None:
-    """Append row to dashboard_mutation_log. Failure must not break the original mutation."""
+    """Append row to dashboard_mutation_log. Failure must not break the original mutation.
+
+    Phase B1: each row is hash-chained to its predecessor. Fetch-prev-then-insert runs in a
+    single BEGIN IMMEDIATE transaction so concurrent writers cannot race on prev_hash. If hash
+    computation or insert fails we still swallow the exception (matches existing posture: do not
+    break the caller's mutation), which means a missing row is invisible to the verifier --
+    deliberate tradeoff -- see commit message.
+    """
     try:
         ensure_dashboard_mutation_log_table(db_path)
-        with connect(db_path) as conn:
+        row_data = {
+            "ts_iso": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "action": action,
+            "actor": actor or "",
+            "chat_id": chat_id or "",
+            "bot_key": bot_key or "",
+            "slip_id": slip_id or "",
+            "payload_json": json.dumps(_sanitize_mutation_payload(payload), ensure_ascii=False, default=str),
+            "result_status": result_status,
+            "result_summary": (result_summary or "")[:500],
+        }
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        # Manual transaction control so BEGIN IMMEDIATE actually takes the reserved lock.
+        conn.isolation_level = None
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            prev_row = conn.execute(
+                "SELECT entry_hash FROM dashboard_mutation_log ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            prev_hash = (prev_row["entry_hash"] if prev_row else "") or ""
+            row_for_hash = dict(row_data)
+            row_for_hash["prev_hash"] = prev_hash
+            entry_hash = compute_mutation_hash(prev_hash, row_for_hash)
             conn.execute(
                 "INSERT INTO dashboard_mutation_log "
-                "(ts_iso, action, actor, chat_id, bot_key, slip_id, payload_json, result_status, result_summary) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
+                "(ts_iso, action, actor, chat_id, bot_key, slip_id, payload_json, result_status, result_summary, prev_hash, entry_hash) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    dt.datetime.now(dt.timezone.utc).isoformat(),
-                    action,
-                    actor or "",
-                    chat_id or "",
-                    bot_key or "",
-                    slip_id or "",
-                    json.dumps(_sanitize_mutation_payload(payload), ensure_ascii=False, default=str),
-                    result_status,
-                    (result_summary or "")[:500],
+                    row_data["ts_iso"],
+                    row_data["action"],
+                    row_data["actor"],
+                    row_data["chat_id"],
+                    row_data["bot_key"],
+                    row_data["slip_id"],
+                    row_data["payload_json"],
+                    row_data["result_status"],
+                    row_data["result_summary"],
+                    prev_hash,
+                    entry_hash,
                 ),
             )
-            conn.commit()
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
     except Exception:
         logger.exception("record_mutation failed action=%s", action)
 
@@ -2065,6 +2302,325 @@ def record_endpoint_mutation(db_path: Path, action: str, *, actor: str = "", req
     """Thin wrapper around record_mutation that prefixes the per-request request_id into the result_summary."""
     prefix = f"req={request_id} " if request_id else ""
     record_mutation(db_path, action, actor=actor, chat_id=chat_id, bot_key=bot_key, slip_id=slip_id, payload=payload, result_status=result_status, result_summary=(prefix + (result_summary or "")))
+
+
+# Phase B1: parse a 'request_id' (12-hex) prefix stamped by record_endpoint_mutation back out
+# of result_summary, so the tail endpoint can surface it without leaking the full summary text.
+_REQUEST_ID_PREFIX_RE = re.compile(r"^req=([0-9a-fA-F]{8,32})\s")
+
+
+def _extract_request_id(result_summary: str) -> str:
+    if not result_summary:
+        return ""
+    m = _REQUEST_ID_PREFIX_RE.match(result_summary)
+    return m.group(1) if m else ""
+
+
+# ---------------------------------------------------------------------------
+# Phase B3: two-person approval workflow for destructive operations
+# ---------------------------------------------------------------------------
+
+PENDING_ACTION_TTL_HOURS = 24
+APPROVAL_REQUIRED_ACTIONS = {"slip.delete", "period.close"}
+_PENDING_ACTIONS_READY = False
+
+
+def ensure_pending_actions_table(db_path: Path) -> None:
+    """Create pending_actions table if missing. Idempotent."""
+    global _PENDING_ACTIONS_READY
+    if _PENDING_ACTIONS_READY:
+        return
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_actions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              action TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              requested_by TEXT NOT NULL,
+              requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              approved_by TEXT DEFAULT NULL,
+              approved_at TEXT DEFAULT NULL,
+              executed_at TEXT DEFAULT NULL,
+              executed_result TEXT DEFAULT NULL,
+              status TEXT NOT NULL DEFAULT 'pending',
+              expires_at TEXT NOT NULL,
+              request_id TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_actions(status, expires_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pending_action ON pending_actions(action)")
+        conn.commit()
+    _PENDING_ACTIONS_READY = True
+
+
+def _utc_now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def _utc_expiry_iso(hours: int = PENDING_ACTION_TTL_HOURS) -> str:
+    return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=hours)).isoformat()
+
+
+def create_pending_action(
+    db_path: Path,
+    *,
+    action: str,
+    payload: Any,
+    requested_by: str,
+    request_id: str = "",
+    ttl_hours: int = PENDING_ACTION_TTL_HOURS,
+) -> int:
+    """Insert a pending action row. Returns the new row id."""
+    ensure_pending_actions_table(db_path)
+    now_iso = _utc_now_iso()
+    expires_iso = _utc_expiry_iso(ttl_hours)
+    payload_json = json.dumps(_sanitize_mutation_payload(payload), ensure_ascii=False, default=str)
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT INTO pending_actions "
+            "(action, payload_json, requested_by, requested_at, status, expires_at, request_id) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (action, payload_json, requested_by or "", now_iso, "pending", expires_iso, request_id or ""),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def load_pending_action(db_path: Path, pending_id: int) -> Dict[str, Any]:
+    """Return pending row as dict or {} if missing."""
+    ensure_pending_actions_table(db_path)
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM pending_actions WHERE id=?", (int(pending_id),)).fetchone()
+    return dict(row) if row else {}
+
+
+def list_pending_actions(db_path: Path, *, status: str = "", limit: int = 200) -> List[Dict[str, Any]]:
+    """List pending actions newest first. Filter by status if non-empty."""
+    ensure_pending_actions_table(db_path)
+    with connect(db_path) as conn:
+        if status:
+            rows = conn.execute(
+                "SELECT id, action, payload_json, requested_by, requested_at, approved_by, approved_at, "
+                "executed_at, status, expires_at, request_id FROM pending_actions WHERE status=? "
+                "ORDER BY id DESC LIMIT ?",
+                (status, int(limit)),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, action, payload_json, requested_by, requested_at, approved_by, approved_at, "
+                "executed_at, status, expires_at, request_id FROM pending_actions "
+                "ORDER BY id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        try:
+            payload = json.loads(d.get("payload_json") or "{}")
+        except Exception:
+            payload = {}
+        d["payload_summary"] = _pending_payload_summary(payload)
+        d.pop("payload_json", None)
+        out.append(d)
+    return out
+
+
+def _pending_payload_summary(payload: Any) -> Dict[str, Any]:
+    """Compact, PII-light view of payload for /api/pending listing."""
+    if not isinstance(payload, dict):
+        return {}
+    summary: Dict[str, Any] = {}
+    for key in ("id", "slip_id", "bot_key", "chat_id", "company_name", "reason", "note"):
+        if key in payload:
+            value = payload.get(key)
+            if isinstance(value, str) and len(value) > 80:
+                value = value[:80] + "..."
+            summary[key] = value
+    return summary
+
+
+def expire_old_pending_actions(db_path: Path) -> int:
+    """Mark pending rows whose expires_at < now as 'expired'. Returns rowcount."""
+    ensure_pending_actions_table(db_path)
+    now_iso = _utc_now_iso()
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "UPDATE pending_actions SET status='expired' WHERE status='pending' AND expires_at < ?",
+            (now_iso,),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def approve_pending_action(db_path: Path, pending_id: int, approver_fp: str) -> Dict[str, Any]:
+    """Approve a pending action. Rejects self-approval (requester == approver)."""
+    ensure_pending_actions_table(db_path)
+    expire_old_pending_actions(db_path)
+    row = load_pending_action(db_path, pending_id)
+    if not row:
+        return {"ok": False, "error": "pending action not found", "status": 404}
+    if row.get("status") != "pending":
+        return {"ok": False, "error": f"cannot approve status={row.get('status')}", "status": 409}
+    if not approver_fp:
+        return {"ok": False, "error": "approver fingerprint required", "status": 403}
+    if row.get("requested_by") == approver_fp:
+        return {"ok": False, "error": "self-approval not allowed", "status": 403}
+    now_iso = _utc_now_iso()
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE pending_actions SET status='approved', approved_by=?, approved_at=? "
+            "WHERE id=? AND status='pending'",
+            (approver_fp, now_iso, int(pending_id)),
+        )
+        conn.commit()
+    return {"ok": True, "pending_id": int(pending_id), "approved_by": approver_fp, "approved_at": now_iso}
+
+
+def reject_pending_action(db_path: Path, pending_id: int, rejecter_fp: str, reason: str = "") -> Dict[str, Any]:
+    ensure_pending_actions_table(db_path)
+    row = load_pending_action(db_path, pending_id)
+    if not row:
+        return {"ok": False, "error": "pending action not found", "status": 404}
+    if row.get("status") not in {"pending", "approved"}:
+        return {"ok": False, "error": f"cannot reject status={row.get('status')}", "status": 409}
+    now_iso = _utc_now_iso()
+    summary = (reason or "")[:480]
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE pending_actions SET status='rejected', approved_by=?, approved_at=?, executed_result=? "
+            "WHERE id=?",
+            (rejecter_fp or "", now_iso, summary, int(pending_id)),
+        )
+        conn.commit()
+    return {"ok": True, "pending_id": int(pending_id), "rejected_by": rejecter_fp, "reason": summary}
+
+
+def cancel_pending_action(db_path: Path, pending_id: int, requester_fp: str) -> Dict[str, Any]:
+    """Only the original requester may cancel."""
+    ensure_pending_actions_table(db_path)
+    row = load_pending_action(db_path, pending_id)
+    if not row:
+        return {"ok": False, "error": "pending action not found", "status": 404}
+    if row.get("status") not in {"pending", "approved"}:
+        return {"ok": False, "error": f"cannot cancel status={row.get('status')}", "status": 409}
+    if not requester_fp or row.get("requested_by") != requester_fp:
+        return {"ok": False, "error": "only requester may cancel", "status": 403}
+    now_iso = _utc_now_iso()
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE pending_actions SET status='cancelled', executed_at=? WHERE id=?",
+            (now_iso, int(pending_id)),
+        )
+        conn.commit()
+    return {"ok": True, "pending_id": int(pending_id), "cancelled_by": requester_fp}
+
+
+def mark_pending_executed(db_path: Path, pending_id: int, executed_result: str = "") -> None:
+    ensure_pending_actions_table(db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE pending_actions SET status='executed', executed_at=?, executed_result=? WHERE id=?",
+            (_utc_now_iso(), (executed_result or "")[:480], int(pending_id)),
+        )
+        conn.commit()
+
+
+def pending_action_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Parse the stored payload_json of a pending row back into a dict."""
+    if not row:
+        return {}
+    try:
+        data = json.loads(row.get("payload_json") or "{}")
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def verify_mutation_chain(db_path: Path) -> Dict[str, Any]:
+    """Walk dashboard_mutation_log in id order; recompute each entry_hash from stored prev_hash
+    and the row's content. Returns the first divergence (by id) or ok=True if all match.
+
+    Cross-validates the chain links too: row N's prev_hash must equal row N-1's entry_hash.
+    """
+    ensure_dashboard_mutation_log_table(db_path)
+    total = 0
+    first_bad_id: Any = None
+    first_bad_reason: Any = None
+    with connect(db_path) as conn:
+        cursor = conn.execute(
+            "SELECT id, ts_iso, action, actor, chat_id, bot_key, slip_id, payload_json, "
+            "       result_status, result_summary, prev_hash, entry_hash "
+            "FROM dashboard_mutation_log ORDER BY id ASC"
+        )
+        last_entry_hash = ""
+        for row in cursor:
+            total += 1
+            row_dict = dict(row)
+            stored_entry_hash = row_dict.get("entry_hash") or ""
+            stored_prev_hash = row_dict.get("prev_hash") or ""
+            if first_bad_id is None and stored_prev_hash != last_entry_hash:
+                first_bad_id = row_dict["id"]
+                first_bad_reason = (
+                    f"prev_hash mismatch: row {row_dict['id']} stores prev_hash="
+                    f"{stored_prev_hash[:12]}... but prior entry_hash was {last_entry_hash[:12]}..."
+                )
+            recomputed = compute_mutation_hash(stored_prev_hash, row_dict)
+            if first_bad_id is None and recomputed != stored_entry_hash:
+                first_bad_id = row_dict["id"]
+                first_bad_reason = (
+                    f"entry_hash mismatch: row {row_dict['id']} stores {stored_entry_hash[:12]}..."
+                    f" but recomputed {recomputed[:12]}..."
+                )
+            last_entry_hash = stored_entry_hash
+    return {
+        "ok": first_bad_id is None,
+        "total_rows": total,
+        "first_bad_id": first_bad_id,
+        "first_bad_reason": first_bad_reason,
+        "verified_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+
+
+def mutation_chain_tail(db_path: Path, limit: int = 50) -> List[Dict[str, Any]]:
+    """Return the last N entries of dashboard_mutation_log (newest first), WITHOUT the raw payload.
+
+    result_summary is truncated to 200 chars. payload_json is intentionally omitted because it
+    can carry account numbers in some endpoints; for full payload access use the standalone
+    verifier with direct DB read (auditor scenario).
+    """
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 50
+    if limit < 1:
+        limit = 1
+    if limit > 500:
+        limit = 500
+    ensure_dashboard_mutation_log_table(db_path)
+    out: List[Dict[str, Any]] = []
+    with connect(db_path) as conn:
+        cursor = conn.execute(
+            "SELECT id, ts_iso, actor, action, result_status, result_summary, prev_hash, entry_hash "
+            "FROM dashboard_mutation_log ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        for row in cursor:
+            d = dict(row)
+            summary = (d.get("result_summary") or "")[:200]
+            out.append({
+                "id": d["id"],
+                "ts": d.get("ts_iso") or "",
+                "actor_fingerprint": d.get("actor") or "",
+                "action": d.get("action") or "",
+                "request_id": _extract_request_id(d.get("result_summary") or ""),
+                "result_status": d.get("result_status") or "",
+                "result_summary": summary,
+                "prev_hash": (d.get("prev_hash") or "")[:12],
+                "entry_hash": (d.get("entry_hash") or "")[:12],
+            })
+    return out
 
 
 def openai_bank_double_check_slip(db_path: Path, slip_id: str, apply: bool = True) -> Dict[str, Any]:
@@ -4689,16 +5245,65 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return ""
 
     def authorized(self) -> bool:
-        if not DASHBOARD_TOKEN:
-            return False
-        import hmac as _hmac
-        return _hmac.compare_digest(self.token_from_request(), DASHBOARD_TOKEN)
+        # Resolve role; any non-empty role means an authorized request.
+        return bool(self.actor_role())
+
+    def actor_role(self) -> str:
+        """Resolve the role for the current request.
+
+        - Look up sha256(token) in dashboard_tokens; if active, return stored role.
+        - If the token IS registered (revoked or otherwise inactive): return "".
+          The DB is the source of truth — legacy DASHBOARD_TOKEN cannot bypass a
+          revoke once it has been registered.
+        - If the token is NOT registered AT ALL but matches the legacy
+          DASHBOARD_TOKEN env, return "admin" as a bootstrap fallback for fresh
+          installs before bootstrap_dashboard_admin_token has run.
+        - Otherwise return "".
+        """
+        tok = self.token_from_request()
+        if not tok:
+            return ""
+        try:
+            role = lookup_dashboard_token_role(DB_PATH, tok)
+        except Exception:
+            role = ""
+        if role:
+            return role
+        # Token might be registered but revoked — DO NOT fall back to legacy.
+        try:
+            registered = dashboard_token_is_registered(DB_PATH, tok)
+        except Exception:
+            registered = False
+        if registered:
+            return ""
+        # Pre-bootstrap legacy fallback only.
+        if DASHBOARD_TOKEN:
+            import hmac as _hmac
+            if _hmac.compare_digest(tok, DASHBOARD_TOKEN):
+                return "admin"
+        return ""
+
+    def require_role(self, *allowed: str) -> bool:
+        return self.actor_role() in set(allowed)
+
+    def role_or_401(self, *allowed: str) -> bool:
+        if self.require_role(*allowed):
+            return True
+        self.send_bytes(HTTPStatus.UNAUTHORIZED, b"Unauthorized", "text/plain; charset=utf-8")
+        return False
 
     def actor_fingerprint(self) -> str:
         tok = self.token_from_request()
         if not tok:
             return ""
         return hashlib.sha256(tok.encode("utf-8", "replace")).hexdigest()[:12]
+
+    def parse_approval_param(self) -> str:
+        """Read ?approval=request|execute from URL query (default 'request')."""
+        parsed = urlparse(self.path)
+        q = parse_qs(parsed.query)
+        val = (q.get("approval") or ["request"])[0].strip().lower()
+        return val if val in {"request", "execute"} else "request"
 
     def cookie_attrs(self) -> str:
         attrs = ["HttpOnly", "SameSite=Strict", "Path=/", "Max-Age=86400"]
@@ -4758,7 +5363,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path in {"/", "/index.html"}:
             self.send_bytes(200, render_dashboard_html().encode("utf-8"), "text/html; charset=utf-8")
             return
+        if parsed.path == "/api/tokens":
+            if not self.role_or_401("admin"):
+                return
+            try:
+                self.send_json({"ok": True, "tokens": list_dashboard_tokens(DB_PATH)})
+            except Exception as exc:
+                logger.exception("api_tokens_list failed")
+                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+            return
         if parsed.path == "/api/summary":
+            # Lazy expiry hook (cheap; runs at most once per request).
+            try:
+                expire_old_pending_actions(DB_PATH)
+            except Exception:
+                logger.exception("expire_old_pending_actions failed during /api/summary")
             q = parse_qs(parsed.query)
             chat_id = (q.get("chat_id") or [""])[0]
             bot_key = (q.get("bot_key") or [""])[0]
@@ -4768,6 +5387,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
             slip_search = (q.get("slip_search") or [""])[0]
             account_search_mode = (q.get("account_search_mode") or [""])[0] or "scoped"
             self.send_json(dashboard_snapshot(DB_PATH, chat_id=chat_id, bot_key=bot_key, flow_type=flow_type, scope=scope, slip_filter=slip_filter, slip_search=slip_search, account_search_mode=account_search_mode))
+            return
+        if parsed.path == "/api/pending":
+            try:
+                expire_old_pending_actions(DB_PATH)
+            except Exception:
+                logger.exception("expire_old_pending_actions failed during /api/pending")
+            q = parse_qs(parsed.query)
+            status_filter = (q.get("status") or [""])[0]
+            try:
+                limit = int((q.get("limit") or ["200"])[0])
+            except (TypeError, ValueError):
+                limit = 200
+            rows = list_pending_actions(DB_PATH, status=status_filter, limit=limit)
+            self.send_json({"ok": True, "items": rows, "count": len(rows)})
             return
         if parsed.path == "/api/slip-image":
             q = parse_qs(parsed.query)
@@ -4834,6 +5467,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 logger.exception("api_export failed")
                 self.send_json({"ok": False, "error": safe_error(exc)}, 400)
             return
+        if parsed.path == "/api/audit-chain/verify":
+            try:
+                self.send_json(verify_mutation_chain(DB_PATH))
+            except Exception as exc:
+                logger.exception("api_audit_chain_verify failed")
+                self.send_json({"ok": False, "error": safe_error(exc)}, 500)
+            return
+        if parsed.path == "/api/audit-chain/tail":
+            q = parse_qs(parsed.query)
+            limit_str = (q.get("limit") or ["50"])[0]
+            try:
+                self.send_json({"ok": True, "entries": mutation_chain_tail(DB_PATH, limit=int(limit_str or 50))})
+            except Exception as exc:
+                logger.exception("api_audit_chain_tail failed")
+                self.send_json({"ok": False, "error": safe_error(exc)}, 500)
+            return
         self.send_json({"ok": False, "error": "not found"}, 404)
 
     def do_POST(self) -> None:
@@ -4871,21 +5520,62 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 else:
                     payload = {k: v[0] for k, v in parse_qs(raw).items()}
         if parsed.path == "/api/close":
-            chat_id = str(payload.get("chat_id") or "")
-            bot_key = str(payload.get("bot_key") or "default")
-            company_name = str(payload.get("company_name") or "")
-            note = str(payload.get("note") or "dashboard close")
+            if not self.role_or_401("admin"):
+                return
+            actor_fp = self.actor_fingerprint()
+            approval_mode = self.parse_approval_param()
+            pending_id_executed: int = 0
+            if approval_mode == "request":
+                request_id = uuid.uuid4().hex[:12]
+                pending_id = create_pending_action(
+                    DB_PATH,
+                    action="period.close",
+                    payload=payload,
+                    requested_by=actor_fp,
+                    request_id=request_id,
+                )
+                record_endpoint_mutation(DB_PATH, "close.request", actor=actor_fp, request_id=request_id, chat_id=str(payload.get("chat_id") or ""), bot_key=str(payload.get("bot_key") or "default"), payload=payload, result_status="pending", result_summary=f"pending_id={pending_id}")
+                self.send_json({"ok": True, "status": "pending", "pending_id": pending_id, "request_id": request_id, "expires_in_hours": PENDING_ACTION_TTL_HOURS})
+                return
+            # approval_mode == "execute"
+            try:
+                pending_id_executed = int(payload.get("pending_id") or 0)
+            except (TypeError, ValueError):
+                pending_id_executed = 0
+            if not pending_id_executed:
+                self.send_json({"ok": False, "error": "pending_id required for execute"}, 400)
+                return
+            expire_old_pending_actions(DB_PATH)
+            pending_row = load_pending_action(DB_PATH, pending_id_executed)
+            if not pending_row or pending_row.get("action") != "period.close":
+                self.send_json({"ok": False, "error": "pending action not found"}, 404)
+                return
+            if pending_row.get("status") != "approved":
+                self.send_json({"ok": False, "error": f"not approved (status={pending_row.get('status')})"}, 409)
+                return
+            # Use the originally-requested payload, NOT the new request body, to prevent target swap.
+            stored_payload = pending_action_payload(pending_row)
+            chat_id = str(stored_payload.get("chat_id") or "")
+            bot_key = str(stored_payload.get("bot_key") or "default")
+            company_name = str(stored_payload.get("company_name") or "")
+            note = str(stored_payload.get("note") or "dashboard close")
             try:
                 result = dashboard_close_period(DB_PATH, chat_id, note, bot_key=bot_key, company_name=company_name)
             except Exception as exc:
                 logger.exception("api_close failed")
-                record_mutation(DB_PATH, "close", actor=self.actor_fingerprint(), chat_id=chat_id, bot_key=bot_key, payload=payload, result_status="error", result_summary=safe_error(exc))
-                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+                record_mutation(DB_PATH, "close", actor=actor_fp, chat_id=chat_id, bot_key=bot_key, payload=stored_payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "pending_id": pending_id_executed}, 400)
                 return
-            record_mutation(DB_PATH, "close", actor=self.actor_fingerprint(), chat_id=chat_id, bot_key=bot_key, payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("settlement_id") or result.get("error") or ""))
+            record_mutation(DB_PATH, "close", actor=actor_fp, chat_id=chat_id, bot_key=bot_key, payload=stored_payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("settlement_id") or result.get("error") or ""))
+            if result.get("ok"):
+                mark_pending_executed(DB_PATH, pending_id_executed, executed_result=str(result.get("settlement_id") or ""))
+            if isinstance(result, dict):
+                result["pending_id"] = pending_id_executed
             self.send_json(result, 200 if result.get("ok") else 400)
             return
         if parsed.path == "/api/account-limit":
+            if not self.role_or_401("admin"):
+                return
             request_id = uuid.uuid4().hex[:12]
             try:
                 result = save_account_limit(
@@ -4907,6 +5597,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
             return
         if parsed.path == "/api/company-account":
+            if not self.role_or_401("admin"):
+                return
             request_id = uuid.uuid4().hex[:12]
             try:
                 result = save_company_account(
@@ -4929,6 +5621,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
             return
         if parsed.path == "/api/duplicate/unmark":
+            if not self.role_or_401("admin", "operator"):
+                return
             request_id = uuid.uuid4().hex[:12]
             slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
             bot_key_in = str(payload.get("bot_key") or "")
@@ -4945,27 +5639,66 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json(result, 200 if result.get("ok") else 400)
             return
         if parsed.path == "/api/slip/delete":
-            request_id = uuid.uuid4().hex[:12]
-            slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
-            bot_key_in = str(payload.get("bot_key") or "")
+            if not self.role_or_401("admin"):
+                return
+            actor_fp = self.actor_fingerprint()
+            approval_mode = self.parse_approval_param()
+            if approval_mode == "request":
+                request_id = uuid.uuid4().hex[:12]
+                pending_id = create_pending_action(
+                    DB_PATH,
+                    action="slip.delete",
+                    payload=payload,
+                    requested_by=actor_fp,
+                    request_id=request_id,
+                )
+                slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
+                record_endpoint_mutation(DB_PATH, "delete.request", actor=actor_fp, request_id=request_id, bot_key=str(payload.get("bot_key") or ""), slip_id=slip_id_in, payload=payload, result_status="pending", result_summary=f"pending_id={pending_id}")
+                self.send_json({"ok": True, "status": "pending", "pending_id": pending_id, "request_id": request_id, "expires_in_hours": PENDING_ACTION_TTL_HOURS})
+                return
+            # approval_mode == "execute"
+            try:
+                pending_id_executed = int(payload.get("pending_id") or 0)
+            except (TypeError, ValueError):
+                pending_id_executed = 0
+            if not pending_id_executed:
+                self.send_json({"ok": False, "error": "pending_id required for execute"}, 400)
+                return
+            expire_old_pending_actions(DB_PATH)
+            pending_row = load_pending_action(DB_PATH, pending_id_executed)
+            if not pending_row or pending_row.get("action") != "slip.delete":
+                self.send_json({"ok": False, "error": "pending action not found"}, 404)
+                return
+            if pending_row.get("status") != "approved":
+                self.send_json({"ok": False, "error": f"not approved (status={pending_row.get('status')})"}, 409)
+                return
+            stored_payload = pending_action_payload(pending_row)
+            request_id = str(pending_row.get("request_id") or uuid.uuid4().hex[:12])
+            slip_id_in = str(stored_payload.get("id") or stored_payload.get("slip_id") or "")
+            bot_key_in = str(stored_payload.get("bot_key") or "")
             try:
                 result = delete_dashboard_slip(
                     DB_PATH,
                     slip_id_in,
                     bot_key_in,
-                    str(payload.get("reason") or "dashboard operator delete"),
+                    str(stored_payload.get("reason") or "dashboard operator delete"),
                 )
             except Exception as exc:
                 logger.exception("api_slip_delete failed")
-                record_endpoint_mutation(DB_PATH, "delete", actor=self.actor_fingerprint(), request_id=request_id, bot_key=bot_key_in, slip_id=slip_id_in, payload=payload, result_status="error", result_summary=safe_error(exc))
-                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
+                record_endpoint_mutation(DB_PATH, "delete", actor=actor_fp, request_id=request_id, bot_key=bot_key_in, slip_id=slip_id_in, payload=stored_payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id, "pending_id": pending_id_executed}, 400)
                 return
-            record_endpoint_mutation(DB_PATH, "delete", actor=self.actor_fingerprint(), request_id=request_id, bot_key=bot_key_in, slip_id=slip_id_in, chat_id=str(result.get("chat_id") or ""), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("previous_status") or result.get("error") or ""))
+            record_endpoint_mutation(DB_PATH, "delete", actor=actor_fp, request_id=request_id, bot_key=bot_key_in, slip_id=slip_id_in, chat_id=str(result.get("chat_id") or ""), payload=stored_payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("previous_status") or result.get("error") or ""))
+            if result.get("ok"):
+                mark_pending_executed(DB_PATH, pending_id_executed, executed_result=str(result.get("previous_status") or ""))
             if isinstance(result, dict):
                 result["request_id"] = request_id
+                result["pending_id"] = pending_id_executed
             self.send_json(result, 200 if result.get("ok") else 400)
             return
         if parsed.path == "/api/slip/reprocess":
+            if not self.role_or_401("admin", "operator"):
+                return
             request_id = uuid.uuid4().hex[:12]
             slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
             bot_key_in = str(payload.get("bot_key") or "")
@@ -4985,6 +5718,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
             return
         if parsed.path == "/api/bank-review/openai":
+            if not self.role_or_401("admin", "operator"):
+                return
             slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
             try:
                 result = openai_bank_double_check_slip(
@@ -5000,6 +5735,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": safe_error(exc)}, 400)
             return
         if parsed.path == "/api/bank-review/openai-all":
+            if not self.role_or_401("admin"):
+                return
             try:
                 q = parse_qs(parsed.query)
                 chat_id_b = str(payload.get("chat_id") or (q.get("chat_id") or [""])[0] or "")
@@ -5024,6 +5761,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": safe_error(exc)}, 400)
             return
         if parsed.path == "/api/reconcile":
+            if not self.role_or_401("admin"):
+                return
             request_id = uuid.uuid4().hex[:12]
             try:
                 chat_id = str(payload.get("chat_id") or "")
@@ -5046,12 +5785,105 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 record_endpoint_mutation(DB_PATH, "reconcile", actor=self.actor_fingerprint(), request_id=request_id, payload=payload, result_status="error", result_summary=safe_error(exc))
                 self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
             return
+        if parsed.path == "/api/tokens/create":
+            if not self.role_or_401("admin"):
+                return
+            request_id = uuid.uuid4().hex[:12]
+            # Redact role/label only — never echo or log the raw token.
+            mutation_payload = {"role": str(payload.get("role") or ""), "label": str(payload.get("label") or "")}
+            try:
+                result = create_dashboard_token(
+                    DB_PATH,
+                    str(payload.get("role") or ""),
+                    str(payload.get("label") or ""),
+                )
+                token_hash_prefix = ""
+                if isinstance(result, dict) and result.get("ok"):
+                    token_hash_prefix = str(result.get("token_hash_prefix") or "")
+                record_endpoint_mutation(DB_PATH, "token.create", actor=self.actor_fingerprint(), request_id=request_id, payload=mutation_payload, result_status=("ok" if (isinstance(result, dict) and result.get("ok")) else "error"), result_summary=token_hash_prefix or (isinstance(result, dict) and str(result.get("error") or "")) or "")
+                if isinstance(result, dict):
+                    result["request_id"] = request_id
+                self.send_json(result, 200 if (isinstance(result, dict) and result.get("ok")) else 400)
+            except Exception as exc:
+                logger.exception("api_tokens_create failed")
+                record_endpoint_mutation(DB_PATH, "token.create", actor=self.actor_fingerprint(), request_id=request_id, payload=mutation_payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
+            return
+        if parsed.path == "/api/tokens/revoke":
+            if not self.role_or_401("admin"):
+                return
+            request_id = uuid.uuid4().hex[:12]
+            token_prefix = str(payload.get("token_hash_prefix") or "")
+            mutation_payload = {"token_hash_prefix": token_prefix}
+            try:
+                result = revoke_dashboard_token(DB_PATH, token_prefix)
+                record_endpoint_mutation(DB_PATH, "token.revoke", actor=self.actor_fingerprint(), request_id=request_id, payload=mutation_payload, result_status=("ok" if (isinstance(result, dict) and result.get("ok")) else "error"), result_summary=token_prefix + " " + (isinstance(result, dict) and str(result.get("error") or "")))
+                if isinstance(result, dict):
+                    result["request_id"] = request_id
+                self.send_json(result, 200 if (isinstance(result, dict) and result.get("ok")) else 400)
+            except Exception as exc:
+                logger.exception("api_tokens_revoke failed")
+                record_endpoint_mutation(DB_PATH, "token.revoke", actor=self.actor_fingerprint(), request_id=request_id, payload=mutation_payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
+            return
+        if parsed.path == "/api/pending/approve":
+            if not self.role_or_401("admin", "auditor"):
+                return
+            actor_fp = self.actor_fingerprint()
+            try:
+                pending_id = int(payload.get("pending_id") or 0)
+            except (TypeError, ValueError):
+                pending_id = 0
+            if not pending_id:
+                self.send_json({"ok": False, "error": "pending_id required"}, 400)
+                return
+            result = approve_pending_action(DB_PATH, pending_id, actor_fp)
+            status_code = int(result.pop("status", 200)) if not result.get("ok") else 200
+            record_endpoint_mutation(DB_PATH, "pending.approve", actor=actor_fp, request_id=str(pending_id), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("error") or result.get("approved_at") or ""))
+            self.send_json(result, status_code)
+            return
+        if parsed.path == "/api/pending/reject":
+            if not self.role_or_401("admin", "auditor"):
+                return
+            actor_fp = self.actor_fingerprint()
+            try:
+                pending_id = int(payload.get("pending_id") or 0)
+            except (TypeError, ValueError):
+                pending_id = 0
+            if not pending_id:
+                self.send_json({"ok": False, "error": "pending_id required"}, 400)
+                return
+            reason = str(payload.get("reason") or "")
+            result = reject_pending_action(DB_PATH, pending_id, actor_fp, reason)
+            status_code = int(result.pop("status", 200)) if not result.get("ok") else 200
+            record_endpoint_mutation(DB_PATH, "pending.reject", actor=actor_fp, request_id=str(pending_id), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("error") or result.get("reason") or ""))
+            self.send_json(result, status_code)
+            return
+        if parsed.path == "/api/pending/cancel":
+            actor_fp = self.actor_fingerprint()
+            try:
+                pending_id = int(payload.get("pending_id") or 0)
+            except (TypeError, ValueError):
+                pending_id = 0
+            if not pending_id:
+                self.send_json({"ok": False, "error": "pending_id required"}, 400)
+                return
+            result = cancel_pending_action(DB_PATH, pending_id, actor_fp)
+            status_code = int(result.pop("status", 200)) if not result.get("ok") else 200
+            record_endpoint_mutation(DB_PATH, "pending.cancel", actor=actor_fp, request_id=str(pending_id), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("error") or ""))
+            self.send_json(result, status_code)
+            return
         self.send_json({"ok": False, "error": "not found"}, 404)
 
 
 def main() -> None:
     if not DASHBOARD_TOKEN:
         raise SystemExit("AUDITSLIP_DASHBOARD_TOKEN is required")
+    try:
+        ensure_dashboard_tokens_table(DB_PATH)
+        bootstrap_dashboard_admin_token(DB_PATH, DASHBOARD_TOKEN)
+    except Exception:
+        logger.exception("dashboard_tokens bootstrap failed")
     httpd = ThreadingHTTPServer((HOST, PORT), DashboardHandler)
     print(f"Auditslip dashboard listening on http://{HOST}:{PORT}", flush=True)
     httpd.serve_forever()
