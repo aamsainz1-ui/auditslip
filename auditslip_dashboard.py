@@ -21,6 +21,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import uuid
 import zipfile
 from copy import copy
 
@@ -2060,6 +2061,12 @@ def record_mutation(
         logger.exception("record_mutation failed action=%s", action)
 
 
+def record_endpoint_mutation(db_path: Path, action: str, *, actor: str = "", request_id: str = "", payload: Any = None, result_status: str = "ok", result_summary: str = "", chat_id: str = "", bot_key: str = "", slip_id: str = "") -> None:
+    """Thin wrapper around record_mutation that prefixes the per-request request_id into the result_summary."""
+    prefix = f"req={request_id} " if request_id else ""
+    record_mutation(db_path, action, actor=actor, chat_id=chat_id, bot_key=bot_key, slip_id=slip_id, payload=payload, result_status=result_status, result_summary=(prefix + (result_summary or "")))
+
+
 def openai_bank_double_check_slip(db_path: Path, slip_id: str, apply: bool = True) -> Dict[str, Any]:
     slip_id = clean_display(slip_id)
     if not slip_id:
@@ -2286,10 +2293,13 @@ def company_overview_dicts(company_rows: List[sqlite3.Row], job_rows: List[sqlit
         out.append(item)
     return sorted(out, key=dict_company_sort_key)
 
-def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = "open", bot_key: str = "", slip_filter: str = "all", slip_search: str = "", flow_type: str = "all") -> Dict[str, Any]:
+def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = "open", bot_key: str = "", slip_filter: str = "all", slip_search: str = "", flow_type: str = "all", account_search_mode: str = "") -> Dict[str, Any]:
     slip_filter_key = clean_display(slip_filter).lower() or "all"
     slip_search_key = clean_display(slip_search)
     flow_type_key = normalize_flow_type(flow_type)
+    account_search_mode_key = clean_display(account_search_mode).lower()
+    if account_search_mode_key not in {"scoped", "cross", "both", ""}:
+        account_search_mode_key = ""
     with connect(db_path) as conn:
         chats = conn.execute(
             """
@@ -2529,7 +2539,13 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
                 source_bank_review = []
                 source_bank_review_total = 0
 
-        cross_company_account_slip_search = cross_company_account_slip_search_rows(conn, scope, flow_type_key, slip_search_key)
+        if account_search_mode_key == "scoped":
+            cross_company_account_slip_search = empty_account_slip_search(slip_search_key)
+            cross_company_account_slip_search.update({"company_count": 0, "companies": [], "is_cross_company": False})
+        else:
+            cross_company_account_slip_search = cross_company_account_slip_search_rows(conn, scope, flow_type_key, slip_search_key)
+        if account_search_mode_key == "cross":
+            account_slip_search = empty_account_slip_search(slip_search_key)
 
         slip_status_rows = conn.execute(f"SELECT status, COUNT(*) AS count FROM slips {status_where} GROUP BY status", status_params).fetchall()
         job_status_rows = conn.execute(f"SELECT status, COUNT(*) AS count FROM ocr_jobs {job_where} GROUP BY status", job_params).fetchall()
@@ -3616,7 +3632,7 @@ def render_dashboard_html(token: str = "") -> str:
       <div class="card"><h3>บริษัทย่อย/บัญชีรับเงิน</h3><div class="toolbar"><input id="companyName" placeholder="ชื่อบริษัท" /><input id="accountBank" placeholder="ธนาคาร" /><input id="accountNo" placeholder="เลขบัญชีที่ใช้" /><input id="accountName" placeholder="ชื่อบัญชีที่ใช้" /><input id="accountDailyLimit" type="number" step="0.01" placeholder="วงเงิน/วัน" /><button onclick="saveCompanyAccount()">บันทึกบัญชีบริษัท</button></div><div id="companyAccounts"></div></div>
       <div class="card"><h3>ฝั่งถอน · รายบัญชีตามวันที่</h3><div class="mini">บัญชีของบริษัท/ผู้โอน [กลุ่มถอน] · บัญชีผู้โอน/ต้นทางจากกลุ่มถอน แยกตามวันและบริษัท วางไว้ก่อนเพื่อไม่ต้องเลื่อนผ่านรายการฝาก/เติมมือ</div><div id="companyAccountDailyWithdraw"></div></div>
       <div class="card"><h3>ฝั่งฝาก/เติมมือ · รายบัญชีตามวันที่</h3><div class="mini">บัญชีของบริษัท/ผู้โอน [กลุ่มฝาก/เติมมือ] · บัญชีรับเงิน/ปลายทางจากกลุ่มฝาก/เติมมือ แยกไว้คนละส่วนกับฝั่งถอน</div><div id="companyAccountDailyDeposit"></div></div>
-      <div class="card"><h3>ค้นหารายการสลิปตามบัญชี</h3><div class="mini">พิมพ์เลขบัญชี/ชื่อ/ธนาคารในช่องค้นหา ระบบจะแสดงจำนวนสลิป ยอดรวม และรูปสลิปทีละใบใน scope ที่เลือก</div><div id="accountSlipSearch"></div><h3>บัญชีถอนที่พบข้ามบริษัท</h3><div class="mini">เฉพาะสลิปถอนเท่านั้น ไม่เอาชื่อ/บัญชีจากสลิปฝากหรือเติมมือมาแสดง</div><div id="accountCrossCompany"></div><h3>ค้นหาสลิปถอนข้ามบริษัท</h3><div class="mini">ค้นทุกบริษัทเฉพาะสลิปถอน เพื่อดูรูปสลิปของบัญชีถอนที่ซ้ำข้ามบริษัท</div><div id="crossCompanyAccountSlipSearch"></div></div>
+      <div class="card"><h3>ค้นหารายการสลิปตามบัญชี</h3><div class="mini">พิมพ์เลขบัญชี/ชื่อ/ธนาคารในช่องค้นหา ระบบจะแสดงจำนวนสลิป ยอดรวม และรูปสลิปทีละใบใน scope ที่เลือก</div><div id="accountSlipSearch"></div><div id="accountCrossCompanyBlock" class="cross-conditional" hidden><h3>บัญชีถอนที่พบข้ามบริษัท</h3><div class="mini">เฉพาะสลิปถอนเท่านั้น ไม่เอาชื่อ/บัญชีจากสลิปฝากหรือเติมมือมาแสดง</div><div id="accountCrossCompany"></div></div><div id="crossCompanyAccountSlipSearchBlock" class="cross-conditional" hidden><h3>ค้นหาสลิปถอนข้ามบริษัท</h3><div class="mini">ค้นทุกบริษัทเฉพาะสลิปถอน เพื่อดูรูปสลิปของบัญชีถอนที่ซ้ำข้ามบริษัท</div><div id="crossCompanyAccountSlipSearch"></div></div></div>
     </section>
     <section id="section-date-sender" class="sections menu-section" hidden>
       <div class="card"><h3>กราฟรายวัน ฝาก/ถอน</h3><div class="mini">นับเฉพาะสลิป success ไม่ซ้ำ แยกกลุ่มฝาก/เติมมือและถอนตามวันที่ของสลิป</div><div id="dailyFlowChart"></div></div>
@@ -3918,6 +3934,7 @@ function pickAccountSearch(queryText, crossCompany=false) {{
   const input = document.getElementById('slipSearch');
   if (!input || !queryText) return;
   input.value = queryText;
+  window.__accountSearchMode = crossCompany ? 'cross' : 'scoped';
   if (crossCompany) {{
     const flow = document.getElementById('flowFilter').value || 'all';
     document.getElementById('botFilter').value = '__all__';
@@ -4415,7 +4432,8 @@ async function load(options={{}}) {{
   const currentFilter = slipFilterEl.value || 'all';
   const currentSearch = slipSearchEl.value || '';
   const requestChat = (current.bot_key === currentBot && (currentFlow === 'all' || current.flow_type === currentFlow)) ? current.chat_id : '';
-  const res = await fetch('/api/summary'+query({{chat_id: requestChat, bot_key: currentBot, flow_type: currentFlow, scope: currentScope, slip_filter: currentFilter, slip_search: currentSearch}}), {{cache:'no-store'}});
+  const accountSearchMode = (typeof window.__accountSearchMode === 'string') ? window.__accountSearchMode : '';
+  const res = await fetch('/api/summary'+query({{chat_id: requestChat, bot_key: currentBot, flow_type: currentFlow, scope: currentScope, slip_filter: currentFilter, slip_search: currentSearch, account_search_mode: accountSearchMode}}), {{cache:'no-store'}});
   if (!res.ok) {{ document.body.innerHTML = '<main class="wrap"><div class="card bad">Unauthorized or dashboard unavailable</div></main>'; return; }}
   const data = await res.json();
   currentSnapshot = data;
@@ -4500,6 +4518,11 @@ async function load(options={{}}) {{
   document.getElementById('accountSlipSearch').innerHTML = renderAccountSlipSearch(data.account_slip_search);
   document.getElementById('accountCrossCompany').innerHTML = renderAccountCrossCompany(data.account_cross_company);
   document.getElementById('crossCompanyAccountSlipSearch').innerHTML = renderCrossCompanyAccountSlipSearch(data.cross_company_account_slip_search);
+  const accountCrossBlock = document.getElementById('accountCrossCompanyBlock');
+  if (accountCrossBlock) accountCrossBlock.hidden = !((data.account_cross_company || []).length > 0);
+  const crossSearchBlock = document.getElementById('crossCompanyAccountSlipSearchBlock');
+  const crossSearchData = data.cross_company_account_slip_search || {{}};
+  if (crossSearchBlock) crossSearchBlock.hidden = !(crossSearchData.is_cross_company === true && (crossSearchData.company_count || 0) > 0);
   wireAccountSearchButtons();
   const selectedBotRow = (data.telegram_bots || []).find(b => b.bot_key === selectedBot) || {{}};
   if (!document.getElementById('companyName').value) document.getElementById('companyName').value = selectedBotRow.company_name || selectedBot || '';
@@ -4630,7 +4653,8 @@ document.getElementById('reconcileCompanyFilter').addEventListener('change', upd
 document.getElementById('reconcileFlowFilter').addEventListener('change', updateReconcileScopePreview);
 document.getElementById('exportStartDate').addEventListener('change', updateExcel);
 document.getElementById('exportEndDate').addEventListener('change', updateExcel);
-document.getElementById('slipSearch').addEventListener('keydown', (event) => {{ if (event.key === 'Enter') load({{scrollTop:true}}); }});
+document.getElementById('slipSearch').addEventListener('keydown', (event) => {{ if (event.key === 'Enter') {{ window.__accountSearchMode = 'scoped'; load({{scrollTop:true}}); }} }});
+try {{ if (location.search && /[?&]token=/.test(location.search)) {{ const cleaned = location.search.replace(/([?&])token=[^&]*/g, '$1').replace(/[?&]$/, '').replace(/&&+/g, '&').replace(/^\\?&/, '?'); window.history.replaceState({{}}, '', location.pathname + (cleaned && cleaned !== '?' ? cleaned : '') + location.hash); }} }} catch (e) {{}}
 load({{home:true, scrollTop:true, smooth:false}}); setInterval(load, 10000);
 </script>
 </body>
@@ -4641,19 +4665,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "AuditslipDashboard/1.0"
 
     def log_message(self, fmt: str, *args: Any) -> None:
+        # Access logging disabled to prevent token leakage in URL query strings.
         return
 
     def token_from_request(self) -> str:
-        parsed = urlparse(self.path)
-        q = parse_qs(parsed.query)
-        if q.get("token"):
-            return q["token"][0]
+        # Priority: (1) HttpOnly cookie, (2) Authorization: Bearer, (3) ?token= legacy fallback
+        # accepted ONLY on '/' or '/index.html' to prevent token leakage via Referer header on
+        # /api/* responses. After the first hit to '/', the cookie is set and the URL is scrubbed.
         cookie = self.headers.get("Cookie", "")
         for part in cookie.split(";"):
             if "=" in part:
                 k, v = part.strip().split("=", 1)
                 if k == COOKIE_NAME:
                     return v
+        auth = self.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            return auth.split(" ", 1)[1].strip()
+        parsed = urlparse(self.path)
+        if parsed.path in {"/", "/index.html"}:
+            q = parse_qs(parsed.query)
+            if q.get("token"):
+                return q["token"][0]
         return ""
 
     def authorized(self) -> bool:
@@ -4669,7 +4701,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return hashlib.sha256(tok.encode("utf-8", "replace")).hexdigest()[:12]
 
     def cookie_attrs(self) -> str:
-        attrs = ["HttpOnly", "SameSite=Lax", "Path=/"]
+        attrs = ["HttpOnly", "SameSite=Strict", "Path=/", "Max-Age=86400"]
         if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
             attrs.append("Secure")
         return "; ".join(attrs)
@@ -4734,7 +4766,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             flow_type = (q.get("flow_type") or ["all"])[0]
             slip_filter = (q.get("slip_filter") or ["all"])[0]
             slip_search = (q.get("slip_search") or [""])[0]
-            self.send_json(dashboard_snapshot(DB_PATH, chat_id=chat_id, bot_key=bot_key, flow_type=flow_type, scope=scope, slip_filter=slip_filter, slip_search=slip_search))
+            account_search_mode = (q.get("account_search_mode") or [""])[0] or "scoped"
+            self.send_json(dashboard_snapshot(DB_PATH, chat_id=chat_id, bot_key=bot_key, flow_type=flow_type, scope=scope, slip_filter=slip_filter, slip_search=slip_search, account_search_mode=account_search_mode))
             return
         if parsed.path == "/api/slip-image":
             q = parse_qs(parsed.query)
@@ -4853,6 +4886,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json(result, 200 if result.get("ok") else 400)
             return
         if parsed.path == "/api/account-limit":
+            request_id = uuid.uuid4().hex[:12]
             try:
                 result = save_account_limit(
                     DB_PATH,
@@ -4863,14 +4897,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     str(payload.get("account") or ""),
                     parse_number(payload.get("limit_amount")),
                 )
-                record_mutation(DB_PATH, "account_limit", actor=self.actor_fingerprint(), chat_id=str(payload.get("chat_id") or ""), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("limit_key") or result.get("error") or ""))
+                record_endpoint_mutation(DB_PATH, "account_limit", actor=self.actor_fingerprint(), request_id=request_id, chat_id=str(payload.get("chat_id") or ""), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("limit_key") or result.get("error") or ""))
+                if isinstance(result, dict):
+                    result["request_id"] = request_id
                 self.send_json(result)
             except Exception as exc:
                 logger.exception("api_account_limit failed")
-                record_mutation(DB_PATH, "account_limit", actor=self.actor_fingerprint(), chat_id=str(payload.get("chat_id") or ""), payload=payload, result_status="error", result_summary=safe_error(exc))
-                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+                record_endpoint_mutation(DB_PATH, "account_limit", actor=self.actor_fingerprint(), request_id=request_id, chat_id=str(payload.get("chat_id") or ""), payload=payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
             return
         if parsed.path == "/api/company-account":
+            request_id = uuid.uuid4().hex[:12]
             try:
                 result = save_company_account(
                     DB_PATH,
@@ -4882,27 +4919,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     account_name=str(payload.get("account_name") or ""),
                     daily_limit=parse_number(payload.get("daily_limit")),
                 )
-                record_mutation(DB_PATH, "company_account", actor=self.actor_fingerprint(), chat_id=str(payload.get("chat_id") or ""), bot_key=str(payload.get("bot_key") or "default"), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("account_key") or result.get("error") or ""))
+                record_endpoint_mutation(DB_PATH, "company_account", actor=self.actor_fingerprint(), request_id=request_id, chat_id=str(payload.get("chat_id") or ""), bot_key=str(payload.get("bot_key") or "default"), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("account_key") or result.get("error") or ""))
+                if isinstance(result, dict):
+                    result["request_id"] = request_id
                 self.send_json(result)
             except Exception as exc:
                 logger.exception("api_company_account failed")
-                record_mutation(DB_PATH, "company_account", actor=self.actor_fingerprint(), chat_id=str(payload.get("chat_id") or ""), bot_key=str(payload.get("bot_key") or "default"), payload=payload, result_status="error", result_summary=safe_error(exc))
-                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+                record_endpoint_mutation(DB_PATH, "company_account", actor=self.actor_fingerprint(), request_id=request_id, chat_id=str(payload.get("chat_id") or ""), bot_key=str(payload.get("bot_key") or "default"), payload=payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
             return
         if parsed.path == "/api/duplicate/unmark":
+            request_id = uuid.uuid4().hex[:12]
             slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
             bot_key_in = str(payload.get("bot_key") or "")
             try:
                 result = unmark_duplicate_slip(DB_PATH, slip_id_in, bot_key_in)
             except Exception as exc:
                 logger.exception("api_duplicate_unmark failed")
-                record_mutation(DB_PATH, "unmark_dup", actor=self.actor_fingerprint(), bot_key=bot_key_in, slip_id=slip_id_in, payload=payload, result_status="error", result_summary=safe_error(exc))
-                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+                record_endpoint_mutation(DB_PATH, "unmark_dup", actor=self.actor_fingerprint(), request_id=request_id, bot_key=bot_key_in, slip_id=slip_id_in, payload=payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
                 return
-            record_mutation(DB_PATH, "unmark_dup", actor=self.actor_fingerprint(), bot_key=bot_key_in, slip_id=slip_id_in, payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("previous_duplicate_of") or result.get("error") or ""))
+            record_endpoint_mutation(DB_PATH, "unmark_dup", actor=self.actor_fingerprint(), request_id=request_id, bot_key=bot_key_in, slip_id=slip_id_in, payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("previous_duplicate_of") or result.get("error") or ""))
+            if isinstance(result, dict):
+                result["request_id"] = request_id
             self.send_json(result, 200 if result.get("ok") else 400)
             return
         if parsed.path == "/api/slip/delete":
+            request_id = uuid.uuid4().hex[:12]
             slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
             bot_key_in = str(payload.get("bot_key") or "")
             try:
@@ -4914,13 +4957,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 )
             except Exception as exc:
                 logger.exception("api_slip_delete failed")
-                record_mutation(DB_PATH, "delete", actor=self.actor_fingerprint(), bot_key=bot_key_in, slip_id=slip_id_in, payload=payload, result_status="error", result_summary=safe_error(exc))
-                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+                record_endpoint_mutation(DB_PATH, "delete", actor=self.actor_fingerprint(), request_id=request_id, bot_key=bot_key_in, slip_id=slip_id_in, payload=payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
                 return
-            record_mutation(DB_PATH, "delete", actor=self.actor_fingerprint(), bot_key=bot_key_in, slip_id=slip_id_in, chat_id=str(result.get("chat_id") or ""), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("previous_status") or result.get("error") or ""))
+            record_endpoint_mutation(DB_PATH, "delete", actor=self.actor_fingerprint(), request_id=request_id, bot_key=bot_key_in, slip_id=slip_id_in, chat_id=str(result.get("chat_id") or ""), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("previous_status") or result.get("error") or ""))
+            if isinstance(result, dict):
+                result["request_id"] = request_id
             self.send_json(result, 200 if result.get("ok") else 400)
             return
         if parsed.path == "/api/slip/reprocess":
+            request_id = uuid.uuid4().hex[:12]
             slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
             bot_key_in = str(payload.get("bot_key") or "")
             try:
@@ -4929,12 +4975,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     slip_id_in,
                     bot_key_in,
                 )
-                record_mutation(DB_PATH, "reprocess", actor=self.actor_fingerprint(), bot_key=bot_key_in, slip_id=slip_id_in, payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("status") or result.get("error") or ""))
+                record_endpoint_mutation(DB_PATH, "reprocess", actor=self.actor_fingerprint(), request_id=request_id, bot_key=bot_key_in, slip_id=slip_id_in, payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("status") or result.get("error") or ""))
+                if isinstance(result, dict):
+                    result["request_id"] = request_id
                 self.send_json(result, 200 if result.get("ok") else 400)
             except Exception as exc:
                 logger.exception("api_slip_reprocess failed")
-                record_mutation(DB_PATH, "reprocess", actor=self.actor_fingerprint(), bot_key=bot_key_in, slip_id=slip_id_in, payload=payload, result_status="error", result_summary=safe_error(exc))
-                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+                record_endpoint_mutation(DB_PATH, "reprocess", actor=self.actor_fingerprint(), request_id=request_id, bot_key=bot_key_in, slip_id=slip_id_in, payload=payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
             return
         if parsed.path == "/api/bank-review/openai":
             slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
@@ -4976,6 +5024,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": safe_error(exc)}, 400)
             return
         if parsed.path == "/api/reconcile":
+            request_id = uuid.uuid4().hex[:12]
             try:
                 chat_id = str(payload.get("chat_id") or "")
                 bot_key = str(payload.get("bot_key") or "")
@@ -4983,17 +5032,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 scope = str(payload.get("scope") or "all")
                 excel_path = safe_backend_excel_path(uploaded_excel_path or str(payload.get("excel_path") or ""))
                 if not excel_path.exists():
-                    record_mutation(DB_PATH, "reconcile", actor=self.actor_fingerprint(), chat_id=chat_id, bot_key=bot_key, payload=payload, result_status="error", result_summary="excel not found")
-                    self.send_json({"ok": False, "error": f"excel not found: {excel_path}"}, 404)
+                    record_endpoint_mutation(DB_PATH, "reconcile", actor=self.actor_fingerprint(), request_id=request_id, chat_id=chat_id, bot_key=bot_key, payload=payload, result_status="error", result_summary="excel not found")
+                    self.send_json({"ok": False, "error": f"excel not found: {excel_path}", "request_id": request_id}, 404)
                     return
                 result = reconcile_backend_excel(DB_PATH, excel_path, chat_id=chat_id, scope=scope, bot_key=bot_key, flow_type=flow_type)
                 summary = f"diff={result.get('diff_amount')} matched={result.get('matched', {}).get('count')} missing={result.get('missing', {}).get('count')} extra={result.get('extra', {}).get('count')}"
-                record_mutation(DB_PATH, "reconcile", actor=self.actor_fingerprint(), chat_id=chat_id, bot_key=bot_key, payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=summary)
+                record_endpoint_mutation(DB_PATH, "reconcile", actor=self.actor_fingerprint(), request_id=request_id, chat_id=chat_id, bot_key=bot_key, payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=summary)
+                if isinstance(result, dict):
+                    result["request_id"] = request_id
                 self.send_json(result)
             except Exception as exc:
                 logger.exception("api_reconcile failed")
-                record_mutation(DB_PATH, "reconcile", actor=self.actor_fingerprint(), payload=payload, result_status="error", result_summary=safe_error(exc))
-                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+                record_endpoint_mutation(DB_PATH, "reconcile", actor=self.actor_fingerprint(), request_id=request_id, payload=payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
             return
         self.send_json({"ok": False, "error": "not found"}, 404)
 
