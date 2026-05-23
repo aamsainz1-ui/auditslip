@@ -5260,7 +5260,7 @@ function pendingDisplayTime(value) {{
   if (!s) return '-';
   return esc(s.replace('T', ' ').replace(/\\.[0-9]+Z?$/, '').replace(/Z$/, ''));
 }}
-function pendingRowsTable(rows) {{
+function pendingRowsTable(rows, currentActor) {{
   if (!rows || !rows.length) return '<div class="muted">ไม่มีคำขอในสถานะนี้</div>';
   const head = '<thead><tr>'+
     '<th>ID</th>'+
@@ -5277,9 +5277,15 @@ function pendingRowsTable(rows) {{
     const action = String(r.action || '');
     const summary = pendingPayloadSummaryText(r.payload_summary || {{}});
     const actionCell = pendingActionEmoji(action) + ' ' + esc(action) + (summary ? '<div class="mini muted">'+summary+'</div>' : '');
+    const isSelfRequest = currentActor && String(r.requested_by || '') === String(currentActor);
     const buttons = [];
     if (status === 'pending') {{
-      buttons.push('<button data-pending-id="'+id+'" data-admin-only="true" onclick="approvePending('+id+')">อนุมัติ</button>');
+      if (isSelfRequest) {{
+        buttons.push('<button disabled title="คำขอที่คุณสร้างเอง ต้องใช้ token อื่นอนุมัติ">ใช้ token อื่นอนุมัติ</button>');
+        buttons.push('<span class="mini warn">คำขอที่คุณสร้างเอง · ห้าม self-approve</span>');
+      }} else {{
+        buttons.push('<button data-pending-id="'+id+'" data-admin-only="true" onclick="approvePending('+id+')">อนุมัติ</button>');
+      }}
       buttons.push('<button class="danger" data-pending-id="'+id+'" data-admin-only="true" onclick="rejectPending('+id+')">ปฏิเสธ</button>');
       buttons.push('<button data-pending-id="'+id+'" onclick="cancelPending('+id+')">ยกเลิก</button>');
     }} else if (status === 'approved') {{
@@ -5314,7 +5320,7 @@ async function loadPendingActions(options={{}}) {{
     }}
     const data = await res.json();
     const rows = (data && data.items) || [];
-    container.innerHTML = pendingRowsTable(rows);
+    container.innerHTML = pendingRowsTable(rows, data.current_actor || '');
     enhanceResponsiveTables(container);
     if (meta) meta.textContent = 'พบ ' + (data.count || rows.length || 0) + ' รายการ';
     if (status === 'pending') {{ updatePendingBadge(rows.length); }}
@@ -5880,7 +5886,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 limit = 200
             rows = list_pending_actions(DB_PATH, status=status_filter, limit=limit)
-            self.send_json({"ok": True, "items": rows, "count": len(rows)})
+            self.send_json({"ok": True, "items": rows, "count": len(rows), "current_actor": self.actor_fingerprint(), "current_role": self.actor_role()})
             return
         if parsed.path == "/api/slip-image":
             q = parse_qs(parsed.query)
