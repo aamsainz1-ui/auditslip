@@ -4665,16 +4665,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "AuditslipDashboard/1.0"
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        # Defensive: strip any token query param before discarding (logging is currently disabled).
-        try:
-            line = fmt % args if args else fmt
-            line = re.sub(r"(?i)([?&]token=)[^&\s\"']+", r"\1REDACTED", str(line))
-        except Exception:
-            pass
+        # Access logging disabled to prevent token leakage in URL query strings.
         return
 
     def token_from_request(self) -> str:
-        # Priority: (1) HttpOnly cookie, (2) Authorization: Bearer, (3) ?token= (legacy fallback).
+        # Priority: (1) HttpOnly cookie, (2) Authorization: Bearer, (3) ?token= legacy fallback
+        # accepted ONLY on '/' or '/index.html' to prevent token leakage via Referer header on
+        # /api/* responses. After the first hit to '/', the cookie is set and the URL is scrubbed.
         cookie = self.headers.get("Cookie", "")
         for part in cookie.split(";"):
             if "=" in part:
@@ -4685,9 +4682,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if auth.lower().startswith("bearer "):
             return auth.split(" ", 1)[1].strip()
         parsed = urlparse(self.path)
-        q = parse_qs(parsed.query)
-        if q.get("token"):
-            return q["token"][0]
+        if parsed.path in {"/", "/index.html"}:
+            q = parse_qs(parsed.query)
+            if q.get("token"):
+                return q["token"][0]
         return ""
 
     def authorized(self) -> bool:

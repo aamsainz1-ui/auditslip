@@ -354,28 +354,35 @@ def check_restart_backoff(
 
 
 def record_restart(log_path: Path, service: str, ts: datetime, window_min: int = RESTART_WINDOW_MIN) -> None:
+    import fcntl
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        log = json.loads(log_path.read_text()) if log_path.exists() else {}
-    except Exception:
-        log = {}
-    if not isinstance(log, dict):
-        log = {}
-    entries = list(log.get(service, []))
-    entries.append(ts.isoformat())
-    cutoff = ts - timedelta(minutes=window_min)
-    pruned: list[str] = []
-    for entry in entries:
+    lock_path = log_path.with_suffix(log_path.suffix + ".lock")
+    with open(lock_path, "a+") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
         try:
-            parsed = datetime.fromisoformat(entry)
-        except Exception:
-            continue
-        if parsed >= cutoff:
-            pruned.append(entry)
-    log[service] = pruned
-    tmp = log_path.with_suffix(log_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(log, ensure_ascii=False, indent=2))
-    tmp.replace(log_path)
+            try:
+                log = json.loads(log_path.read_text()) if log_path.exists() else {}
+            except Exception:
+                log = {}
+            if not isinstance(log, dict):
+                log = {}
+            entries = list(log.get(service, []))
+            entries.append(ts.isoformat())
+            cutoff = ts - timedelta(minutes=window_min)
+            pruned: list[str] = []
+            for entry in entries:
+                try:
+                    parsed = datetime.fromisoformat(entry)
+                except Exception:
+                    continue
+                if parsed >= cutoff:
+                    pruned.append(entry)
+            log[service] = pruned
+            tmp = log_path.with_suffix(log_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(log, ensure_ascii=False, indent=2))
+            tmp.replace(log_path)
+        finally:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
 
 
 def send_alerts(args: argparse.Namespace, alerts: list[Alert], report: dict[str, Any]) -> None:
