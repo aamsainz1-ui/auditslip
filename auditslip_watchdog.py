@@ -26,6 +26,9 @@ APP_DIR = Path(__file__).resolve().parent
 DEFAULT_ENV_FILE = Path("/etc/auditslip/auditslip.env")
 DEFAULT_DB = APP_DIR / "data" / "auditslip.db"
 DEFAULT_STATE = APP_DIR / "data" / "watchdog-state.json"
+DEFAULT_RESTART_LOG = APP_DIR / "data" / "watchdog_restart_log.json"
+RESTART_WINDOW_MIN = 60
+RESTART_MAX_PER_WINDOW = 3
 BKK = timezone(timedelta(hours=7))
 
 SECRET_KEY_RE = re.compile(r"(token|secret|password|api[_-]?key)", re.I)
@@ -137,6 +140,7 @@ def check_services(args: argparse.Namespace, alerts: list[Alert], report: dict[s
         (os.environ.get("AUDITSLIP_DASHBOARD_SERVICE", "auditslip-dashboard.service"), "dashboard"),
     ]
     auto_restart = env_bool("AUDITSLIP_WATCHDOG_AUTO_RESTART", True)
+    restart_log = Path(os.environ.get("AUDITSLIP_WATCHDOG_RESTART_LOG") or DEFAULT_RESTART_LOG)
     report["services"] = {}
     report["restarts"] = []
     for service, label in services:
@@ -154,11 +158,38 @@ def check_services(args: argparse.Namespace, alerts: list[Alert], report: dict[s
                 {"service": service, "state": state},
             )
         )
-        if auto_restart and not args.dry_run:
-            restart = run_cmd(["systemctl", "restart", service], timeout=20)
-            report["restarts"].append({"service": service, "exit_code": restart.returncode})
-        elif auto_restart and args.dry_run:
-            report["restarts"].append({"service": service, "dry_run": True})
+        if not auto_restart:
+            continue
+        now = datetime.now(BKK)
+        allowed, recent = check_restart_backoff(restart_log, service, now)
+        attempt = len(recent) + 1
+        if not allowed:
+            alerts.append(
+                Alert(
+                    "restart_blocked_backoff",
+                    "critical",
+                    f"{label} restart backoff tripped",
+                    f"{service} restarted >={RESTART_MAX_PER_WINDOW}x/hour, NOT restarting, investigate",
+                    {"service": service, "recent_count": len(recent), "window_min": RESTART_WINDOW_MIN},
+                )
+            )
+            report["restarts"].append({"service": service, "skipped": "backoff", "recent_count": len(recent)})
+            continue
+        alerts.append(
+            Alert(
+                "service_crash_restart",
+                "warning",
+                f"{label} crashed, restarting",
+                f"{service} crashed, restarting (attempt {attempt}/{RESTART_MAX_PER_WINDOW})",
+                {"service": service, "attempt": attempt, "max": RESTART_MAX_PER_WINDOW},
+            )
+        )
+        if args.dry_run:
+            report["restarts"].append({"service": service, "dry_run": True, "attempt": attempt})
+            continue
+        restart = run_cmd(["systemctl", "restart", service], timeout=20)
+        record_restart(restart_log, service, now)
+        report["restarts"].append({"service": service, "exit_code": restart.returncode, "attempt": attempt})
 
 
 def check_dashboard(args: argparse.Namespace, alerts: list[Alert], report: dict[str, Any]) -> None:
@@ -295,6 +326,56 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2))
     tmp.replace(path)
+
+
+def check_restart_backoff(
+    log_path: Path,
+    service: str,
+    now: datetime,
+    window_min: int = RESTART_WINDOW_MIN,
+    max_restarts: int = RESTART_MAX_PER_WINDOW,
+) -> tuple[bool, list[str]]:
+    """Return (allowed, recent_timestamps_in_window) for a candidate restart."""
+    try:
+        log = json.loads(log_path.read_text()) if log_path.exists() else {}
+    except Exception:
+        log = {}
+    entries = log.get(service, []) if isinstance(log, dict) else []
+    cutoff = now - timedelta(minutes=window_min)
+    recent: list[str] = []
+    for ts in entries:
+        try:
+            parsed = datetime.fromisoformat(ts)
+        except Exception:
+            continue
+        if parsed >= cutoff:
+            recent.append(ts)
+    return (len(recent) < max_restarts, recent)
+
+
+def record_restart(log_path: Path, service: str, ts: datetime, window_min: int = RESTART_WINDOW_MIN) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        log = json.loads(log_path.read_text()) if log_path.exists() else {}
+    except Exception:
+        log = {}
+    if not isinstance(log, dict):
+        log = {}
+    entries = list(log.get(service, []))
+    entries.append(ts.isoformat())
+    cutoff = ts - timedelta(minutes=window_min)
+    pruned: list[str] = []
+    for entry in entries:
+        try:
+            parsed = datetime.fromisoformat(entry)
+        except Exception:
+            continue
+        if parsed >= cutoff:
+            pruned.append(entry)
+    log[service] = pruned
+    tmp = log_path.with_suffix(log_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(log, ensure_ascii=False, indent=2))
+    tmp.replace(log_path)
 
 
 def send_alerts(args: argparse.Namespace, alerts: list[Alert], report: dict[str, Any]) -> None:
