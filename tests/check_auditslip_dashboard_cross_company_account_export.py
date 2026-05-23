@@ -34,7 +34,7 @@ for bot in bots.values():
     bot.init_db()
 
 
-def save(bot_key: str, slip_id: str, company: str, chat_id: str, title: str, amount: float, to_account: str, ref: str, duplicate: int = 0, date_iso: str = "2026-05-22") -> None:
+def save(bot_key: str, slip_id: str, company: str, chat_id: str, title: str, amount: float, to_account: str, ref: str, duplicate: int = 0, date_iso: str = "2026-05-22", from_account: str = "") -> None:
     bots[bot_key].save_slip({
         "id": slip_id,
         "bot_key": bot_key,
@@ -51,7 +51,7 @@ def save(bot_key: str, slip_id: str, company: str, chat_id: str, title: str, amo
         "transferor_name": f"ลูกค้า {company}",
         "recipient_name": company,
         "from_bank": "SCB",
-        "from_account": f"FROM-{bot_key}",
+        "from_account": from_account or f"FROM-{bot_key}",
         "to_bank": "KBANK",
         "to_account": to_account,
         "account_name": company,
@@ -62,11 +62,11 @@ def save(bot_key: str, slip_id: str, company: str, chat_id: str, title: str, amo
     })
 
 
-save("botA", "A_SHARED", "บริษัท A", "A_DEP", "บริษัท A ฝาก", 100.0, "SHARED-ACC-789", "RA01")
-save("botB", "B_SHARED", "บริษัท B", "B_DEP", "บริษัท B ฝาก/เติมมือ", 250.0, "SHARED-ACC-789", "RB02")
-save("botC", "C_OTHER", "บริษัท C", "C_DEP", "บริษัท C ฝาก", 999.0, "OTHER-ACC", "RC03")
-save("botB", "B_DUP", "บริษัท B", "B_DEP", "บริษัท B ฝาก/เติมมือ", 888.0, "SHARED-ACC-789", "RB04", duplicate=1)
-save("botA", "A_OLD", "บริษัท A", "A_DEP", "บริษัท A ฝาก", 777.0, "SHARED-ACC-789", "RA05", date_iso="2026-05-21")
+save("botA", "A_SHARED", "บริษัท A", "A_WD", "บริษัท A ถอน", 100.0, "DEST-A", "RA01", from_account="SHARED-ACC-789")
+save("botB", "B_SHARED", "บริษัท B", "B_WD", "บริษัท B ถอน", 250.0, "DEST-B", "RB02", from_account="SHARED-ACC-789")
+save("botC", "C_OTHER", "บริษัท C", "C_WD", "บริษัท C ถอน", 999.0, "DEST-C", "RC03", from_account="OTHER-ACC")
+save("botB", "B_DUP", "บริษัท B", "B_WD", "บริษัท B ถอน", 888.0, "DEST-B", "RB04", duplicate=1, from_account="SHARED-ACC-789")
+save("botA", "A_OLD", "บริษัท A", "A_WD", "บริษัท A ถอน", 777.0, "DEST-A", "RA05", date_iso="2026-05-21", from_account="SHARED-ACC-789")
 
 spec = importlib.util.spec_from_file_location("auditslip_dashboard", ROOT / "auditslip_dashboard.py")
 assert spec and spec.loader
@@ -76,7 +76,7 @@ spec.loader.exec_module(Dash)
 
 xlsx = Dash.export_cross_company_account_slips_excel(
     db_path,
-    flow_type="deposit",
+    flow_type="withdraw",
     scope="2026-05-22",
     search="SHAREDACC789",
 )

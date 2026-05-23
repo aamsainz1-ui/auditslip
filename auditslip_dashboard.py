@@ -13,6 +13,7 @@ import cgi
 import datetime as dt
 import hashlib
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -22,6 +23,19 @@ import tempfile
 import time
 import zipfile
 from copy import copy
+
+logger = logging.getLogger("auditslip.dashboard")
+if not logger.handlers:
+    _dh = logging.StreamHandler()
+    _dh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logger.addHandler(_dh)
+    logger.setLevel(logging.INFO)
+
+
+def safe_error(exc: Exception) -> str:
+    """Non-sensitive error label for HTTP responses. Full traceback goes to logger only."""
+    return type(exc).__name__
+
 
 import requests
 from openpyxl import Workbook
@@ -58,6 +72,10 @@ HOST = os.environ.get("AUDITSLIP_DASHBOARD_HOST", "0.0.0.0")
 PORT = int(os.environ.get("AUDITSLIP_DASHBOARD_PORT", "8095"))
 DASHBOARD_TOKEN = os.environ.get("AUDITSLIP_DASHBOARD_TOKEN", "")
 COOKIE_NAME = "auditslip_dashboard_token"
+TWALLET_DASHBOARD_URL = os.environ.get("AUDITSLIP_TWALLET_DASHBOARD_URL", "http://76.13.190.65:3051").rstrip("/")
+TWALLET_TIMEOUT_SECONDS = float(os.environ.get("AUDITSLIP_TWALLET_TIMEOUT", "2.5"))
+TWALLET_CACHE_TTL_SECONDS = float(os.environ.get("AUDITSLIP_TWALLET_CACHE_TTL", "20"))
+_TWALLET_SUMMARY_CACHE: Dict[str, Any] = {"ts": 0.0, "base_url": "", "data": None}
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -78,6 +96,73 @@ def aggregate_dicts(rows: Any) -> List[Dict[str, Any]]:
 
 def clean_display(value: Any) -> str:
     return " ".join(str(value or "").strip().split())
+
+
+def mask_phone(value: Any) -> str:
+    digits = re.sub(r"\D+", "", clean_display(value))
+    if len(digits) >= 5:
+        return f"{digits[:3]}***{digits[-2:]}"
+    return clean_display(value)
+
+
+def satang_to_baht(value: Any) -> float:
+    return round(parse_number(value) / 100.0, 2)
+
+
+def twallet_json(base_url: str, path: str) -> Dict[str, Any]:
+    response = requests.get(f"{base_url.rstrip('/')}{path}", timeout=TWALLET_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    data = response.json()
+    return data if isinstance(data, dict) else {}
+
+
+def fetch_twallet_summary(force: bool = False, base_url: str = "") -> Dict[str, Any]:
+    """Read a small, safe True Wallet dashboard summary for embedding in Auditslip."""
+    url = clean_display(base_url or TWALLET_DASHBOARD_URL).rstrip("/")
+    if not url:
+        return {"enabled": False, "ok": False, "error": "not configured"}
+    now = time.time()
+    cached = _TWALLET_SUMMARY_CACHE.get("data")
+    if (
+        not force
+        and cached
+        and _TWALLET_SUMMARY_CACHE.get("base_url") == url
+        and now - float(_TWALLET_SUMMARY_CACHE.get("ts") or 0) < TWALLET_CACHE_TTL_SECONDS
+    ):
+        return dict(cached)
+    try:
+        health = twallet_json(url, "/health")
+        balance = twallet_json(url, "/api/tm/balance")
+        daily = twallet_json(url, "/api/stats/daily?days=1")
+        last = twallet_json(url, "/api/tm/my-last-receive")
+        balance_data = balance.get("data") if isinstance(balance.get("data"), dict) else {}
+        daily_items = daily.get("items") if isinstance(daily.get("items"), list) else []
+        today = daily_items[-1] if daily_items else {}
+        last_data = last.get("data") if isinstance(last.get("data"), dict) else {}
+        summary = {
+            "enabled": True,
+            "ok": bool(health.get("ok")) and balance.get("status") == "ok" and bool(daily.get("ok")),
+            "tokens_loaded": bool(health.get("tokensLoaded")),
+            "tx_count": int(health.get("txCount") or 0),
+            "balance_amount": satang_to_baht(balance_data.get("balance")),
+            "mobile_masked": mask_phone(balance_data.get("mobile_no")),
+            "balance_updated_at": clean_display(balance_data.get("updated_at")),
+            "today_date": clean_display(today.get("date")),
+            "today_count": int(today.get("count") or 0),
+            "today_total": float(today.get("total") or 0),
+            "last_receive": {
+                "amount": satang_to_baht(last_data.get("amount")),
+                "sender_mobile": mask_phone(last_data.get("sender_mobile")),
+                "receiver_mobile": mask_phone(last_data.get("receiver_mobile")),
+                "received_time": clean_display(last_data.get("received_time")),
+                "event_type": clean_display(last_data.get("event_type") or "P2P"),
+            } if last_data else {},
+            "error": "",
+        }
+    except Exception as exc:
+        summary = {"enabled": True, "ok": False, "error": type(exc).__name__, "today_count": 0, "today_total": 0.0, "balance_amount": 0.0, "last_receive": {}}
+    _TWALLET_SUMMARY_CACHE.update({"ts": now, "base_url": url, "data": dict(summary)})
+    return summary
 
 
 def clean_company_name(value: Any, bot_key: Any = "") -> str:
@@ -699,10 +784,19 @@ def company_account_daily_totals(conn: sqlite3.Connection, where_clause: str, pa
     return out[:limit]
 
 
+def cross_company_withdraw_flow_type(flow_type: str) -> str:
+    """Cross-company account audits are for withdrawal/source accounts only."""
+    flow = normalize_flow_type(flow_type)
+    return "withdraw" if flow in {"all", "withdraw"} else ""
+
+
 def cross_company_account_usage(conn: sqlite3.Connection, scope: str = "all", flow_type: str = "all", selected_bot_key: str = "", search: str = "", limit: int = 120) -> List[Dict[str, Any]]:
-    """Find accounts that appear under more than one company in the selected period/flow."""
+    """Find withdrawal accounts that appear under more than one company in the selected period."""
+    effective_flow = cross_company_withdraw_flow_type(flow_type)
+    if not effective_flow:
+        return []
     clause, params, _ = global_scope_where(scope, success_only=True)
-    clause, params = apply_flow_sql(clause, params, flow_type)
+    clause, params = apply_flow_sql(clause, params, effective_flow)
     rows = conn.execute(
         f"""
         SELECT COALESCE(NULLIF(bot_key,''),'default') AS bot_key,
@@ -1813,17 +1907,27 @@ def account_slip_search_rows(conn: sqlite3.Connection, where_clause: str, params
 
 
 def cross_company_account_slip_search_rows(conn: sqlite3.Connection, scope: str = "all", flow_type: str = "all", search: str = "", limit: int = 120) -> Dict[str, Any]:
-    """Individual counted slip rows for one account across every company in the selected date/flow scope."""
+    """Individual counted withdrawal slip rows for one account across every company in the selected date scope."""
     query = clean_display(search)
     if not query:
         result = empty_account_slip_search(query)
-        result.update({"company_count": 0, "companies": []})
+        result.update({"company_count": 0, "companies": [], "is_cross_company": False})
+        return result
+    effective_flow = cross_company_withdraw_flow_type(flow_type)
+    if not effective_flow:
+        result = empty_account_slip_search(query)
+        result.update({"company_count": 0, "companies": [], "is_cross_company": False})
         return result
     where_clause, params, _ = global_scope_where(scope, success_only=True)
-    where_clause, params = apply_flow_sql(where_clause, params, flow_type)
+    where_clause, params = apply_flow_sql(where_clause, params, effective_flow)
     result = account_slip_search_rows(conn, where_clause, params, query, limit=limit)
     company_rows = result.get("companies") or []
-    result.update({"company_count": len(company_rows), "companies": company_rows})
+    company_count = len(company_rows)
+    if company_count < 2:
+        empty = empty_account_slip_search(query)
+        empty.update({"company_count": company_count, "companies": company_rows, "is_cross_company": False})
+        return empty
+    result.update({"company_count": company_count, "companies": company_rows, "is_cross_company": True})
     return result
 
 
@@ -1867,6 +1971,93 @@ def ensure_bank_review_log_table(conn: sqlite3.Connection) -> None:
         )
         """
     )
+
+
+_MUTATION_LOG_READY = False
+
+
+def ensure_dashboard_mutation_log_table(db_path: Path) -> None:
+    global _MUTATION_LOG_READY
+    if _MUTATION_LOG_READY:
+        return
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dashboard_mutation_log (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts_iso TEXT NOT NULL,
+              action TEXT NOT NULL,
+              actor TEXT,
+              chat_id TEXT,
+              bot_key TEXT,
+              slip_id TEXT,
+              payload_json TEXT,
+              result_status TEXT NOT NULL,
+              result_summary TEXT
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dashboard_mutation_log_ts ON dashboard_mutation_log(ts_iso)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dashboard_mutation_log_action ON dashboard_mutation_log(action)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dashboard_mutation_log_slip ON dashboard_mutation_log(slip_id)")
+        conn.commit()
+    _MUTATION_LOG_READY = True
+
+
+_MUTATION_PAYLOAD_REDACT_KEYS = {"token", "cookie", "authorization", "auth", "password", "secret"}
+
+
+def _sanitize_mutation_payload(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {"_raw_type": type(payload).__name__}
+    out: Dict[str, Any] = {}
+    for k, v in payload.items():
+        if k.lower() in _MUTATION_PAYLOAD_REDACT_KEYS:
+            out[k] = "***"
+        elif isinstance(v, (bytes, bytearray, memoryview)):
+            out[k] = f"<bytes:{len(v)}>"
+        elif isinstance(v, str) and len(v) > 500:
+            out[k] = v[:500] + "...(truncated)"
+        else:
+            out[k] = v
+    return out
+
+
+def record_mutation(
+    db_path: Path,
+    action: str,
+    *,
+    actor: str = "",
+    chat_id: str = "",
+    bot_key: str = "",
+    slip_id: str = "",
+    payload: Any = None,
+    result_status: str = "ok",
+    result_summary: str = "",
+) -> None:
+    """Append row to dashboard_mutation_log. Failure must not break the original mutation."""
+    try:
+        ensure_dashboard_mutation_log_table(db_path)
+        with connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO dashboard_mutation_log "
+                "(ts_iso, action, actor, chat_id, bot_key, slip_id, payload_json, result_status, result_summary) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    dt.datetime.now(dt.timezone.utc).isoformat(),
+                    action,
+                    actor or "",
+                    chat_id or "",
+                    bot_key or "",
+                    slip_id or "",
+                    json.dumps(_sanitize_mutation_payload(payload), ensure_ascii=False, default=str),
+                    result_status,
+                    (result_summary or "")[:500],
+                ),
+            )
+            conn.commit()
+    except Exception:
+        logger.exception("record_mutation failed action=%s", action)
 
 
 def openai_bank_double_check_slip(db_path: Path, slip_id: str, apply: bool = True) -> Dict[str, Any]:
@@ -2506,6 +2697,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
         "queue_attention_count": int(queue_attention_count),
     }
     exception_summary["total_count"] = sum(int(v or 0) for v in exception_summary.values())
+    twallet_summary = fetch_twallet_summary()
 
     return {
         "app": APP_NAME,
@@ -2537,6 +2729,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
             "source_bank_review_count": int(source_bank_review_total or 0),
         },
         "exception_summary": exception_summary,
+        "twallet_summary": twallet_summary,
         "slip_statuses": dict(slip_statuses),
         "jobs": dict(jobs),
         "chats": chat_dicts,
@@ -2566,11 +2759,19 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
 def safe_backend_excel_path(path_text: str = "") -> Path:
     base = Path(os.environ.get("AUDITSLIP_BACKEND_IMPORT_DIR", "/root/projects/auditslip/imports/backend"))
     base.mkdir(parents=True, exist_ok=True)
+    base_resolved = base.resolve()
     if path_text:
         path = Path(path_text).expanduser()
         if not path.is_absolute():
             path = base / path
-        return path
+        resolved = path.resolve()
+        try:
+            resolved.relative_to(base_resolved)
+        except ValueError:
+            raise PermissionError("excel path outside backend import dir")
+        if resolved.suffix.lower() not in {".xlsx", ".xlsm"}:
+            raise PermissionError("excel path must be .xlsx or .xlsm")
+        return resolved
     files = sorted([p for p in base.glob("*.xlsx") if p.is_file()], key=lambda p: p.stat().st_mtime, reverse=True)
     if not files:
         raise FileNotFoundError(f"ไม่พบไฟล์ .xlsx ใน {base}")
@@ -3335,7 +3536,7 @@ def render_dashboard_html(token: str = "") -> str:
           <label class="side-field"><span>ฝาก/ถอน</span><select id="flowFilter" title="เลือกกลุ่มฝาก/เติมมือหรือถอน"><option value="all">รวมทุกกลุ่ม</option><option value="withdraw">ทุกกลุ่มถอน</option><option value="deposit">ทุกกลุ่มฝาก/เติมมือ</option></select></label>
           <label class="side-field"><span>กลุ่ม</span><select id="chat" title="เลือกกลุ่มของบริษัท"></select></label>
           <label class="side-field"><span>รอบ</span><select id="scope"><option value="today" selected>วันนี้</option><option value="open">รอบเปิด</option><option value="all">ทั้งหมด</option></select></label>
-          <label class="side-field"><span>เลือกวันที่เดียว</span><input id="customDateFilter" type="date" title="เลือกวันที่เพื่อดูทุกตารางเฉพาะวันนั้น" /></label>
+          <label class="side-field"><span>เลือกวันที่เดียว</span><input id="customDateFilter" type="date" title="เลือกวันที่เพื่อดูทุกตารางเฉพาะวันนี้" /></label>
           <label class="side-field"><span>ช่วงวันที่เริ่ม</span><input id="summaryStartDate" type="date" title="วันที่เริ่มสำหรับสรุปแดชบอร์ด" /></label>
           <label class="side-field"><span>ช่วงวันที่สิ้นสุด</span><input id="summaryEndDate" type="date" title="วันที่สิ้นสุดสำหรับสรุปแดชบอร์ด" /></label>
           <label class="side-field"><span>สถานะสลิป</span><select id="slipFilter"><option value="all">สลิปทั้งหมด</option><option value="success">เฉพาะไม่ซ้ำ</option><option id="duplicateOnly" value="duplicate">สลิปซ้ำที่จับแล้ว</option><option value="issues">อ่านไม่ชัด/ error</option></select></label>
@@ -3400,8 +3601,10 @@ def render_dashboard_html(token: str = "") -> str:
       <div class="card"><div class="label">processing / failed</div><div id="processing" class="value">-</div></div>
       <div class="card"><div class="label">สลิปซ้ำตามช่วง</div><div id="duplicateCount" class="value warn">-</div><div id="duplicateAmount" class="mini"></div></div>
       <div class="card"><div class="label">รีเช็คธนาคารต้นทาง</div><div id="sourceBankReviewCount" class="value warn">-</div><div class="mini">success ไม่ซ้ำ แต่ยังไม่เจอธนาคารต้นทางจริง ๆ · ปลายทางว่างไม่นับเป็น issue</div></div>
+      <div class="card"><div class="label">True Wallet วันนี้</div><div id="twalletTodayAmount" class="value good">-</div><div id="twalletTodayMeta" class="mini">โหลดข้อมูล TWallet...</div></div>
     </section>
     <section id="section-operator-home" class="sections menu-section" hidden>
+      <div class="card"><h3>True Wallet</h3><div class="mini">ยอดจาก dashboard TWallet · แสดงเฉพาะยอด/จำนวน ไม่แสดง token หรือเบอร์เต็ม</div><div id="twalletSummary"></div></div>
       <div class="card"><h3>งานวันนี้</h3><div class="mini">ภาพรวมบริษัท · ฝาก/ถอน · รอบ สำหรับ operator บนมือถือ</div><div id="operatorHome"></div></div>
       <div class="card"><h3>รายการที่ต้องจัดการ</h3><div class="mini">รวมเฉพาะ exception ที่ควรเปิดดูต่อ: เกินวงเงิน, OCR issue, สลิปซ้ำ, รีเช็คธนาคาร</div><div id="exceptionQueue"></div></div>
     </section>
@@ -3411,7 +3614,7 @@ def render_dashboard_html(token: str = "") -> str:
     </section>
     <section id="section-company-accounts" class="sections menu-section" hidden>
       <div class="card"><h3>บริษัทย่อย/บัญชีรับเงิน</h3><div class="toolbar"><input id="companyName" placeholder="ชื่อบริษัท" /><input id="accountBank" placeholder="ธนาคาร" /><input id="accountNo" placeholder="เลขบัญชีที่ใช้" /><input id="accountName" placeholder="ชื่อบัญชีที่ใช้" /><input id="accountDailyLimit" type="number" step="0.01" placeholder="วงเงิน/วัน" /><button onclick="saveCompanyAccount()">บันทึกบัญชีบริษัท</button></div><div id="companyAccounts"></div></div>
-      <div class="card"><h3>รายการรายบัญชีตามวันที่</h3><div class="mini">บัญชีของบริษัท/ผู้โอน แยกตามวัน บริษัท และกลุ่มฝาก/ถอน ไม่นับสลิปซ้ำ · [กลุ่มฝาก/เติมมือ] [กลุ่มถอน] · กด “ดูสลิปบัญชีนี้” เพื่อเปิดรูปสลิปของบัญชีนั้น</div><div id="companyAccountDaily"></div><h3>ค้นหารายการสลิปตามบัญชี</h3><div class="mini">พิมพ์เลขบัญชี/ชื่อ/ธนาคารในช่องค้นหา ระบบจะแสดงจำนวนสลิป ยอดรวม และรูปสลิปทีละใบใน scope ที่เลือก</div><div id="accountSlipSearch"></div><h3>บัญชีที่พบข้ามบริษัท</h3><div id="accountCrossCompany"></div><h3>ค้นหาสลิปบัญชีข้ามบริษัท</h3><div class="mini">ใช้คำค้นเดียวกัน แต่ค้นทุกบริษัทในวันที่/ฝากถอนที่เลือก เพื่อดูสลิปพร้อมรูปของบัญชีที่ซ้ำข้ามบริษัท</div><div id="crossCompanyAccountSlipSearch"></div></div>
+      <div class="card"><h3>รายการรายบัญชีตามวันที่</h3><div class="mini">บัญชีของบริษัท/ผู้โอน แยกตามวัน บริษัท และกลุ่มฝาก/ถอน ไม่นับสลิปซ้ำ · [กลุ่มฝาก/เติมมือ] [กลุ่มถอน] · กด “ดูสลิปบัญชีนี้” เพื่อเปิดรูปสลิปของบัญชีนั้น</div><div id="companyAccountDaily"></div><h3>ค้นหารายการสลิปตามบัญชี</h3><div class="mini">พิมพ์เลขบัญชี/ชื่อ/ธนาคารในช่องค้นหา ระบบจะแสดงจำนวนสลิป ยอดรวม และรูปสลิปทีละใบใน scope ที่เลือก</div><div id="accountSlipSearch"></div><h3>บัญชีถอนที่พบข้ามบริษัท</h3><div class="mini">เฉพาะสลิปถอนเท่านั้น ไม่เอาชื่อ/บัญชีจากสลิปฝากหรือเติมมือมาแสดง</div><div id="accountCrossCompany"></div><h3>ค้นหาสลิปถอนข้ามบริษัท</h3><div class="mini">ค้นทุกบริษัทเฉพาะสลิปถอน เพื่อดูรูปสลิปของบัญชีถอนที่ซ้ำข้ามบริษัท</div><div id="crossCompanyAccountSlipSearch"></div></div>
     </section>
     <section id="section-date-sender" class="sections menu-section" hidden>
       <div class="card"><h3>กราฟรายวัน ฝาก/ถอน</h3><div class="mini">นับเฉพาะสลิป success ไม่ซ้ำ แยกกลุ่มฝาก/เติมมือและถอนตามวันที่ของสลิป</div><div id="dailyFlowChart"></div></div>
@@ -3650,7 +3853,7 @@ function aggregateTable(rows) {{ return table(rows, [['ชื่อ','name'], ['
 function sourceBankTable(rows) {{ return aggregateTable(rows); }}
 function dailyAccountLimitTable(rows) {{
   if (!rows || !rows.length) return '<div class="muted">ไม่มีข้อมูล</div>';
-  return '<div class="responsive-table"><table><thead><tr><th>วันที่</th><th>บัญชีผู้โอน (บริษัท)</th><th>เลขบัญชี</th><th>สลิป</th><th>ยอดวันนั้น</th><th>วงเงิน/วัน</th><th>เหลือ/เกิน</th></tr></thead><tbody>'+
+  return '<div class="responsive-table"><table><thead><tr><th>วันที่</th><th>บัญชีผู้โอน (บริษัท)</th><th>เลขบัญชี</th><th>สลิป</th><th>ยอดวันนี้</th><th>วงเงิน/วัน</th><th>เหลือ/เกิน</th></tr></thead><tbody>'+
     rows.map(r => '<tr>'+[
       '<td>'+esc(r.date || r.date_key || '-')+'</td>',
       '<td>'+esc(nameWithCompany(r))+'</td>',
@@ -3664,7 +3867,7 @@ function dailyAccountLimitTable(rows) {{
 function transferorLimitTable(rows) {{
   transferorRows = rows || [];
   if (!transferorRows.length) return '<div class="muted">ไม่มีข้อมูล</div>';
-  return '<div class="responsive-table"><table><thead><tr><th>วันที่</th><th>บัญชีผู้โอน (บริษัท)</th><th>บัญชี</th><th>สลิป</th><th>ยอดวันนั้น</th><th>วงเงิน/วัน</th><th>เหลือ/เกินวันนั้น</th><th class="action-col">จัดการ</th></tr></thead><tbody>'+
+  return '<div class="responsive-table"><table><thead><tr><th>วันที่</th><th>บัญชีผู้โอน (บริษัท)</th><th>บัญชี</th><th>สลิป</th><th>ยอดวันนี้</th><th>วงเงิน/วัน</th><th>เหลือ/เกินวันนี้</th><th class="action-col">จัดการ</th></tr></thead><tbody>'+
     transferorRows.map((r, i) => '<tr>'+[
       '<td>'+esc(r.date || r.date_key || '-')+'</td>',
       '<td>'+esc(nameWithCompany(r))+'</td>',
@@ -3806,6 +4009,17 @@ function renderCompanyOverview(rows) {{
 function renderSideCompanies(rows) {{
   if (!rows || !rows.length) return '<div class="muted">ยังไม่มีข้อมูลบริษัท</div>';
   return rows.map(r => '<button type="button" class="side-company" data-company-bot-key="'+esc(String(r.bot_key || 'default'))+'"><b>'+esc(r.company_name || r.bot_key || '-')+'</b><div class="mini">ถอน '+money(r.withdraw_open_amount || 0)+' / '+esc(r.withdraw_open_count || 0)+' สลิป · ฝาก '+money(r.deposit_open_amount || 0)+' / '+esc(r.deposit_open_count || 0)+' สลิป · ซ้ำ '+esc(r.duplicate_count || 0)+'</div></button>').join('');
+}}
+function renderTWalletSummary(t) {{
+  if (!t || t.enabled === false) return '<div class="muted">ยังไม่ได้ตั้งค่า True Wallet</div>';
+  if (!t.ok) return '<div class="bad"><b>True Wallet ดึงข้อมูลไม่ได้</b></div><div class="mini">'+esc(t.error || 'offline')+'</div>';
+  const last = t.last_receive || {{}};
+  const lastLine = last.amount ? 'ล่าสุด '+money(last.amount)+' · '+esc(last.sender_mobile || '-')+' → '+esc(last.receiver_mobile || '-')+' · '+esc(last.received_time || '-') : 'ยังไม่มีรายการล่าสุด';
+  return '<div class="operator-home-grid">'
+    + '<div class="operator-stat"><div class="mini">ยอดรับวันนี้</div><b>'+money(t.today_total || 0)+'</b><div class="mini">'+esc(t.today_count || 0)+' รายการ · '+esc(t.today_date || '')+'</div></div>'
+    + '<div class="operator-stat"><div class="mini">ยอดคงเหลือ</div><b>'+money(t.balance_amount || 0)+'</b><div class="mini">เบอร์ '+esc(t.mobile_masked || '-')+' · '+esc(t.balance_updated_at || '')+'</div></div>'
+    + '<div class="operator-stat"><div class="mini">รายการทั้งหมด</div><b>'+esc(t.tx_count || 0)+'</b><div class="mini">'+esc(lastLine)+'</div></div>'
+    + '</div>';
 }}
 function renderOperatorHome(rows) {{
   if (!rows || !rows.length) return '<div class="muted">ยังไม่มีข้อมูลบริษัท</div>';
@@ -4244,6 +4458,9 @@ async function load(options={{}}) {{
   document.getElementById('duplicateCount').textContent = data.totals.selected_duplicate_count || 0;
   document.getElementById('duplicateAmount').textContent = 'ยอดซ้ำ ' + money(data.totals.selected_duplicate_amount || 0);
   document.getElementById('sourceBankReviewCount').textContent = data.totals.source_bank_review_count || 0;
+  const tw = data.twallet_summary || {{}};
+  document.getElementById('twalletTodayAmount').textContent = tw.ok ? money(tw.today_total || 0) : '-';
+  document.getElementById('twalletTodayMeta').textContent = tw.ok ? ((tw.today_count || 0)+' รายการ · คงเหลือ '+money(tw.balance_amount || 0)) : ('TWallet: '+(tw.error || 'offline'));
   if (data.scope && ['today','open','all'].includes(String(data.scope))) scopeEl.value = data.scope;
   if (customDateEl && /^\d{{4}}-\d{{2}}-\d{{2}}$/.test(data.scope || '')) {{
     customDateEl.value = data.scope;
@@ -4263,6 +4480,7 @@ async function load(options={{}}) {{
   if (data.slip_filter) slipFilterEl.value = data.slip_filter;
   if (document.activeElement !== slipSearchEl) slipSearchEl.value = data.slip_search || currentSearch || '';
   document.getElementById('companyOverview').innerHTML = renderCompanyOverview(data.company_summary);
+  document.getElementById('twalletSummary').innerHTML = renderTWalletSummary(data.twallet_summary);
   document.getElementById('operatorHome').innerHTML = renderOperatorHome(data.company_summary);
   document.getElementById('exceptionQueue').innerHTML = renderExceptionQueue(data);
   wireExceptionButtons();
@@ -4435,7 +4653,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return ""
 
     def authorized(self) -> bool:
-        return bool(DASHBOARD_TOKEN) and self.token_from_request() == DASHBOARD_TOKEN
+        if not DASHBOARD_TOKEN:
+            return False
+        import hmac as _hmac
+        return _hmac.compare_digest(self.token_from_request(), DASHBOARD_TOKEN)
+
+    def actor_fingerprint(self) -> str:
+        tok = self.token_from_request()
+        if not tok:
+            return ""
+        return hashlib.sha256(tok.encode("utf-8", "replace")).hexdigest()[:12]
 
     def cookie_attrs(self) -> str:
         attrs = ["HttpOnly", "SameSite=Lax", "Path=/"]
@@ -4479,6 +4706,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not self.authorized():
             self.send_bytes(HTTPStatus.UNAUTHORIZED, b"Unauthorized", "text/plain; charset=utf-8")
             return
+        q = parse_qs(parsed.query)
+        if q.get("token") and parsed.path in {"/", "/index.html"}:
+            clean_q = {k: v for k, v in q.items() if k != "token"}
+            new_query = urlencode([(k, vv) for k, vs in clean_q.items() for vv in vs])
+            new_loc = parsed.path + (f"?{new_query}" if new_query else "")
+            self.send_response(HTTPStatus.FOUND)
+            for k, v in self.security_headers().items():
+                self.send_header(k, v)
+            self.send_header("Set-Cookie", f"{COOKIE_NAME}={DASHBOARD_TOKEN}; {self.cookie_attrs()}")
+            self.send_header("Location", new_loc)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if parsed.path in {"/", "/index.html"}:
             self.send_bytes(200, render_dashboard_html().encode("utf-8"), "text/html; charset=utf-8")
             return
@@ -4498,8 +4738,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             try:
                 body, mime = fetch_slip_image(DB_PATH, slip_id)
                 self.send_bytes(200, body, mime, {"Cache-Control": "private, max-age=86400"})
-            except Exception as exc:
+            except FileNotFoundError as exc:
                 self.send_json({"ok": False, "error": str(exc)}, 404)
+            except Exception as exc:
+                logger.exception("api_slip_image failed slip_id=%s", slip_id)
+                self.send_json({"ok": False, "error": safe_error(exc)}, 404)
             return
         if parsed.path == "/api/export":
             q = parse_qs(parsed.query)
@@ -4551,7 +4794,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     {"Content-Disposition": f'attachment; filename="{path.name}"'},
                 )
             except Exception as exc:
-                self.send_json({"ok": False, "error": str(exc)}, 400)
+                logger.exception("api_export failed")
+                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
             return
         self.send_json({"ok": False, "error": "not found"}, 404)
 
@@ -4594,7 +4838,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             bot_key = str(payload.get("bot_key") or "default")
             company_name = str(payload.get("company_name") or "")
             note = str(payload.get("note") or "dashboard close")
-            result = dashboard_close_period(DB_PATH, chat_id, note, bot_key=bot_key, company_name=company_name)
+            try:
+                result = dashboard_close_period(DB_PATH, chat_id, note, bot_key=bot_key, company_name=company_name)
+            except Exception as exc:
+                logger.exception("api_close failed")
+                record_mutation(DB_PATH, "close", actor=self.actor_fingerprint(), chat_id=chat_id, bot_key=bot_key, payload=payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+                return
+            record_mutation(DB_PATH, "close", actor=self.actor_fingerprint(), chat_id=chat_id, bot_key=bot_key, payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("settlement_id") or result.get("error") or ""))
             self.send_json(result, 200 if result.get("ok") else 400)
             return
         if parsed.path == "/api/account-limit":
@@ -4608,9 +4859,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     str(payload.get("account") or ""),
                     parse_number(payload.get("limit_amount")),
                 )
+                record_mutation(DB_PATH, "account_limit", actor=self.actor_fingerprint(), chat_id=str(payload.get("chat_id") or ""), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("limit_key") or result.get("error") or ""))
                 self.send_json(result)
             except Exception as exc:
-                self.send_json({"ok": False, "error": str(exc)}, 400)
+                logger.exception("api_account_limit failed")
+                record_mutation(DB_PATH, "account_limit", actor=self.actor_fingerprint(), chat_id=str(payload.get("chat_id") or ""), payload=payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
             return
         if parsed.path == "/api/company-account":
             try:
@@ -4624,60 +4878,98 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     account_name=str(payload.get("account_name") or ""),
                     daily_limit=parse_number(payload.get("daily_limit")),
                 )
+                record_mutation(DB_PATH, "company_account", actor=self.actor_fingerprint(), chat_id=str(payload.get("chat_id") or ""), bot_key=str(payload.get("bot_key") or "default"), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("account_key") or result.get("error") or ""))
                 self.send_json(result)
             except Exception as exc:
-                self.send_json({"ok": False, "error": str(exc)}, 400)
+                logger.exception("api_company_account failed")
+                record_mutation(DB_PATH, "company_account", actor=self.actor_fingerprint(), chat_id=str(payload.get("chat_id") or ""), bot_key=str(payload.get("bot_key") or "default"), payload=payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
             return
         if parsed.path == "/api/duplicate/unmark":
-            result = unmark_duplicate_slip(DB_PATH, str(payload.get("id") or payload.get("slip_id") or ""), str(payload.get("bot_key") or ""))
+            slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
+            bot_key_in = str(payload.get("bot_key") or "")
+            try:
+                result = unmark_duplicate_slip(DB_PATH, slip_id_in, bot_key_in)
+            except Exception as exc:
+                logger.exception("api_duplicate_unmark failed")
+                record_mutation(DB_PATH, "unmark_dup", actor=self.actor_fingerprint(), bot_key=bot_key_in, slip_id=slip_id_in, payload=payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+                return
+            record_mutation(DB_PATH, "unmark_dup", actor=self.actor_fingerprint(), bot_key=bot_key_in, slip_id=slip_id_in, payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("previous_duplicate_of") or result.get("error") or ""))
             self.send_json(result, 200 if result.get("ok") else 400)
             return
         if parsed.path == "/api/slip/delete":
-            result = delete_dashboard_slip(
-                DB_PATH,
-                str(payload.get("id") or payload.get("slip_id") or ""),
-                str(payload.get("bot_key") or ""),
-                str(payload.get("reason") or "dashboard operator delete"),
-            )
+            slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
+            bot_key_in = str(payload.get("bot_key") or "")
+            try:
+                result = delete_dashboard_slip(
+                    DB_PATH,
+                    slip_id_in,
+                    bot_key_in,
+                    str(payload.get("reason") or "dashboard operator delete"),
+                )
+            except Exception as exc:
+                logger.exception("api_slip_delete failed")
+                record_mutation(DB_PATH, "delete", actor=self.actor_fingerprint(), bot_key=bot_key_in, slip_id=slip_id_in, payload=payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+                return
+            record_mutation(DB_PATH, "delete", actor=self.actor_fingerprint(), bot_key=bot_key_in, slip_id=slip_id_in, chat_id=str(result.get("chat_id") or ""), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("previous_status") or result.get("error") or ""))
             self.send_json(result, 200 if result.get("ok") else 400)
             return
         if parsed.path == "/api/slip/reprocess":
+            slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
+            bot_key_in = str(payload.get("bot_key") or "")
             try:
                 result = reprocess_dashboard_slip(
                     DB_PATH,
-                    str(payload.get("id") or payload.get("slip_id") or ""),
-                    str(payload.get("bot_key") or ""),
+                    slip_id_in,
+                    bot_key_in,
                 )
+                record_mutation(DB_PATH, "reprocess", actor=self.actor_fingerprint(), bot_key=bot_key_in, slip_id=slip_id_in, payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("status") or result.get("error") or ""))
                 self.send_json(result, 200 if result.get("ok") else 400)
             except Exception as exc:
-                self.send_json({"ok": False, "error": str(exc)}, 400)
+                logger.exception("api_slip_reprocess failed")
+                record_mutation(DB_PATH, "reprocess", actor=self.actor_fingerprint(), bot_key=bot_key_in, slip_id=slip_id_in, payload=payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
             return
         if parsed.path == "/api/bank-review/openai":
+            slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
             try:
                 result = openai_bank_double_check_slip(
                     DB_PATH,
-                    str(payload.get("id") or payload.get("slip_id") or ""),
+                    slip_id_in,
                     apply=str(payload.get("apply", "true")).strip().lower() not in {"0", "false", "no"},
                 )
+                record_mutation(DB_PATH, "bank_review", actor=self.actor_fingerprint(), slip_id=slip_id_in, payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=json.dumps(result.get("applied") or result.get("error") or "", ensure_ascii=False, default=str)[:480])
                 self.send_json(result, 200 if result.get("ok") else 400)
             except Exception as exc:
-                self.send_json({"ok": False, "error": str(exc)}, 400)
+                logger.exception("api_bank_review_openai failed")
+                record_mutation(DB_PATH, "bank_review", actor=self.actor_fingerprint(), slip_id=slip_id_in, payload=payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
             return
         if parsed.path == "/api/bank-review/openai-all":
             try:
                 q = parse_qs(parsed.query)
+                chat_id_b = str(payload.get("chat_id") or (q.get("chat_id") or [""])[0] or "")
+                bot_key_b = str(payload.get("bot_key") or (q.get("bot_key") or [""])[0] or "")
                 result = openai_bank_recheck_scope(
                     DB_PATH,
-                    chat_id=str(payload.get("chat_id") or (q.get("chat_id") or [""])[0] or ""),
-                    bot_key=str(payload.get("bot_key") or (q.get("bot_key") or [""])[0] or ""),
+                    chat_id=chat_id_b,
+                    bot_key=bot_key_b,
                     scope=str(payload.get("scope") or (q.get("scope") or ["open"])[0] or "open"),
                     flow_type=str(payload.get("flow_type") or (q.get("flow_type") or ["all"])[0] or "all"),
                     search=str(payload.get("slip_search") or (q.get("slip_search") or [""])[0] or ""),
                     apply=str(payload.get("apply", "true")).strip().lower() not in {"0", "false", "no"},
                 )
+                ok_count = result.get("ok_count") or 0
+                fail_count = result.get("fail_count") or 0
+                status = "ok" if (result.get("ok") and fail_count == 0) else ("partial" if ok_count > 0 else "error")
+                record_mutation(DB_PATH, "bank_review_batch", actor=self.actor_fingerprint(), chat_id=chat_id_b, bot_key=bot_key_b, payload=payload, result_status=status, result_summary=f"ok={ok_count} fail={fail_count} total={result.get('total_count') or 0}")
                 self.send_json(result, 200 if result.get("ok") else 207)
             except Exception as exc:
-                self.send_json({"ok": False, "error": str(exc)}, 400)
+                logger.exception("api_bank_review_openai_all failed")
+                record_mutation(DB_PATH, "bank_review_batch", actor=self.actor_fingerprint(), payload=payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
             return
         if parsed.path == "/api/reconcile":
             try:
@@ -4687,12 +4979,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 scope = str(payload.get("scope") or "all")
                 excel_path = safe_backend_excel_path(uploaded_excel_path or str(payload.get("excel_path") or ""))
                 if not excel_path.exists():
+                    record_mutation(DB_PATH, "reconcile", actor=self.actor_fingerprint(), chat_id=chat_id, bot_key=bot_key, payload=payload, result_status="error", result_summary="excel not found")
                     self.send_json({"ok": False, "error": f"excel not found: {excel_path}"}, 404)
                     return
                 result = reconcile_backend_excel(DB_PATH, excel_path, chat_id=chat_id, scope=scope, bot_key=bot_key, flow_type=flow_type)
+                summary = f"diff={result.get('diff_amount')} matched={result.get('matched', {}).get('count')} missing={result.get('missing', {}).get('count')} extra={result.get('extra', {}).get('count')}"
+                record_mutation(DB_PATH, "reconcile", actor=self.actor_fingerprint(), chat_id=chat_id, bot_key=bot_key, payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=summary)
                 self.send_json(result)
             except Exception as exc:
-                self.send_json({"ok": False, "error": str(exc)}, 400)
+                logger.exception("api_reconcile failed")
+                record_mutation(DB_PATH, "reconcile", actor=self.actor_fingerprint(), payload=payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
             return
         self.send_json({"ok": False, "error": "not found"}, 404)
 

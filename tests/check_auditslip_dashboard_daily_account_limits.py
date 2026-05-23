@@ -160,9 +160,9 @@ for key in ordered_keys:
         assert key != "2026-05-22", ordered_keys
 
 html = Dash.render_dashboard_html("test-token")
-for marker in ["byAccountDay", "วงเงินรายวันต่อบัญชี", "ยอดวันนั้น", "วงเงิน/วัน", "dailyAccountLimitTable", "ตั้งวงเงินจากยอดรายวัน", "เหลือ/เกินวันนั้น"]:
+for marker in ["byAccountDay", "วงเงินรายวันต่อบัญชี", "ยอดวันนี้", "วงเงิน/วัน", "dailyAccountLimitTable", "ตั้งวงเงินจากยอดรายวัน", "เหลือ/เกินวันนี้"]:
     assert marker in html, marker
-for forbidden in ["ยอดรวมช่วง", "เหลือ/เกินจากยอดรวม"]:
+for forbidden in ["ยอดวันนั้น", "เหลือ/เกินวันนั้น", "วันนั้น", "ยอดรวมช่วง", "เหลือ/เกินจากยอดรวม"]:
     assert forbidden not in html, forbidden
 
 print("ok: daily account limits reset by date and account")

@@ -49,6 +49,7 @@ bot1.save_slip({**base, "id": "DEP1", "bot_key": "bot1", "company_name": "บร
 bot1.save_slip({**base, "id": "WDR1", "bot_key": "bot1", "company_name": "บริษัท 1", "chat_id": "CHAT_WDR", "chat_title": "บริษัท 1 ถอน", "message_id": 102, "file_id": "FWDR", "from_account": "SHARED-ACC-789", "to_account": "DEST-WDR", "amount": 222.0, "reference_no": "RWDR"})
 bot1.save_slip({**base, "id": "DUP1", "bot_key": "bot1", "company_name": "บริษัท 1", "chat_id": "CHAT_DEP", "chat_title": "บริษัท 1 ฝาก/เติมมือ", "message_id": 103, "file_id": "FDUP", "amount": 333.0, "reference_no": "RDUP", "is_duplicate": 1})
 bot2.save_slip({**base, "id": "DEP2", "bot_key": "bot2", "company_name": "บริษัท 2", "chat_id": "CHAT2_DEP", "chat_title": "บริษัท 2 ฝาก", "message_id": 201, "file_id": "FDEP2", "amount": 444.0, "reference_no": "RDEP2"})
+bot2.save_slip({**base, "id": "WDR2", "bot_key": "bot2", "company_name": "บริษัท 2", "chat_id": "CHAT2_WDR", "chat_title": "บริษัท 2 ถอน", "message_id": 202, "file_id": "FWDR2", "from_account": "SHARED-ACC-789", "to_account": "DEST-WDR2", "amount": 555.0, "reference_no": "RWDR2"})
 
 spec = importlib.util.spec_from_file_location("auditslip_dashboard", ROOT / "auditslip_dashboard.py")
 assert spec and spec.loader
@@ -93,8 +94,8 @@ cross_wb = load_workbook(cross_xlsx, data_only=True)
 assert {"CrossCompanyAccountSlips", "DepositSlips", "WithdrawSlips"}.issubset(set(cross_wb.sheetnames)), cross_wb.sheetnames
 _, cross_dep = records(cross_wb["DepositSlips"])
 _, cross_wdr = records(cross_wb["WithdrawSlips"])
-assert {str(r["reference_no"] or "") for r in cross_dep} == {"RDEP", "RDEP2"}, cross_dep
-assert [str(r["reference_no"] or "") for r in cross_wdr] == ["RWDR"], cross_wdr
+assert cross_dep == [], cross_dep
+assert [str(r["reference_no"] or "") for r in cross_wdr] == ["RWDR2", "RWDR"], cross_wdr
 assert all(str(r.get("slip_image_url") or "").startswith("/api/slip-image?id=") for r in cross_dep + cross_wdr)
 
 print("ok: dashboard Excel exports separate deposit and withdraw slip sheets")
