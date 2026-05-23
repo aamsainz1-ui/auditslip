@@ -3614,7 +3614,9 @@ def render_dashboard_html(token: str = "") -> str:
     </section>
     <section id="section-company-accounts" class="sections menu-section" hidden>
       <div class="card"><h3>บริษัทย่อย/บัญชีรับเงิน</h3><div class="toolbar"><input id="companyName" placeholder="ชื่อบริษัท" /><input id="accountBank" placeholder="ธนาคาร" /><input id="accountNo" placeholder="เลขบัญชีที่ใช้" /><input id="accountName" placeholder="ชื่อบัญชีที่ใช้" /><input id="accountDailyLimit" type="number" step="0.01" placeholder="วงเงิน/วัน" /><button onclick="saveCompanyAccount()">บันทึกบัญชีบริษัท</button></div><div id="companyAccounts"></div></div>
-      <div class="card"><h3>รายการรายบัญชีตามวันที่</h3><div class="mini">บัญชีของบริษัท/ผู้โอน แยกตามวัน บริษัท และกลุ่มฝาก/ถอน ไม่นับสลิปซ้ำ · [กลุ่มฝาก/เติมมือ] [กลุ่มถอน] · กด “ดูสลิปบัญชีนี้” เพื่อเปิดรูปสลิปของบัญชีนั้น</div><div id="companyAccountDaily"></div><h3>ค้นหารายการสลิปตามบัญชี</h3><div class="mini">พิมพ์เลขบัญชี/ชื่อ/ธนาคารในช่องค้นหา ระบบจะแสดงจำนวนสลิป ยอดรวม และรูปสลิปทีละใบใน scope ที่เลือก</div><div id="accountSlipSearch"></div><h3>บัญชีถอนที่พบข้ามบริษัท</h3><div class="mini">เฉพาะสลิปถอนเท่านั้น ไม่เอาชื่อ/บัญชีจากสลิปฝากหรือเติมมือมาแสดง</div><div id="accountCrossCompany"></div><h3>ค้นหาสลิปถอนข้ามบริษัท</h3><div class="mini">ค้นทุกบริษัทเฉพาะสลิปถอน เพื่อดูรูปสลิปของบัญชีถอนที่ซ้ำข้ามบริษัท</div><div id="crossCompanyAccountSlipSearch"></div></div>
+      <div class="card"><h3>ฝั่งถอน · รายบัญชีตามวันที่</h3><div class="mini">บัญชีของบริษัท/ผู้โอน [กลุ่มถอน] · บัญชีผู้โอน/ต้นทางจากกลุ่มถอน แยกตามวันและบริษัท วางไว้ก่อนเพื่อไม่ต้องเลื่อนผ่านรายการฝาก/เติมมือ</div><div id="companyAccountDailyWithdraw"></div></div>
+      <div class="card"><h3>ฝั่งฝาก/เติมมือ · รายบัญชีตามวันที่</h3><div class="mini">บัญชีของบริษัท/ผู้โอน [กลุ่มฝาก/เติมมือ] · บัญชีรับเงิน/ปลายทางจากกลุ่มฝาก/เติมมือ แยกไว้คนละส่วนกับฝั่งถอน</div><div id="companyAccountDailyDeposit"></div></div>
+      <div class="card"><h3>ค้นหารายการสลิปตามบัญชี</h3><div class="mini">พิมพ์เลขบัญชี/ชื่อ/ธนาคารในช่องค้นหา ระบบจะแสดงจำนวนสลิป ยอดรวม และรูปสลิปทีละใบใน scope ที่เลือก</div><div id="accountSlipSearch"></div><h3>บัญชีถอนที่พบข้ามบริษัท</h3><div class="mini">เฉพาะสลิปถอนเท่านั้น ไม่เอาชื่อ/บัญชีจากสลิปฝากหรือเติมมือมาแสดง</div><div id="accountCrossCompany"></div><h3>ค้นหาสลิปถอนข้ามบริษัท</h3><div class="mini">ค้นทุกบริษัทเฉพาะสลิปถอน เพื่อดูรูปสลิปของบัญชีถอนที่ซ้ำข้ามบริษัท</div><div id="crossCompanyAccountSlipSearch"></div></div>
     </section>
     <section id="section-date-sender" class="sections menu-section" hidden>
       <div class="card"><h3>กราฟรายวัน ฝาก/ถอน</h3><div class="mini">นับเฉพาะสลิป success ไม่ซ้ำ แยกกลุ่มฝาก/เติมมือและถอนตามวันที่ของสลิป</div><div id="dailyFlowChart"></div></div>
@@ -4462,7 +4464,7 @@ async function load(options={{}}) {{
   document.getElementById('twalletTodayAmount').textContent = tw.ok ? money(tw.today_total || 0) : '-';
   document.getElementById('twalletTodayMeta').textContent = tw.ok ? ((tw.today_count || 0)+' รายการ · คงเหลือ '+money(tw.balance_amount || 0)) : ('TWallet: '+(tw.error || 'offline'));
   if (data.scope && ['today','open','all'].includes(String(data.scope))) scopeEl.value = data.scope;
-  if (customDateEl && /^\d{{4}}-\d{{2}}-\d{{2}}$/.test(data.scope || '')) {{
+  if (customDateEl && /^\\d{{4}}-\\d{{2}}-\\d{{2}}$/.test(data.scope || '')) {{
     customDateEl.value = data.scope;
     if (summaryStartEl) summaryStartEl.value = '';
     if (summaryEndEl) summaryEndEl.value = '';
@@ -4492,7 +4494,9 @@ async function load(options={{}}) {{
   const activeSummary = document.getElementById('activeSelectionSummary');
   if (activeSummary) activeSummary.innerHTML = '<div><b>'+esc(selectedBot === '__all__' ? 'ทุกบริษัท' : (selectedBot || '-'))+'</b> · '+esc(flowName(data.flow_type || activeFlow))+' · '+esc(data.scope_label || data.scope || scopeName(data.scope || ''))+'</div><div class="mini">ใช้ตัวกรองและส่งออก Excel ได้จาก side menu ด้านซ้าย</div>';
   document.getElementById('companyAccounts').innerHTML = renderCompanyAccounts(data.company_accounts);
-  document.getElementById('companyAccountDaily').innerHTML = renderCompanyAccountDaily(data.company_account_daily);
+  const accountDailyRows = data.company_account_daily || [];
+  document.getElementById('companyAccountDailyWithdraw').innerHTML = renderCompanyAccountDaily(accountDailyRows.filter(r => r.flow_type === 'withdraw'));
+  document.getElementById('companyAccountDailyDeposit').innerHTML = renderCompanyAccountDaily(accountDailyRows.filter(r => r.flow_type === 'deposit'));
   document.getElementById('accountSlipSearch').innerHTML = renderAccountSlipSearch(data.account_slip_search);
   document.getElementById('accountCrossCompany').innerHTML = renderAccountCrossCompany(data.account_cross_company);
   document.getElementById('crossCompanyAccountSlipSearch').innerHTML = renderCrossCompanyAccountSlipSearch(data.cross_company_account_slip_search);
