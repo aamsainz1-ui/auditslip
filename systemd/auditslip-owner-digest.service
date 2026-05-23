@@ -1,0 +1,11 @@
+[Unit]
+Description=Auditslip Owner Digest
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/auditslip/auditslip.env
+WorkingDirectory=/root/projects/auditslip
+ExecStart=/usr/bin/python3 /root/projects/auditslip/tools/owner_digest.py
+StandardOutput=journal
+StandardError=journal
