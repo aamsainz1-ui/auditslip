@@ -21,8 +21,8 @@ assert "window.history.scrollRestoration = 'auto'" not in html
 # Initial page boot and the explicit refresh button should return to top home; background polling must not scroll.
 assert "refreshDashboardHome" in html
 assert "topRefreshButton" in html
-assert "load({home:true, scrollTop:true, smooth:false}); setInterval(load, 10000)" in html
-assert "setInterval(load, 10000)" in html
+assert "load({home:true, scrollTop:true, smooth:false}); setInterval(() => load({lite:true}), 10000)" in html
+assert "setInterval(() => load({lite:true}), 10000)" in html
 assert "onclick=\"refreshDashboardHome()\"" in html
 
 # Browser refresh/entry should always open the combined dashboard home instead of a stale tool page.

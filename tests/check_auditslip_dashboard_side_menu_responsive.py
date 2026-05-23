@@ -56,7 +56,7 @@ for marker in [
     "refreshDashboardHome",
     "showMenuSection('section-operator-home', {scroll:false, persist:false})",
     "load({home:true, scrollTop:true, smooth:false})",
-    "setInterval(load, 10000)",
+    "setInterval(() => load({lite:true}), 10000)",
 ]:
     assert marker in html, marker
 

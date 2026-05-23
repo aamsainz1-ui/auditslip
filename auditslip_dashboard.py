@@ -1808,6 +1808,46 @@ def empty_account_slip_search(search: str = "") -> Dict[str, Any]:
     return {"query": clean_display(search), "count": 0, "amount": 0.0, "rows": [], "truncated": False}
 
 
+DASHBOARD_LITE_EMPTY_ARRAY_KEYS = (
+    "recent",
+    "duplicate_pairs",
+    "source_bank_review",
+    "deposit_customer_slips",
+    "issues",
+    "jobs_recent",
+    "provider_usage",
+    "company_account_daily",
+    "account_cross_company",
+    "by_transferor",
+    "by_account_day",
+    "by_date",
+    "daily_flow_summary",
+    "by_from_bank",
+    "by_to_bank",
+    "by_sender",
+)
+
+
+def lite_dashboard_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a polling-safe dashboard payload with totals/navigation only.
+
+    The browser auto-refresh runs every 10 seconds; it should not re-download slip-card
+    image URLs and detail tables unless the operator explicitly refreshes or changes a
+    filter.  Keep counts/totals/company navigation fresh, but strip detail-heavy arrays.
+    """
+    out = dict(snapshot)
+    out["detail_level"] = "lite"
+    out["detail_omitted"] = list(DASHBOARD_LITE_EMPTY_ARRAY_KEYS) + ["account_slip_search", "cross_company_account_slip_search"]
+    for key in DASHBOARD_LITE_EMPTY_ARRAY_KEYS:
+        out[key] = []
+    query = clean_display(snapshot.get("slip_search"))
+    out["account_slip_search"] = empty_account_slip_search(query)
+    cross_empty = empty_account_slip_search(query)
+    cross_empty.update({"company_count": 0, "companies": [], "is_cross_company": False})
+    out["cross_company_account_slip_search"] = cross_empty
+    return out
+
+
 def account_slip_match(row: sqlite3.Row, search: str) -> Tuple[str, str]:
     """Return matched account side for an operator account/name/bank search."""
     query = clean_display(search)
@@ -2880,10 +2920,13 @@ def company_overview_dicts(company_rows: List[sqlite3.Row], job_rows: List[sqlit
         out.append(item)
     return sorted(out, key=dict_company_sort_key)
 
-def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = "open", bot_key: str = "", slip_filter: str = "all", slip_search: str = "", flow_type: str = "all", account_search_mode: str = "") -> Dict[str, Any]:
+def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = "open", bot_key: str = "", slip_filter: str = "all", slip_search: str = "", flow_type: str = "all", account_search_mode: str = "", detail_level: str = "full") -> Dict[str, Any]:
     slip_filter_key = clean_display(slip_filter).lower() or "all"
     slip_search_key = clean_display(slip_search)
     flow_type_key = normalize_flow_type(flow_type)
+    detail_level_key = clean_display(detail_level).lower() or "full"
+    if detail_level_key not in {"full", "lite"}:
+        detail_level_key = "full"
     account_search_mode_key = clean_display(account_search_mode).lower()
     if account_search_mode_key not in {"scoped", "cross", "both", ""}:
         account_search_mode_key = ""
@@ -3302,9 +3345,10 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
     exception_summary["total_count"] = sum(int(v or 0) for v in exception_summary.values())
     twallet_summary = fetch_twallet_summary()
 
-    return {
+    snapshot = {
         "app": APP_NAME,
         "generated_at": int(time.time()),
+        "detail_level": detail_level_key,
         "selected_chat_id": selected_chat_id,
         "selected_bot_key": selected_bot_key,
         "scope": scope or "open",
@@ -3357,6 +3401,9 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
         "by_to_bank": aggregate_dicts(by_to_bank),
         "by_sender": rows_to_dicts(by_sender),
     }
+    if detail_level_key == "lite":
+        return lite_dashboard_snapshot(snapshot)
+    return snapshot
 
 
 def safe_backend_excel_path(path_text: str = "") -> Path:
@@ -5020,10 +5067,35 @@ async function load(options={{}}) {{
   const currentSearch = slipSearchEl.value || '';
   const requestChat = (current.bot_key === currentBot && (currentFlow === 'all' || current.flow_type === currentFlow)) ? current.chat_id : '';
   const accountSearchMode = (typeof window.__accountSearchMode === 'string') ? window.__accountSearchMode : '';
-  const res = await fetch('/api/summary'+query({{chat_id: requestChat, bot_key: currentBot, flow_type: currentFlow, scope: currentScope, slip_filter: currentFilter, slip_search: currentSearch, account_search_mode: accountSearchMode}}), {{cache:'no-store'}});
+  const detailLevel = (options && options.lite) ? 'lite' : 'full';
+  const res = await fetch('/api/summary'+query({{chat_id: requestChat, bot_key: currentBot, flow_type: currentFlow, scope: currentScope, slip_filter: currentFilter, slip_search: currentSearch, account_search_mode: accountSearchMode, detail: detailLevel}}), {{cache:'no-store'}});
   if (!res.ok) {{ document.body.innerHTML = '<main class="wrap"><div class="card bad">Unauthorized or dashboard unavailable</div></main>'; return; }}
   const data = await res.json();
-  currentSnapshot = data;
+  const isLiteSnapshot = data.detail_level === 'lite';
+  if (isLiteSnapshot && currentSnapshot) {{
+    currentSnapshot = Object.assign({{}}, currentSnapshot, data, {{
+      recent: currentSnapshot.recent || [],
+      duplicate_pairs: currentSnapshot.duplicate_pairs || [],
+      source_bank_review: currentSnapshot.source_bank_review || [],
+      deposit_customer_slips: currentSnapshot.deposit_customer_slips || [],
+      issues: currentSnapshot.issues || [],
+      jobs_recent: currentSnapshot.jobs_recent || [],
+      provider_usage: currentSnapshot.provider_usage || [],
+      company_account_daily: currentSnapshot.company_account_daily || [],
+      account_slip_search: currentSnapshot.account_slip_search || data.account_slip_search,
+      cross_company_account_slip_search: currentSnapshot.cross_company_account_slip_search || data.cross_company_account_slip_search,
+      account_cross_company: currentSnapshot.account_cross_company || [],
+      by_transferor: currentSnapshot.by_transferor || [],
+      by_account_day: currentSnapshot.by_account_day || [],
+      by_date: currentSnapshot.by_date || [],
+      daily_flow_summary: currentSnapshot.daily_flow_summary || [],
+      by_from_bank: currentSnapshot.by_from_bank || [],
+      by_to_bank: currentSnapshot.by_to_bank || [],
+      by_sender: currentSnapshot.by_sender || []
+    }});
+  }} else {{
+    currentSnapshot = data;
+  }}
   const selectedBot = data.selected_bot_key || currentBot || '__all__';
   const companyOptions = '<option value="__all__">ทุกบริษัท</option>' + (data.telegram_bots || []).map(b => '<option value="'+esc(b.bot_key)+'">'+esc(b.company_name || b.bot_key)+'</option>').join('');
   botEl.innerHTML = companyOptions;
@@ -5098,45 +5170,47 @@ async function load(options={{}}) {{
   closeOpenPeriodGuard();
   const activeSummary = document.getElementById('activeSelectionSummary');
   if (activeSummary) activeSummary.innerHTML = '<div><b>'+esc(selectedBot === '__all__' ? 'ทุกบริษัท' : (selectedBot || '-'))+'</b> · '+esc(flowName(data.flow_type || activeFlow))+' · '+esc(data.scope_label || data.scope || scopeName(data.scope || ''))+'</div><div class="mini">ใช้ตัวกรองและส่งออก Excel ได้จาก side menu ด้านซ้าย</div>';
-  document.getElementById('companyAccounts').innerHTML = renderCompanyAccounts(data.company_accounts);
-  const accountDailyRows = data.company_account_daily || [];
-  document.getElementById('companyAccountDailyWithdraw').innerHTML = renderCompanyAccountDaily(accountDailyRows.filter(r => r.flow_type === 'withdraw'));
-  document.getElementById('companyAccountDailyDeposit').innerHTML = renderCompanyAccountDaily(accountDailyRows.filter(r => r.flow_type === 'deposit'));
-  document.getElementById('accountSlipSearch').innerHTML = renderAccountSlipSearch(data.account_slip_search);
-  document.getElementById('accountCrossCompany').innerHTML = renderAccountCrossCompany(data.account_cross_company);
-  document.getElementById('crossCompanyAccountSlipSearch').innerHTML = renderCrossCompanyAccountSlipSearch(data.cross_company_account_slip_search);
-  const accountCrossBlock = document.getElementById('accountCrossCompanyBlock');
-  if (accountCrossBlock) accountCrossBlock.hidden = !((data.account_cross_company || []).length > 0);
-  const crossSearchBlock = document.getElementById('crossCompanyAccountSlipSearchBlock');
-  const crossSearchData = data.cross_company_account_slip_search || {{}};
-  if (crossSearchBlock) crossSearchBlock.hidden = !(crossSearchData.is_cross_company === true && (crossSearchData.company_count || 0) > 0);
-  wireAccountSearchButtons();
-  const selectedBotRow = (data.telegram_bots || []).find(b => b.bot_key === selectedBot) || {{}};
-  if (!document.getElementById('companyName').value) document.getElementById('companyName').value = selectedBotRow.company_name || selectedBot || '';
-  document.getElementById('dailyFlowChart').innerHTML = renderDailyFlowChart(data.daily_flow_summary);
-  document.getElementById('byDate').innerHTML = dateTable(data.by_date);
-  const withdrawSummary = document.getElementById('withdrawLimitSummary');
-  const depositSummary = document.getElementById('depositCustomerSummary');
-  if (withdrawSummary) withdrawSummary.textContent = 'ฝั่งถอน/วงเงิน: ' + (data.totals.withdraw_limit_count || 0) + ' สลิป · ' + money(data.totals.withdraw_limit_amount || 0) + ' · ไม่รวมฝาก/เติมมือ';
-  if (depositSummary) depositSummary.textContent = 'ฝั่งฝาก/เติมมือ: ' + (data.totals.deposit_customer_count || 0) + ' สลิป · ' + money(data.totals.deposit_customer_amount || 0) + ' · สลิปลูกค้า ไม่มีวงเงิน';
-  if (data.limit_check_enabled === false) {{
-    const limitNote = '<div class="muted">กลุ่มฝาก/เติมมือ ไม่ต้องเช็กวงเงิน</div>';
-    document.getElementById('byAccountDay').innerHTML = limitNote;
-    document.getElementById('byTransferor').innerHTML = limitNote;
-  }} else {{
-    document.getElementById('byAccountDay').innerHTML = dailyAccountLimitTable(data.by_account_day);
-    document.getElementById('byTransferor').innerHTML = transferorLimitTable(data.by_account_day);
+  if (!isLiteSnapshot) {{
+    document.getElementById('companyAccounts').innerHTML = renderCompanyAccounts(data.company_accounts);
+    const accountDailyRows = data.company_account_daily || [];
+    document.getElementById('companyAccountDailyWithdraw').innerHTML = renderCompanyAccountDaily(accountDailyRows.filter(r => r.flow_type === 'withdraw'));
+    document.getElementById('companyAccountDailyDeposit').innerHTML = renderCompanyAccountDaily(accountDailyRows.filter(r => r.flow_type === 'deposit'));
+    document.getElementById('accountSlipSearch').innerHTML = renderAccountSlipSearch(data.account_slip_search);
+    document.getElementById('accountCrossCompany').innerHTML = renderAccountCrossCompany(data.account_cross_company);
+    document.getElementById('crossCompanyAccountSlipSearch').innerHTML = renderCrossCompanyAccountSlipSearch(data.cross_company_account_slip_search);
+    const accountCrossBlock = document.getElementById('accountCrossCompanyBlock');
+    if (accountCrossBlock) accountCrossBlock.hidden = !((data.account_cross_company || []).length > 0);
+    const crossSearchBlock = document.getElementById('crossCompanyAccountSlipSearchBlock');
+    const crossSearchData = data.cross_company_account_slip_search || {{}};
+    if (crossSearchBlock) crossSearchBlock.hidden = !(crossSearchData.is_cross_company === true && (crossSearchData.company_count || 0) > 0);
+    wireAccountSearchButtons();
+    const selectedBotRow = (data.telegram_bots || []).find(b => b.bot_key === selectedBot) || {{}};
+    if (!document.getElementById('companyName').value) document.getElementById('companyName').value = selectedBotRow.company_name || selectedBot || '';
+    document.getElementById('dailyFlowChart').innerHTML = renderDailyFlowChart(data.daily_flow_summary);
+    document.getElementById('byDate').innerHTML = dateTable(data.by_date);
+    const withdrawSummary = document.getElementById('withdrawLimitSummary');
+    const depositSummary = document.getElementById('depositCustomerSummary');
+    if (withdrawSummary) withdrawSummary.textContent = 'ฝั่งถอน/วงเงิน: ' + (data.totals.withdraw_limit_count || 0) + ' สลิป · ' + money(data.totals.withdraw_limit_amount || 0) + ' · ไม่รวมฝาก/เติมมือ';
+    if (depositSummary) depositSummary.textContent = 'ฝั่งฝาก/เติมมือ: ' + (data.totals.deposit_customer_count || 0) + ' สลิป · ' + money(data.totals.deposit_customer_amount || 0) + ' · สลิปลูกค้า ไม่มีวงเงิน';
+    if (data.limit_check_enabled === false) {{
+      const limitNote = '<div class="muted">กลุ่มฝาก/เติมมือ ไม่ต้องเช็กวงเงิน</div>';
+      document.getElementById('byAccountDay').innerHTML = limitNote;
+      document.getElementById('byTransferor').innerHTML = limitNote;
+    }} else {{
+      document.getElementById('byAccountDay').innerHTML = dailyAccountLimitTable(data.by_account_day);
+      document.getElementById('byTransferor').innerHTML = transferorLimitTable(data.by_account_day);
+    }}
+    document.getElementById('depositCustomerSlips').innerHTML = recentCards(data.deposit_customer_slips || []);
+    document.getElementById('bySender').innerHTML = aggregateTable(data.by_sender);
+    document.getElementById('byFromBank').innerHTML = sourceBankTable(data.by_from_bank);
+    document.getElementById('byToBank').innerHTML = aggregateTable(data.by_to_bank);
+    document.getElementById('duplicatePairs').innerHTML = renderDuplicatePairs(data.duplicate_pairs);
+    wireDuplicateButtons();
+    document.getElementById('sourceBankReview').innerHTML = sourceBankReviewCards(data.source_bank_review);
+    document.getElementById('recent').innerHTML = recentCards(data.recent);
+    document.getElementById('issues').innerHTML = renderQueueIssues(data.jobs_recent || [], data.issues || []);
+    document.getElementById('usage').innerHTML = table(data.provider_usage, [['provider','provider'], ['model','model'], ['status','status'], ['count','count']]);
   }}
-  document.getElementById('depositCustomerSlips').innerHTML = recentCards(data.deposit_customer_slips || []);
-  document.getElementById('bySender').innerHTML = aggregateTable(data.by_sender);
-  document.getElementById('byFromBank').innerHTML = sourceBankTable(data.by_from_bank);
-  document.getElementById('byToBank').innerHTML = aggregateTable(data.by_to_bank);
-  document.getElementById('duplicatePairs').innerHTML = renderDuplicatePairs(data.duplicate_pairs);
-  wireDuplicateButtons();
-  document.getElementById('sourceBankReview').innerHTML = sourceBankReviewCards(data.source_bank_review);
-  document.getElementById('recent').innerHTML = recentCards(data.recent);
-  document.getElementById('issues').innerHTML = renderQueueIssues(data.jobs_recent || [], data.issues || []);
-  document.getElementById('usage').innerHTML = table(data.provider_usage, [['provider','provider'], ['model','model'], ['status','status'], ['count','count']]);
   enhanceResponsiveTables();
   updateReconcileScopePreview();
   updateExcel();
@@ -5242,7 +5316,7 @@ document.getElementById('exportStartDate').addEventListener('change', updateExce
 document.getElementById('exportEndDate').addEventListener('change', updateExcel);
 document.getElementById('slipSearch').addEventListener('keydown', (event) => {{ if (event.key === 'Enter') {{ window.__accountSearchMode = 'scoped'; load({{scrollTop:true}}); }} }});
 try {{ if (location.search && /[?&]token=/.test(location.search)) {{ const cleaned = location.search.replace(/([?&])token=[^&]*/g, '$1').replace(/[?&]$/, '').replace(/&&+/g, '&').replace(/^\\?&/, '?'); window.history.replaceState({{}}, '', location.pathname + (cleaned && cleaned !== '?' ? cleaned : '') + location.hash); }} }} catch (e) {{}}
-load({{home:true, scrollTop:true, smooth:false}}); setInterval(load, 10000);
+load({{home:true, scrollTop:true, smooth:false}}); setInterval(() => load({{lite:true}}), 10000);
 </script>
 </body>
 </html>"""
@@ -5417,7 +5491,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             slip_filter = (q.get("slip_filter") or ["all"])[0]
             slip_search = (q.get("slip_search") or [""])[0]
             account_search_mode = (q.get("account_search_mode") or [""])[0] or "scoped"
-            self.send_json(dashboard_snapshot(DB_PATH, chat_id=chat_id, bot_key=bot_key, flow_type=flow_type, scope=scope, slip_filter=slip_filter, slip_search=slip_search, account_search_mode=account_search_mode))
+            detail_level = (q.get("detail") or q.get("detail_level") or ["full"])[0]
+            self.send_json(dashboard_snapshot(DB_PATH, chat_id=chat_id, bot_key=bot_key, flow_type=flow_type, scope=scope, slip_filter=slip_filter, slip_search=slip_search, account_search_mode=account_search_mode, detail_level=detail_level))
             return
         if parsed.path == "/api/pending":
             try:
