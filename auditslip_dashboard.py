@@ -4724,7 +4724,7 @@ def render_dashboard_html(token: str = "") -> str:
     <section id="limitSection" class="sections menu-section" hidden>
       <div class="card"><h3>ยอดถอนรวม / วงเงินรวมทุกบัญชี</h3><div class="mini">รวมทุกบัญชีถอนในบริษัท/วันที่เลือก · วงเงินเป็นวงเงินรายวันรวมตามบัญชีและวันที่ใน scope</div><div id="withdrawLimitUsageChart"></div></div>
       <div class="card"><h3>ฝั่งถอน · วงเงินรายวันต่อบัญชี</h3><div id="withdrawLimitSummary" class="mini">นับเฉพาะกลุ่มถอน ไม่รวมฝาก/เติมมือ</div><div class="mini">แยกตามวันที่ของสลิปและเลขบัญชีผู้โอน วงเงิน/วันจะ reset ทุกวัน และไม่นับสลิปซ้ำ</div><div id="byAccountDay"></div></div>
-      <div class="card"><h3>ฝั่งถอน · ตั้งวงเงินจากยอดรายวัน</h3><div class="mini">แสดงแยกตามวันเท่านั้น ไม่มีการเอาวันอื่นมารวมกัน วงเงินรายวัน reset ทุกวัน</div><div class="toolbar"><input id="limitKey" placeholder="เลือกบัญชีจากปุ่มตั้งวงเงิน" readonly /><input id="limitName" placeholder="ชื่อบัญชี" /><input id="limitBank" placeholder="ธนาคาร" /><input id="limitAccount" placeholder="เลขบัญชี" /><input id="limitAmount" type="number" step="0.01" placeholder="วงเงินต่อวัน" /><button onclick="saveAccountLimit()">บันทึกวงเงิน</button><span class="muted">ตั้งวงเงินบัญชี</span></div><div id="byTransferor"></div></div>
+      <div class="card"><h3>ฝั่งถอน · ตั้งวงเงินจากยอดรายวัน</h3><div class="mini">ตั้งวงเงินบัญชี: กด “ตั้งวงเงิน” จากแถวบัญชี ระบบจะจำบริษัทของแถวนั้นให้เอง แม้ตอนดูรวมทุกบริษัท</div><div class="toolbar limit-edit-form"><input id="limitKey" placeholder="เลือกบัญชีจากปุ่มตั้งวงเงิน" readonly /><input id="limitScopeValue" placeholder="บริษัท/กลุ่มที่จะบันทึก" readonly /><input id="limitName" placeholder="ชื่อบัญชี" /><input id="limitBank" placeholder="ธนาคาร" /><input id="limitAccount" placeholder="เลขบัญชี" /><input id="limitAmount" type="number" step="0.01" placeholder="วงเงินต่อวัน" /><button onclick="saveAccountLimit()">บันทึกวงเงิน</button></div><div id="limitScopeHint" class="mini muted">เลือกบัญชีจากตารางด้านล่างก่อนแก้ไขวงเงิน</div><div id="byTransferor"></div></div>
     </section>
     <section id="section-deposit-slips" class="sections menu-section" hidden>
       <div class="card"><h3>ฝั่งฝาก/เติมมือ · สลิปลูกค้าฝาก/เติมมือ</h3><div id="depositCustomerSummary" class="mini">สลิปลูกค้า ไม่มีวงเงิน และไม่เอาไปรวมกับถอน/วงเงิน</div><div id="depositCustomerSlips"></div></div>
@@ -5463,10 +5463,20 @@ function wireDuplicateButtons() {{
 }}
 function pickLimitIndex(index) {{
   const r = transferorRows[index] || {{}};
-  pickLimit(r.limit_key || '', r.display_name || r.name || '', r.bank || '', r.account || '', Number((r.limit_amount ?? r.daily_limit) || 0));
+  pickLimit(r.limit_key || '', r.display_name || r.name || '', r.bank || '', r.account || '', Number((r.limit_amount ?? r.daily_limit) || 0), r.bot_key || '');
 }}
-function pickLimit(limitKey, name, bank, account, amount) {{
+function selectedLimitScopeKey(botKey='') {{
+  const bot = botKey || '';
+  if (bot && bot !== '__all__' && bot !== 'all') return 'bot:' + bot;
+  return limitScopeKey();
+}}
+function pickLimit(limitKey, name, bank, account, amount, botKey='') {{
   document.getElementById('limitKey').value = limitKey;
+  const scope = selectedLimitScopeKey(botKey);
+  const scopeEl = document.getElementById('limitScopeValue');
+  if (scopeEl) scopeEl.value = scope;
+  const hint = document.getElementById('limitScopeHint');
+  if (hint) hint.textContent = scope ? ('จะบันทึกวงเงินใน scope: ' + scope) : 'ไม่พบบริษัทของบัญชีนี้ กรุณาเลือกบริษัทก่อนบันทึก';
   document.getElementById('limitName').value = name;
   document.getElementById('limitBank').value = bank;
   document.getElementById('limitAccount').value = account;
@@ -5480,7 +5490,8 @@ function limitScopeKey() {{
   return '';
 }}
 async function saveAccountLimit() {{
-  const scopeKey = limitScopeKey();
+  const selectedScopeEl = document.getElementById('limitScopeValue');
+  const scopeKey = (selectedScopeEl && selectedScopeEl.value) ? selectedScopeEl.value : limitScopeKey();
   const payload = {{chat_id: scopeKey, limit_key: document.getElementById('limitKey').value, display_name: document.getElementById('limitName').value, bank: document.getElementById('limitBank').value, account: document.getElementById('limitAccount').value, limit_amount: Number(document.getElementById('limitAmount').value || 0)}};
   if (!payload.chat_id) return await dashboardNotify('เลือกบริษัทหรือกลุ่มก่อนตั้งวงเงิน');
   if (!payload.limit_key) return await dashboardNotify('เลือกบัญชีจากปุ่มตั้งวงเงินก่อน');
