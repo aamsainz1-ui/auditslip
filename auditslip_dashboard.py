@@ -4135,6 +4135,13 @@ def render_dashboard_html(token: str = "") -> str:
     .good {{ color:var(--good); }} .warn {{ color:var(--warn); }} .bad {{ color:var(--bad); }}
     .sections {{ display:grid; grid-template-columns: 1.2fr .8fr; gap:14px; margin-top:14px; }}
     .menu-section[hidden] {{ display:none !important; }}
+    .pending-badge {{ display:inline-block; min-width:18px; padding:1px 6px; margin-left:6px; border-radius:999px; background:#dc2626; color:#fff; font-size:11px; font-weight:800; line-height:16px; text-align:center; vertical-align:middle; }}
+    .pending-badge[hidden] {{ display:none !important; }}
+    .pending-toolbar {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:8px 0; }}
+    .pending-toast-host {{ position:fixed; right:16px; bottom:16px; display:flex; flex-direction:column; gap:8px; z-index:9999; }}
+    .pending-toast {{ background:rgba(15,23,42,.95); border:1px solid var(--line); color:#e2e8f0; padding:10px 14px; border-radius:10px; box-shadow:0 12px 30px rgba(0,0,0,.35); font-size:13px; max-width:320px; }}
+    .pending-toast.success {{ border-color:rgba(34,197,94,.55); }}
+    .pending-toast.error {{ border-color:rgba(220,38,38,.55); }}
     .responsive-table {{ width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }}
     table {{ width:100%; border-collapse:collapse; font-size:13px; min-width:620px; }}
     th,td {{ text-align:left; padding:9px 8px; border-bottom:1px solid var(--line); vertical-align:top; }}
@@ -4265,6 +4272,7 @@ def render_dashboard_html(token: str = "") -> str:
             <button class="side-menu-item" type="button" data-menu-target="all" onclick="showAllMenuSections()"><span class="side-menu-icon">⌘</span><span class="side-menu-text"><span class="side-menu-title">แสดงทั้งหมด</span><span class="side-menu-desc">ทุกการ์ดและทุกตาราง</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-overview" onclick="showMenuSection('section-overview')"><span class="side-menu-icon">▦</span><span class="side-menu-text"><span class="side-menu-title">ภาพรวม</span><span class="side-menu-desc">ยอดรวมแยกบริษัท</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-company-accounts" onclick="showMenuSection('section-company-accounts')"><span class="side-menu-icon">🏦</span><span class="side-menu-text"><span class="side-menu-title">บัญชี/ค้นสลิป</span><span class="side-menu-desc">บัญชีรับเงินและดูรูปสลิปต่อบัญชี</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-pending" onclick="showMenuSection('section-pending')"><span class="side-menu-icon">⏳</span><span class="side-menu-text"><span class="side-menu-title">รออนุมัติ <span id="pendingBadge" class="pending-badge" hidden>0</span></span><span class="side-menu-desc">two-person approval · ยังไม่ได้อนุมัติ</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-date-sender" onclick="showMenuSection('section-date-sender')"><span class="side-menu-icon">◷</span><span class="side-menu-text"><span class="side-menu-title">วันที่/ผู้ส่งรูป</span><span class="side-menu-desc">ยอดรายวันและคนส่งรูป</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="limitSection" onclick="showMenuSection('limitSection')"><span class="side-menu-icon">↯</span><span class="side-menu-text"><span class="side-menu-title">ฝั่งถอน/วงเงิน</span><span class="side-menu-desc">วงเงินรายวัน/ผู้โอนถอน</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-deposit-slips" onclick="showMenuSection('section-deposit-slips')"><span class="side-menu-icon">＋</span><span class="side-menu-text"><span class="side-menu-title">ฝาก/เติมมือ</span><span class="side-menu-desc">สลิปลูกค้า ไม่มีวงเงิน</span></span></button>
@@ -4357,7 +4365,31 @@ def render_dashboard_html(token: str = "") -> str:
       <div class="card"><h3>Recent slips</h3><div id="recent"></div></div>
       <div class="card"><h3>Queue / Issues</h3><div id="issues"></div><h3>Provider usage</h3><div id="usage"></div></div>
     </section>
+    <section id="section-pending" class="sections menu-section" hidden>
+      <div class="card">
+        <h3>รออนุมัติ (Two-person approval)</h3>
+        <div class="mini">รายการที่ผู้ใช้ขออนุมัติ — ต้องใช้คนละ token approve เท่านั้น</div>
+        <div class="pending-toolbar">
+          <label class="mini">สถานะ
+            <select id="pendingStatusFilter" title="กรองสถานะคำขอ">
+              <option value="pending">pending</option>
+              <option value="approved">approved</option>
+              <option value="executed">executed</option>
+              <option value="rejected">rejected</option>
+              <option value="cancelled">cancelled</option>
+              <option value="expired">expired</option>
+              <option value="all">ทั้งหมด</option>
+            </select>
+          </label>
+          <button id="pendingRefreshBtn" type="button" onclick="loadPendingActions({{scrollTop:false}})">รีเฟรช</button>
+          <span id="pendingMeta" class="mini muted">โหลด...</span>
+        </div>
+        <div id="pendingTableContainer"></div>
+        <div class="mini">approve/reject ทำได้เฉพาะ role admin หรือ auditor และห้าม self-approve</div>
+      </div>
+    </section>
     </main>
+    <div id="pendingToastHost" class="pending-toast-host" aria-live="polite"></div>
   </div>
   <div id="dashboardModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="dashboardModalTitle" aria-hidden="true">
     <div class="modal-card">
@@ -5103,6 +5135,217 @@ async function runReconcile() {{
   box.innerHTML = reconcileSummary(data);
   enhanceResponsiveTables(box);
 }}
+function showToast(msg, type='info') {{
+  try {{
+    const host = document.getElementById('pendingToastHost');
+    if (!host) {{ return; }}
+    const div = document.createElement('div');
+    div.className = 'pending-toast ' + (type === 'success' ? 'success' : (type === 'error' ? 'error' : ''));
+    div.textContent = String(msg || '');
+    host.appendChild(div);
+    setTimeout(() => {{ try {{ div.remove(); }} catch (e) {{}} }}, 4200);
+  }} catch (e) {{}}
+}}
+const PENDING_ACTION_ICONS = {{
+  'slip.delete': '🗑️',
+  'period.close': '🔒',
+  'account_limit': '💰',
+  'account_limit.delete': '💰',
+  'company_account': '🏦',
+  'company_account.delete': '🏦',
+  'reconcile': '🔁',
+  'token.create': '🔑',
+  'token.revoke': '🔑',
+  'token.update': '🔑'
+}};
+function pendingActionEmoji(action) {{
+  const key = String(action || '');
+  if (PENDING_ACTION_ICONS[key]) return PENDING_ACTION_ICONS[key];
+  if (key.startsWith('slip.delete') || key.endsWith('.delete')) return '🗑️';
+  if (key.startsWith('period.close') || key.endsWith('.close')) return '🔒';
+  if (key.startsWith('account_limit')) return '💰';
+  if (key.startsWith('company_account')) return '🏦';
+  if (key.startsWith('reconcile')) return '🔁';
+  if (key.startsWith('token.')) return '🔑';
+  return '•';
+}}
+function pendingPayloadSummaryText(summary) {{
+  if (!summary || typeof summary !== 'object') return '';
+  const parts = [];
+  ['id','slip_id','company_name','bot_key','chat_id','reason','note'].forEach(k => {{
+    if (summary[k] !== undefined && summary[k] !== null && String(summary[k]) !== '') {{
+      parts.push(esc(k) + ':' + esc(String(summary[k])));
+    }}
+  }});
+  return parts.join(' · ');
+}}
+function pendingShortFp(fp) {{
+  const s = String(fp || '');
+  if (!s) return '-';
+  return esc(s.substring(0, 8));
+}}
+function pendingStatusBadge(status) {{
+  const s = String(status || '');
+  const cls = (s === 'pending') ? 'warn' : (s === 'rejected' || s === 'expired' || s === 'cancelled') ? 'bad' : (s === 'executed' || s === 'approved') ? 'good' : '';
+  return '<span class="'+cls+'">'+esc(s || '-')+'</span>';
+}}
+function pendingDisplayTime(value) {{
+  const s = String(value || '');
+  if (!s) return '-';
+  return esc(s.replace('T', ' ').replace(/\\.[0-9]+Z?$/, '').replace(/Z$/, ''));
+}}
+function pendingRowsTable(rows) {{
+  if (!rows || !rows.length) return '<div class="muted">ไม่มีคำขอในสถานะนี้</div>';
+  const head = '<thead><tr>'+
+    '<th>ID</th>'+
+    '<th>Action</th>'+
+    '<th>ผู้ขอ</th>'+
+    '<th>เวลาขอ</th>'+
+    '<th>expire</th>'+
+    '<th>status</th>'+
+    '<th class="action-col">จัดการ</th>'+
+    '</tr></thead>';
+  const body = rows.map(r => {{
+    const id = Number(r.id || 0);
+    const status = String(r.status || '');
+    const action = String(r.action || '');
+    const summary = pendingPayloadSummaryText(r.payload_summary || {{}});
+    const actionCell = pendingActionEmoji(action) + ' ' + esc(action) + (summary ? '<div class="mini muted">'+summary+'</div>' : '');
+    const buttons = [];
+    if (status === 'pending') {{
+      buttons.push('<button data-pending-id="'+id+'" data-admin-only="true" onclick="approvePending('+id+')">อนุมัติ</button>');
+      buttons.push('<button class="danger" data-pending-id="'+id+'" data-admin-only="true" onclick="rejectPending('+id+')">ปฏิเสธ</button>');
+      buttons.push('<button data-pending-id="'+id+'" onclick="cancelPending('+id+')">ยกเลิก</button>');
+    }} else if (status === 'approved') {{
+      buttons.push('<button data-pending-id="'+id+'" data-admin-only="true" onclick="executePending('+id+')">execute</button>');
+    }}
+    const actionsHtml = buttons.length ? buttons.join(' ') : '<span class="muted mini">-</span>';
+    return '<tr>'+
+      '<td>'+esc(String(id))+'</td>'+
+      '<td>'+actionCell+'</td>'+
+      '<td>'+pendingShortFp(r.requested_by)+'</td>'+
+      '<td>'+pendingDisplayTime(r.requested_at)+'</td>'+
+      '<td>'+pendingDisplayTime(r.expires_at)+'</td>'+
+      '<td>'+pendingStatusBadge(status)+'</td>'+
+      '<td class="action-cell">'+actionsHtml+'</td>'+
+      '</tr>';
+  }}).join('');
+  return '<div class="responsive-table"><table>'+head+'<tbody>'+body+'</tbody></table></div>';
+}}
+async function loadPendingActions(options={{}}) {{
+  const filterEl = document.getElementById('pendingStatusFilter');
+  const container = document.getElementById('pendingTableContainer');
+  const meta = document.getElementById('pendingMeta');
+  if (!container) return;
+  const status = filterEl ? (filterEl.value || 'pending') : 'pending';
+  const qs = (status && status !== 'all') ? ('?status=' + encodeURIComponent(status)) : '';
+  try {{
+    const res = await fetch('/api/pending' + qs, {{cache:'no-store'}});
+    if (!res.ok) {{
+      container.innerHTML = '<div class="bad">โหลดรายการรออนุมัติไม่สำเร็จ ('+res.status+')</div>';
+      if (meta) meta.textContent = '';
+      return;
+    }}
+    const data = await res.json();
+    const rows = (data && data.items) || [];
+    container.innerHTML = pendingRowsTable(rows);
+    enhanceResponsiveTables(container);
+    if (meta) meta.textContent = 'พบ ' + (data.count || rows.length || 0) + ' รายการ';
+    if (status === 'pending') {{ updatePendingBadge(rows.length); }}
+  }} catch (err) {{
+    container.innerHTML = '<div class="bad">โหลดรายการรออนุมัติไม่สำเร็จ</div>';
+    if (meta) meta.textContent = '';
+  }}
+}}
+function updatePendingBadge(count) {{
+  const badge = document.getElementById('pendingBadge');
+  if (!badge) return;
+  const n = Number(count || 0);
+  if (n > 0) {{
+    badge.textContent = String(n);
+    badge.hidden = false;
+  }} else {{
+    badge.textContent = '0';
+    badge.hidden = true;
+  }}
+}}
+async function refreshPendingBadge() {{
+  try {{
+    const res = await fetch('/api/pending?status=pending', {{cache:'no-store'}});
+    if (!res.ok) return;
+    const data = await res.json();
+    updatePendingBadge((data && (data.count || (data.items || []).length)) || 0);
+  }} catch (err) {{}}
+}}
+async function approvePending(pendingId) {{
+  const ok = await dashboardConfirm('อนุมัติคำขอ #' + pendingId + '?', 'ยืนยันการอนุมัติ');
+  if (!ok) return;
+  try {{
+    const res = await fetch('/api/pending/approve', {{method:'POST', headers:postHeaders(), body: JSON.stringify({{pending_id: pendingId}})}});
+    const data = await res.json().catch(() => ({{}}));
+    if (res.ok && data && data.ok) {{
+      showToast('อนุมัติคำขอ #' + pendingId + ' แล้ว', 'success');
+    }} else {{
+      showToast('อนุมัติไม่สำเร็จ: ' + (data && data.error ? data.error : res.status), 'error');
+    }}
+  }} catch (err) {{
+    showToast('อนุมัติไม่สำเร็จ', 'error');
+  }}
+  await loadPendingActions({{scrollTop:false}});
+  refreshPendingBadge();
+}}
+async function rejectPending(pendingId) {{
+  let reason = '';
+  try {{ reason = window.prompt('เหตุผลที่ปฏิเสธคำขอ #' + pendingId + ' (ระบุก็ได้)', '') || ''; }} catch (e) {{ reason = ''; }}
+  if (reason === null) return;
+  try {{
+    const res = await fetch('/api/pending/reject', {{method:'POST', headers:postHeaders(), body: JSON.stringify({{pending_id: pendingId, reason: reason}})}});
+    const data = await res.json().catch(() => ({{}}));
+    if (res.ok && data && data.ok) {{
+      showToast('ปฏิเสธคำขอ #' + pendingId + ' แล้ว', 'success');
+    }} else {{
+      showToast('ปฏิเสธไม่สำเร็จ: ' + (data && data.error ? data.error : res.status), 'error');
+    }}
+  }} catch (err) {{
+    showToast('ปฏิเสธไม่สำเร็จ', 'error');
+  }}
+  await loadPendingActions({{scrollTop:false}});
+  refreshPendingBadge();
+}}
+async function cancelPending(pendingId) {{
+  const ok = await dashboardConfirm('ยกเลิกคำขอ #' + pendingId + '? (ใช้ได้เฉพาะผู้ที่ขอ)', 'ยืนยันยกเลิก', true);
+  if (!ok) return;
+  try {{
+    const res = await fetch('/api/pending/cancel', {{method:'POST', headers:postHeaders(), body: JSON.stringify({{pending_id: pendingId}})}});
+    const data = await res.json().catch(() => ({{}}));
+    if (res.ok && data && data.ok) {{
+      showToast('ยกเลิกคำขอ #' + pendingId + ' แล้ว', 'success');
+    }} else {{
+      showToast('ยกเลิกไม่สำเร็จ: ' + (data && data.error ? data.error : res.status), 'error');
+    }}
+  }} catch (err) {{
+    showToast('ยกเลิกไม่สำเร็จ', 'error');
+  }}
+  await loadPendingActions({{scrollTop:false}});
+  refreshPendingBadge();
+}}
+async function executePending(pendingId) {{
+  const ok = await dashboardConfirm('ดำเนินการคำขอที่อนุมัติแล้ว #' + pendingId + '?', 'ยืนยัน execute');
+  if (!ok) return;
+  try {{
+    const res = await fetch('/api/pending/approve?approval=execute', {{method:'POST', headers:postHeaders(), body: JSON.stringify({{pending_id: pendingId, approval: 'execute'}})}});
+    const data = await res.json().catch(() => ({{}}));
+    if (res.ok && data && data.ok) {{
+      showToast('execute สำเร็จ #' + pendingId, 'success');
+    }} else {{
+      showToast('execute ไม่สำเร็จ: ' + (data && data.error ? data.error : res.status), 'error');
+    }}
+  }} catch (err) {{
+    showToast('execute ไม่สำเร็จ', 'error');
+  }}
+  await loadPendingActions({{scrollTop:false}});
+  refreshPendingBadge();
+}}
 async function load(options={{}}) {{
   const botEl = document.getElementById('botFilter');
   const exportCompanyEl = document.getElementById('exportCompanyFilter');
@@ -5275,6 +5518,7 @@ async function load(options={{}}) {{
   updateExcel();
   if (!initialMenuApplied || (options && options.home)) {{ initialMenuApplied = true; showMenuSection('section-operator-home', {{scroll:false, persist:false}}); }}
   if (options && options.scrollTop) scrollDashboardTop(options.smooth !== false);
+  try {{ loadPendingActions({{scrollTop:false}}); }} catch (e) {{}}
 }}
 function selectedDashboardScope() {{
   const scopeEl = document.getElementById('scope');
@@ -5374,8 +5618,13 @@ document.getElementById('reconcileFlowFilter').addEventListener('change', update
 document.getElementById('exportStartDate').addEventListener('change', updateExcel);
 document.getElementById('exportEndDate').addEventListener('change', updateExcel);
 document.getElementById('slipSearch').addEventListener('keydown', (event) => {{ if (event.key === 'Enter') {{ window.__accountSearchMode = 'scoped'; load({{scrollTop:true}}); }} }});
+(function () {{
+  const pendingFilterEl = document.getElementById('pendingStatusFilter');
+  if (pendingFilterEl) pendingFilterEl.addEventListener('change', () => loadPendingActions({{scrollTop:false}}));
+}})();
 try {{ if (location.search && /[?&]token=/.test(location.search)) {{ const cleaned = location.search.replace(/([?&])token=[^&]*/g, '$1').replace(/[?&]$/, '').replace(/&&+/g, '&').replace(/^\\?&/, '?'); window.history.replaceState({{}}, '', location.pathname + (cleaned && cleaned !== '?' ? cleaned : '') + location.hash); }} }} catch (e) {{}}
 load({{home:true, scrollTop:true, smooth:false}}); setInterval(() => load({{lite:true}}), 10000);
+loadPendingActions({{scrollTop:false}}); refreshPendingBadge(); setInterval(refreshPendingBadge, 30000);
 </script>
 </body>
 </html>"""
