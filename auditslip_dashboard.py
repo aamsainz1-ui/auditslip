@@ -42,6 +42,7 @@ import requests
 from openpyxl import Workbook
 from collections import defaultdict
 from difflib import SequenceMatcher
+from functools import lru_cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -256,8 +257,19 @@ BANK_LIMITS = {
 MISSING_BANK_VALUES = {"", "unknown", "unknownbank", "n/a", "na", "none", "null", "-", "ไม่ทราบ", "xxx", "xxxx", "xxxbank", "masked"}
 
 
+@lru_cache(maxsize=8192)
+def _bank_key_cached(text: str) -> str:
+    return re.sub(r"[\s\*\u200b\u200c\u200d.\-_/|(),]+", "", text.lower())
+
+
 def bank_key(value: Any) -> str:
-    return re.sub(r"[\s\*\u200b\u200c\u200d.\-_/|(),]+", "", clean_display(value).lower())
+    return _bank_key_cached(clean_display(value))
+
+
+BANK_ALIAS_KEYS = {
+    canonical: {_bank_key_cached(clean_display(alias)) for alias in aliases}
+    for canonical, aliases in BANK_ALIASES.items()
+}
 
 
 def bank_needs_review(value: Any) -> bool:
@@ -266,16 +278,22 @@ def bank_needs_review(value: Any) -> bool:
     return (not key) or key in MISSING_BANK_VALUES or bool(re.fullmatch(r"x+(?:bank)?", key, flags=re.I)) or "ไม่ทราบ" in text
 
 
-def display_bank(value: Any) -> str:
-    bank = clean_display(value)
+@lru_cache(maxsize=4096)
+def _display_bank_cached(bank: str) -> str:
     key = bank_key(bank)
     if bank_needs_review(bank):
         return ""
-    for canonical, aliases in BANK_ALIASES.items():
-        normalized_aliases = {bank_key(alias) for alias in aliases}
+    for canonical, normalized_aliases in BANK_ALIAS_KEYS.items():
         if key in normalized_aliases or any(alias and ((len(alias) >= 3 and key.startswith(alias)) or (len(alias) >= 4 and alias in key)) for alias in normalized_aliases):
             return canonical
     return bank.upper() if re.fullmatch(r"[A-Za-z0-9 ._-]+", bank) else bank
+
+
+def display_bank(value: Any) -> str:
+    return _display_bank_cached(clean_display(value))
+
+
+display_bank.cache_clear = _display_bank_cached.cache_clear  # type: ignore[attr-defined]
 
 
 def bank_limit_amount(value: Any) -> float:
@@ -1068,15 +1086,23 @@ def cross_company_account_usage(conn: sqlite3.Connection, scope: str = "all", fl
     return out[:limit]
 
 
-def date_bucket(display_value: Any, iso_value: Any = "") -> Tuple[str, str, str]:
-    display_raw = clean_display(display_value)
-    iso_raw = clean_display(iso_value)
+@lru_cache(maxsize=8192)
+def _date_bucket_cached(display_raw: str, iso_raw: str) -> Tuple[str, str, str]:
     display_label, display_iso = normalize_date_parts(display_raw)
     iso_label, iso_iso = normalize_date_parts(iso_raw)
     label = display_label or iso_label or display_raw or iso_raw or "(ไม่ทราบวันที่)"
     sort_key = display_iso or iso_iso or label
     group_key = display_iso or iso_iso or label
     return group_key, label, sort_key
+
+
+def date_bucket(display_value: Any, iso_value: Any = "") -> Tuple[str, str, str]:
+    display_raw = clean_display(display_value)
+    iso_raw = clean_display(iso_value)
+    return _date_bucket_cached(display_raw, iso_raw)
+
+
+date_bucket.cache_clear = _date_bucket_cached.cache_clear  # type: ignore[attr-defined]
 
 
 def date_totals(conn: sqlite3.Connection, where_clause: str, params: List[Any], limit: int = 50) -> List[Dict[str, Any]]:
