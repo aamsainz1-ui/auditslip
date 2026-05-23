@@ -1974,6 +1974,157 @@ def ensure_bank_review_log_table(conn: sqlite3.Connection) -> None:
     )
 
 
+_DASHBOARD_TOKENS_READY = False
+_DASHBOARD_TOKENS_BOOTSTRAPPED = False
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256((token or "").encode("utf-8", "replace")).hexdigest()
+
+
+def ensure_dashboard_tokens_table(db_path: Path) -> None:
+    """Create dashboard_tokens table (idempotent). Stores only sha256 hashes, never raw tokens."""
+    global _DASHBOARD_TOKENS_READY
+    if _DASHBOARD_TOKENS_READY:
+        return
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dashboard_tokens (
+              token_hash TEXT PRIMARY KEY,
+              role TEXT NOT NULL DEFAULT 'viewer',
+              label TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              last_used_at TEXT DEFAULT NULL,
+              revoked_at TEXT DEFAULT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_dashboard_tokens_role ON dashboard_tokens(role)")
+        conn.commit()
+    _DASHBOARD_TOKENS_READY = True
+
+
+def bootstrap_dashboard_admin_token(db_path: Path, legacy_token: str) -> None:
+    """If the dashboard_tokens table is empty AND a legacy token is set, register it as admin."""
+    global _DASHBOARD_TOKENS_BOOTSTRAPPED
+    if _DASHBOARD_TOKENS_BOOTSTRAPPED:
+        return
+    if not legacy_token:
+        _DASHBOARD_TOKENS_BOOTSTRAPPED = True
+        return
+    ensure_dashboard_tokens_table(db_path)
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT COUNT(*) AS c FROM dashboard_tokens").fetchone()
+        count = int(row["c"]) if row else 0
+        if count == 0:
+            conn.execute(
+                "INSERT INTO dashboard_tokens(token_hash, role, label) VALUES (?,?,?)",
+                (_hash_token(legacy_token), "admin", "legacy-bootstrap"),
+            )
+            conn.commit()
+            print("Dashboard token registered as admin (legacy). Use /api/tokens to manage.", flush=True)
+    _DASHBOARD_TOKENS_BOOTSTRAPPED = True
+
+
+def lookup_dashboard_token_role(db_path: Path, token: str) -> str:
+    """Return the role for a token (sha256 lookup). Empty string if missing/revoked.
+
+    Updates last_used_at on a successful (non-revoked) lookup.
+    """
+    if not token:
+        return ""
+    ensure_dashboard_tokens_table(db_path)
+    th = _hash_token(token)
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT role, revoked_at FROM dashboard_tokens WHERE token_hash=?",
+            (th,),
+        ).fetchone()
+        if not row:
+            return ""
+        if row["revoked_at"]:
+            return ""
+        try:
+            conn.execute(
+                "UPDATE dashboard_tokens SET last_used_at=? WHERE token_hash=?",
+                (dt.datetime.now(dt.timezone.utc).isoformat(), th),
+            )
+            conn.commit()
+        except Exception:
+            pass
+        return str(row["role"] or "")
+
+
+def list_dashboard_tokens(db_path: Path) -> List[Dict[str, Any]]:
+    ensure_dashboard_tokens_table(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT token_hash, role, label, created_at, last_used_at, revoked_at "
+            "FROM dashboard_tokens ORDER BY created_at DESC"
+        ).fetchall()
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append({
+            "token_hash_prefix": str(r["token_hash"])[:12],
+            "role": r["role"],
+            "label": r["label"],
+            "created_at": r["created_at"],
+            "last_used_at": r["last_used_at"],
+            "revoked_at": r["revoked_at"],
+        })
+    return out
+
+
+def create_dashboard_token(db_path: Path, role: str, label: str) -> Dict[str, Any]:
+    role = (role or "").strip().lower()
+    if role not in {"admin", "auditor", "operator", "viewer"}:
+        return {"ok": False, "error": "invalid role"}
+    label = (label or "").strip()[:120]
+    ensure_dashboard_tokens_table(db_path)
+    import secrets as _secrets
+    token = _secrets.token_hex(32)
+    th = _hash_token(token)
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO dashboard_tokens(token_hash, role, label) VALUES (?,?,?)",
+            (th, role, label),
+        )
+        conn.commit()
+    return {"ok": True, "token": token, "token_hash_prefix": th[:12], "role": role, "label": label}
+
+
+def revoke_dashboard_token(db_path: Path, token_hash_prefix: str) -> Dict[str, Any]:
+    prefix = (token_hash_prefix or "").strip().lower()
+    if len(prefix) < 6:
+        return {"ok": False, "error": "prefix too short"}
+    ensure_dashboard_tokens_table(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT token_hash, role, revoked_at FROM dashboard_tokens WHERE token_hash LIKE ?",
+            (prefix + "%",),
+        ).fetchall()
+        if not rows:
+            return {"ok": False, "error": "token not found"}
+        if len(rows) > 1:
+            return {"ok": False, "error": "prefix is ambiguous"}
+        target = rows[0]
+        if target["revoked_at"]:
+            return {"ok": False, "error": "already revoked"}
+        if (target["role"] or "") == "admin":
+            active_admin_row = conn.execute(
+                "SELECT COUNT(*) AS c FROM dashboard_tokens WHERE role='admin' AND revoked_at IS NULL"
+            ).fetchone()
+            if int(active_admin_row["c"] if active_admin_row else 0) <= 1:
+                return {"ok": False, "error": "cannot revoke last admin"}
+        conn.execute(
+            "UPDATE dashboard_tokens SET revoked_at=? WHERE token_hash=?",
+            (dt.datetime.now(dt.timezone.utc).isoformat(), target["token_hash"]),
+        )
+        conn.commit()
+    return {"ok": True, "token_hash_prefix": target["token_hash"][:12]}
+
+
 _MUTATION_LOG_READY = False
 
 
@@ -4849,10 +5000,55 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return ""
 
     def authorized(self) -> bool:
-        if not DASHBOARD_TOKEN:
+        # Accept the legacy DASHBOARD_TOKEN (constant-time compare) OR any active
+        # token registered in the dashboard_tokens table.
+        tok = self.token_from_request()
+        if not tok:
             return False
+        if DASHBOARD_TOKEN:
+            import hmac as _hmac
+            if _hmac.compare_digest(tok, DASHBOARD_TOKEN):
+                return True
+        try:
+            return bool(lookup_dashboard_token_role(DB_PATH, tok))
+        except Exception:
+            return False
+
+    def actor_role(self) -> str:
+        """Resolve the role for the current request.
+
+        - If token matches DASHBOARD_TOKEN AND the legacy hash is NOT in
+          dashboard_tokens, return "admin" (backward compatibility).
+        - Otherwise look up sha256(token) in dashboard_tokens; if it exists and
+          is not revoked, return the stored role.
+        - Otherwise return "".
+        """
+        tok = self.token_from_request()
+        if not tok:
+            return ""
         import hmac as _hmac
-        return _hmac.compare_digest(self.token_from_request(), DASHBOARD_TOKEN)
+        legacy_match = bool(DASHBOARD_TOKEN) and _hmac.compare_digest(tok, DASHBOARD_TOKEN)
+        # First try DB lookup (covers both registered legacy admin and new tokens).
+        try:
+            role = lookup_dashboard_token_role(DB_PATH, tok)
+        except Exception:
+            role = ""
+        if role:
+            return role
+        # Legacy fallback: token equals env DASHBOARD_TOKEN but has not been
+        # registered in dashboard_tokens yet (e.g. before bootstrap on a fresh DB).
+        if legacy_match:
+            return "admin"
+        return ""
+
+    def require_role(self, *allowed: str) -> bool:
+        return self.actor_role() in set(allowed)
+
+    def role_or_401(self, *allowed: str) -> bool:
+        if self.require_role(*allowed):
+            return True
+        self.send_bytes(HTTPStatus.UNAUTHORIZED, b"Unauthorized", "text/plain; charset=utf-8")
+        return False
 
     def actor_fingerprint(self) -> str:
         tok = self.token_from_request()
@@ -4917,6 +5113,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path in {"/", "/index.html"}:
             self.send_bytes(200, render_dashboard_html().encode("utf-8"), "text/html; charset=utf-8")
+            return
+        if parsed.path == "/api/tokens":
+            if not self.role_or_401("admin"):
+                return
+            try:
+                self.send_json({"ok": True, "tokens": list_dashboard_tokens(DB_PATH)})
+            except Exception as exc:
+                logger.exception("api_tokens_list failed")
+                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
             return
         if parsed.path == "/api/summary":
             q = parse_qs(parsed.query)
@@ -5047,6 +5252,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 else:
                     payload = {k: v[0] for k, v in parse_qs(raw).items()}
         if parsed.path == "/api/close":
+            if not self.role_or_401("admin"):
+                return
             chat_id = str(payload.get("chat_id") or "")
             bot_key = str(payload.get("bot_key") or "default")
             company_name = str(payload.get("company_name") or "")
@@ -5062,6 +5269,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json(result, 200 if result.get("ok") else 400)
             return
         if parsed.path == "/api/account-limit":
+            if not self.role_or_401("admin"):
+                return
             request_id = uuid.uuid4().hex[:12]
             try:
                 result = save_account_limit(
@@ -5083,6 +5292,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
             return
         if parsed.path == "/api/company-account":
+            if not self.role_or_401("admin"):
+                return
             request_id = uuid.uuid4().hex[:12]
             try:
                 result = save_company_account(
@@ -5105,6 +5316,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
             return
         if parsed.path == "/api/duplicate/unmark":
+            if not self.role_or_401("admin", "operator"):
+                return
             request_id = uuid.uuid4().hex[:12]
             slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
             bot_key_in = str(payload.get("bot_key") or "")
@@ -5121,6 +5334,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json(result, 200 if result.get("ok") else 400)
             return
         if parsed.path == "/api/slip/delete":
+            if not self.role_or_401("admin"):
+                return
             request_id = uuid.uuid4().hex[:12]
             slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
             bot_key_in = str(payload.get("bot_key") or "")
@@ -5142,6 +5357,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json(result, 200 if result.get("ok") else 400)
             return
         if parsed.path == "/api/slip/reprocess":
+            if not self.role_or_401("admin", "operator"):
+                return
             request_id = uuid.uuid4().hex[:12]
             slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
             bot_key_in = str(payload.get("bot_key") or "")
@@ -5161,6 +5378,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
             return
         if parsed.path == "/api/bank-review/openai":
+            if not self.role_or_401("admin", "operator"):
+                return
             slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
             try:
                 result = openai_bank_double_check_slip(
@@ -5176,6 +5395,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": safe_error(exc)}, 400)
             return
         if parsed.path == "/api/bank-review/openai-all":
+            if not self.role_or_401("admin"):
+                return
             try:
                 q = parse_qs(parsed.query)
                 chat_id_b = str(payload.get("chat_id") or (q.get("chat_id") or [""])[0] or "")
@@ -5200,6 +5421,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": safe_error(exc)}, 400)
             return
         if parsed.path == "/api/reconcile":
+            if not self.role_or_401("admin"):
+                return
             request_id = uuid.uuid4().hex[:12]
             try:
                 chat_id = str(payload.get("chat_id") or "")
@@ -5222,12 +5445,44 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 record_endpoint_mutation(DB_PATH, "reconcile", actor=self.actor_fingerprint(), request_id=request_id, payload=payload, result_status="error", result_summary=safe_error(exc))
                 self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
             return
+        if parsed.path == "/api/tokens/create":
+            if not self.role_or_401("admin"):
+                return
+            try:
+                result = create_dashboard_token(
+                    DB_PATH,
+                    str(payload.get("role") or ""),
+                    str(payload.get("label") or ""),
+                )
+                self.send_json(result, 200 if result.get("ok") else 400)
+            except Exception as exc:
+                logger.exception("api_tokens_create failed")
+                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+            return
+        if parsed.path == "/api/tokens/revoke":
+            if not self.role_or_401("admin"):
+                return
+            try:
+                result = revoke_dashboard_token(
+                    DB_PATH,
+                    str(payload.get("token_hash_prefix") or ""),
+                )
+                self.send_json(result, 200 if result.get("ok") else 400)
+            except Exception as exc:
+                logger.exception("api_tokens_revoke failed")
+                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+            return
         self.send_json({"ok": False, "error": "not found"}, 404)
 
 
 def main() -> None:
     if not DASHBOARD_TOKEN:
         raise SystemExit("AUDITSLIP_DASHBOARD_TOKEN is required")
+    try:
+        ensure_dashboard_tokens_table(DB_PATH)
+        bootstrap_dashboard_admin_token(DB_PATH, DASHBOARD_TOKEN)
+    except Exception:
+        logger.exception("dashboard_tokens bootstrap failed")
     httpd = ThreadingHTTPServer((HOST, PORT), DashboardHandler)
     print(f"Auditslip dashboard listening on http://{HOST}:{PORT}", flush=True)
     httpd.serve_forever()
