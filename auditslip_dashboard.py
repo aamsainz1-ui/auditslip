@@ -87,6 +87,31 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def sqlite_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table_name,)).fetchone()
+    return row is not None
+
+
+def ensure_dashboard_performance_indexes(conn: sqlite3.Connection) -> None:
+    """Create idempotent indexes for high-frequency dashboard summary/search paths."""
+    if not sqlite_table_exists(conn, "slips"):
+        return
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_slips_bot_chat_date_amount
+        ON slips(bot_key, chat_id, slip_date_iso, amount)
+        WHERE COALESCE(status,'success')='success' AND COALESCE(is_duplicate,0)=0
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_slips_status
+        ON slips(status)
+        WHERE status IN ('unclear','error','success')
+        """
+    )
+
+
 def rows_to_dicts(rows: List[sqlite3.Row]) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
@@ -2029,11 +2054,68 @@ def account_slip_search_company_summary(rows: List[Dict[str, Any]]) -> List[Dict
     return sorted(companies.values(), key=dict_company_sort_key)
 
 
+ACCOUNT_SLIP_SEARCH_SQL_FIELDS = (
+    "from_account",
+    "to_account",
+    "transferor_name",
+    "recipient_name",
+    "account_name",
+    "sender_name",
+    "username",
+    "from_bank",
+    "to_bank",
+    "issuer_bank",
+    "reference_no",
+    "seq",
+    "aid",
+)
+SQL_COMPACT_REMOVE_CHARS = (" ", "\t", "\n", "\r", "*", "\u200b", "\u200c", "\u200d", ".", "-", "_", "/", "|", "(", ")")
+
+
+def sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def sql_compact_text_expr(column: str) -> str:
+    expr = f"LOWER(COALESCE({column},''))"
+    for ch in SQL_COMPACT_REMOVE_CHARS:
+        expr = f"REPLACE({expr}, {sql_literal(ch)}, '')"
+    return expr
+
+
+def account_search_sql_predicate(search: str) -> Tuple[str, List[Any]]:
+    """Broad SQL-side prefilter mirroring account_slip_match normalization."""
+    query = clean_display(search)
+    if not query:
+        return "", []
+    raw_needle = query.lower()
+    compact_needle = normalize_match_text(query)
+    clauses: List[str] = []
+    params: List[Any] = []
+    for field in ACCOUNT_SLIP_SEARCH_SQL_FIELDS:
+        raw_expr = f"LOWER(COALESCE({field},''))"
+        compact_expr = sql_compact_text_expr(field)
+        if raw_needle:
+            clauses.append(f"{raw_expr} LIKE ?")
+            params.append(f"%{raw_needle}%")
+        if compact_needle:
+            clauses.append(f"{compact_expr} LIKE ?")
+            params.append(f"%{compact_needle}%")
+            # Preserve account_slip_match's conservative reverse containment
+            # behavior, e.g. a query like "SCB 123456" may match bank+account.
+            clauses.append(f"({compact_expr} <> '' AND ? LIKE '%' || {compact_expr} || '%')")
+            params.append(compact_needle)
+    return "(" + " OR ".join(clauses) + ")", params
+
+
 def account_slip_search_rows(conn: sqlite3.Connection, where_clause: str, params: List[Any], search: str = "", limit: int = 80) -> Dict[str, Any]:
     """Individual counted slip rows for auditing one account within the selected day/company/flow scope."""
     query = clean_display(search)
     if not query:
         return empty_account_slip_search(query)
+    search_where, search_params = account_search_sql_predicate(query)
+    effective_where = f"({where_clause}) AND {search_where}" if search_where else where_clause
+    effective_params = list(params or []) + search_params
     rows = conn.execute(
         f"""
         SELECT id, COALESCE(NULLIF(bot_key,''),'default') AS bot_key, company_name, chat_id, chat_title,
@@ -2043,7 +2125,7 @@ def account_slip_search_rows(conn: sqlite3.Connection, where_clause: str, params
                transferor_name, recipient_name, issuer_bank, from_bank, from_account, to_bank, to_account,
                account_name, amount, fee, reference_no, seq, aid, confidence, created_at, created_at_iso, settlement_id, is_duplicate, duplicate_of
         FROM slips
-        WHERE {where_clause}
+        WHERE {effective_where}
           AND (NULLIF(TRIM(COALESCE(from_account,'')), '') IS NOT NULL
                OR NULLIF(TRIM(COALESCE(to_account,'')), '') IS NOT NULL
                OR NULLIF(TRIM(COALESCE(transferor_name,'')), '') IS NOT NULL
@@ -2053,7 +2135,7 @@ def account_slip_search_rows(conn: sqlite3.Connection, where_clause: str, params
                  CAST(COALESCE(message_id,0) AS INTEGER) DESC,
                  created_at DESC
         """,
-        params,
+        effective_params,
     ).fetchall()
     matched: List[Dict[str, Any]] = []
     total_amount = 0.0
@@ -7010,11 +7092,14 @@ def main() -> None:
     if not DASHBOARD_TOKEN and not dashboard_owner_login_enabled():
         raise SystemExit("AUDITSLIP_DASHBOARD_OWNER_PASSWORD is required when no dashboard token is configured")
     try:
+        with connect(DB_PATH) as conn:
+            ensure_dashboard_performance_indexes(conn)
+            conn.commit()
         ensure_dashboard_tokens_table(DB_PATH)
         if DASHBOARD_TOKEN:
             bootstrap_dashboard_admin_token(DB_PATH, DASHBOARD_TOKEN)
     except Exception:
-        logger.exception("dashboard_tokens bootstrap failed")
+        logger.exception("dashboard bootstrap failed")
     httpd = ThreadingHTTPServer((HOST, PORT), DashboardHandler)
     print(f"Auditslip dashboard listening on http://{HOST}:{PORT}", flush=True)
     httpd.serve_forever()
