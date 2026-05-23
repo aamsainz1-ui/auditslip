@@ -2056,6 +2056,29 @@ def lookup_dashboard_token_role(db_path: Path, token: str) -> str:
         return str(row["role"] or "")
 
 
+def dashboard_token_is_registered(db_path: Path, token: str) -> bool:
+    """Return True if the token hash exists in dashboard_tokens (revoked or not).
+
+    Used to decide whether the legacy DASHBOARD_TOKEN env fallback applies: once a
+    token is registered, the DB is the source of truth — even for the legacy admin.
+    This closes the revoke bypass where env-token holders kept admin after the
+    bootstrap row was revoked.
+    """
+    if not token:
+        return False
+    ensure_dashboard_tokens_table(db_path)
+    th = _hash_token(token)
+    try:
+        with connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM dashboard_tokens WHERE token_hash=? LIMIT 1",
+                (th,),
+            ).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
 def list_dashboard_tokens(db_path: Path) -> List[Dict[str, Any]]:
     ensure_dashboard_tokens_table(db_path)
     with connect(db_path) as conn:
@@ -5222,45 +5245,42 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return ""
 
     def authorized(self) -> bool:
-        # Accept the legacy DASHBOARD_TOKEN (constant-time compare) OR any active
-        # token registered in the dashboard_tokens table.
-        tok = self.token_from_request()
-        if not tok:
-            return False
-        if DASHBOARD_TOKEN:
-            import hmac as _hmac
-            if _hmac.compare_digest(tok, DASHBOARD_TOKEN):
-                return True
-        try:
-            return bool(lookup_dashboard_token_role(DB_PATH, tok))
-        except Exception:
-            return False
+        # Resolve role; any non-empty role means an authorized request.
+        return bool(self.actor_role())
 
     def actor_role(self) -> str:
         """Resolve the role for the current request.
 
-        - If token matches DASHBOARD_TOKEN AND the legacy hash is NOT in
-          dashboard_tokens, return "admin" (backward compatibility).
-        - Otherwise look up sha256(token) in dashboard_tokens; if it exists and
-          is not revoked, return the stored role.
+        - Look up sha256(token) in dashboard_tokens; if active, return stored role.
+        - If the token IS registered (revoked or otherwise inactive): return "".
+          The DB is the source of truth — legacy DASHBOARD_TOKEN cannot bypass a
+          revoke once it has been registered.
+        - If the token is NOT registered AT ALL but matches the legacy
+          DASHBOARD_TOKEN env, return "admin" as a bootstrap fallback for fresh
+          installs before bootstrap_dashboard_admin_token has run.
         - Otherwise return "".
         """
         tok = self.token_from_request()
         if not tok:
             return ""
-        import hmac as _hmac
-        legacy_match = bool(DASHBOARD_TOKEN) and _hmac.compare_digest(tok, DASHBOARD_TOKEN)
-        # First try DB lookup (covers both registered legacy admin and new tokens).
         try:
             role = lookup_dashboard_token_role(DB_PATH, tok)
         except Exception:
             role = ""
         if role:
             return role
-        # Legacy fallback: token equals env DASHBOARD_TOKEN but has not been
-        # registered in dashboard_tokens yet (e.g. before bootstrap on a fresh DB).
-        if legacy_match:
-            return "admin"
+        # Token might be registered but revoked — DO NOT fall back to legacy.
+        try:
+            registered = dashboard_token_is_registered(DB_PATH, tok)
+        except Exception:
+            registered = False
+        if registered:
+            return ""
+        # Pre-bootstrap legacy fallback only.
+        if DASHBOARD_TOKEN:
+            import hmac as _hmac
+            if _hmac.compare_digest(tok, DASHBOARD_TOKEN):
+                return "admin"
         return ""
 
     def require_role(self, *allowed: str) -> bool:
@@ -5768,31 +5788,47 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/tokens/create":
             if not self.role_or_401("admin"):
                 return
+            request_id = uuid.uuid4().hex[:12]
+            # Redact role/label only — never echo or log the raw token.
+            mutation_payload = {"role": str(payload.get("role") or ""), "label": str(payload.get("label") or "")}
             try:
                 result = create_dashboard_token(
                     DB_PATH,
                     str(payload.get("role") or ""),
                     str(payload.get("label") or ""),
                 )
-                self.send_json(result, 200 if result.get("ok") else 400)
+                token_hash_prefix = ""
+                if isinstance(result, dict) and result.get("ok"):
+                    token_hash_prefix = str(result.get("token_hash_prefix") or "")
+                record_endpoint_mutation(DB_PATH, "token.create", actor=self.actor_fingerprint(), request_id=request_id, payload=mutation_payload, result_status=("ok" if (isinstance(result, dict) and result.get("ok")) else "error"), result_summary=token_hash_prefix or (isinstance(result, dict) and str(result.get("error") or "")) or "")
+                if isinstance(result, dict):
+                    result["request_id"] = request_id
+                self.send_json(result, 200 if (isinstance(result, dict) and result.get("ok")) else 400)
             except Exception as exc:
                 logger.exception("api_tokens_create failed")
-                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+                record_endpoint_mutation(DB_PATH, "token.create", actor=self.actor_fingerprint(), request_id=request_id, payload=mutation_payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
             return
         if parsed.path == "/api/tokens/revoke":
             if not self.role_or_401("admin"):
                 return
+            request_id = uuid.uuid4().hex[:12]
+            token_prefix = str(payload.get("token_hash_prefix") or "")
+            mutation_payload = {"token_hash_prefix": token_prefix}
             try:
-                result = revoke_dashboard_token(
-                    DB_PATH,
-                    str(payload.get("token_hash_prefix") or ""),
-                )
-                self.send_json(result, 200 if result.get("ok") else 400)
+                result = revoke_dashboard_token(DB_PATH, token_prefix)
+                record_endpoint_mutation(DB_PATH, "token.revoke", actor=self.actor_fingerprint(), request_id=request_id, payload=mutation_payload, result_status=("ok" if (isinstance(result, dict) and result.get("ok")) else "error"), result_summary=token_prefix + " " + (isinstance(result, dict) and str(result.get("error") or "")))
+                if isinstance(result, dict):
+                    result["request_id"] = request_id
+                self.send_json(result, 200 if (isinstance(result, dict) and result.get("ok")) else 400)
             except Exception as exc:
                 logger.exception("api_tokens_revoke failed")
-                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+                record_endpoint_mutation(DB_PATH, "token.revoke", actor=self.actor_fingerprint(), request_id=request_id, payload=mutation_payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
             return
         if parsed.path == "/api/pending/approve":
+            if not self.role_or_401("admin", "auditor"):
+                return
             actor_fp = self.actor_fingerprint()
             try:
                 pending_id = int(payload.get("pending_id") or 0)
@@ -5807,6 +5843,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json(result, status_code)
             return
         if parsed.path == "/api/pending/reject":
+            if not self.role_or_401("admin", "auditor"):
+                return
             actor_fp = self.actor_fingerprint()
             try:
                 pending_id = int(payload.get("pending_id") or 0)
