@@ -1,0 +1,9 @@
+[Unit]
+Description=Send Auditslip owner digest daily at 09:00 Asia/Bangkok
+
+[Timer]
+OnCalendar=*-*-* 09:00:00 Asia/Bangkok
+Persistent=true
+
+[Install]
+WantedBy=timers.target

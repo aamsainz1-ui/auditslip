@@ -2369,10 +2369,69 @@ def record_mutation(
         logger.exception("record_mutation failed action=%s", action)
 
 
+# Phase C2: high-risk action names (mutation-log convention -- short tokens, not dotted) that
+# warrant a real-time Telegram alert to the owner. Lower-risk actions (reprocess, unmark_dup,
+# bank_review*) are intentionally excluded.
+_ALERT_ACTIONS = {
+    "delete",
+    "close",
+    "clear",
+    "account_limit",
+    "company_account",
+    "token.create",
+    "token.revoke",
+}
+
+
+def send_owner_alert(message: str, action: str = "", request_id: str = "") -> None:
+    """Best-effort Telegram alert to the watchdog/owner chat.
+
+    Reads same env vars as auditslip_watchdog. Network failure is swallowed (logged at WARNING).
+    Returns immediately if token/chat are unset so dev/test environments do not 'fail'.
+    """
+    try:
+        token = (
+            os.environ.get("AUDITSLIP_WATCHDOG_BOT_TOKEN")
+            or os.environ.get("BOT_TOKEN")
+            or os.environ.get("TELEGRAM_BOT_TOKEN")
+            or ""
+        )
+        chat_id = os.environ.get("AUDITSLIP_WATCHDOG_ALERT_CHAT_ID") or next(
+            (x.strip() for x in os.environ.get("AUDITSLIP_ADMIN_IDS", "").split(",") if x.strip()),
+            "",
+        )
+        if not token or not chat_id:
+            return
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        resp = requests.post(url, data={"chat_id": chat_id, "text": message}, timeout=10)
+        # Touch status_code to surface obvious 4xx in logs without raising.
+        if resp.status_code >= 400:
+            logger.warning("send_owner_alert non-2xx status=%s action=%s req=%s", resp.status_code, action, request_id)
+    except Exception:
+        logger.warning("send_owner_alert failed action=%s req=%s", action, request_id, exc_info=True)
+
+
 def record_endpoint_mutation(db_path: Path, action: str, *, actor: str = "", request_id: str = "", payload: Any = None, result_status: str = "ok", result_summary: str = "", chat_id: str = "", bot_key: str = "", slip_id: str = "") -> None:
-    """Thin wrapper around record_mutation that prefixes the per-request request_id into the result_summary."""
+    """Thin wrapper around record_mutation that prefixes the per-request request_id into the result_summary.
+
+    Phase C2: after logging, if `action` is in _ALERT_ACTIONS and AUDITSLIP_ALERT_ON_MUTATION!=0,
+    fire a best-effort Telegram alert. Alert is fire-and-forget; failures never break the mutation.
+    """
     prefix = f"req={request_id} " if request_id else ""
     record_mutation(db_path, action, actor=actor, chat_id=chat_id, bot_key=bot_key, slip_id=slip_id, payload=payload, result_status=result_status, result_summary=(prefix + (result_summary or "")))
+    if action in _ALERT_ACTIONS and os.environ.get("AUDITSLIP_ALERT_ON_MUTATION", "1") != "0":
+        try:
+            actor_short = (actor or "")[:8]
+            summary_snip = (result_summary or "")[:200]
+            text = (
+                f"🚨 Auditslip mutation: {action} by {actor_short} "
+                f"req={request_id or '-'} result={result_status}"
+            )
+            if summary_snip:
+                text = f"{text}\n{summary_snip}"
+            send_owner_alert(text, action=action, request_id=request_id)
+        except Exception:
+            logger.warning("record_endpoint_mutation alert dispatch failed action=%s", action)
 
 
 # Phase B1: parse a 'request_id' (12-hex) prefix stamped by record_endpoint_mutation back out
@@ -2392,7 +2451,7 @@ def _extract_request_id(result_summary: str) -> str:
 # ---------------------------------------------------------------------------
 
 PENDING_ACTION_TTL_HOURS = 24
-APPROVAL_REQUIRED_ACTIONS = {"slip.delete", "period.close"}
+APPROVAL_REQUIRED_ACTIONS = {"slip.delete", "period.close", "account.limit", "company.account", "reconcile.run"}
 _PENDING_ACTIONS_READY = False
 
 
@@ -4076,6 +4135,13 @@ def render_dashboard_html(token: str = "") -> str:
     .good {{ color:var(--good); }} .warn {{ color:var(--warn); }} .bad {{ color:var(--bad); }}
     .sections {{ display:grid; grid-template-columns: 1.2fr .8fr; gap:14px; margin-top:14px; }}
     .menu-section[hidden] {{ display:none !important; }}
+    .pending-badge {{ display:inline-block; min-width:18px; padding:1px 6px; margin-left:6px; border-radius:999px; background:#dc2626; color:#fff; font-size:11px; font-weight:800; line-height:16px; text-align:center; vertical-align:middle; }}
+    .pending-badge[hidden] {{ display:none !important; }}
+    .pending-toolbar {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:8px 0; }}
+    .pending-toast-host {{ position:fixed; right:16px; bottom:16px; display:flex; flex-direction:column; gap:8px; z-index:9999; }}
+    .pending-toast {{ background:rgba(15,23,42,.95); border:1px solid var(--line); color:#e2e8f0; padding:10px 14px; border-radius:10px; box-shadow:0 12px 30px rgba(0,0,0,.35); font-size:13px; max-width:320px; }}
+    .pending-toast.success {{ border-color:rgba(34,197,94,.55); }}
+    .pending-toast.error {{ border-color:rgba(220,38,38,.55); }}
     .responsive-table {{ width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }}
     table {{ width:100%; border-collapse:collapse; font-size:13px; min-width:620px; }}
     th,td {{ text-align:left; padding:9px 8px; border-bottom:1px solid var(--line); vertical-align:top; }}
@@ -4206,6 +4272,7 @@ def render_dashboard_html(token: str = "") -> str:
             <button class="side-menu-item" type="button" data-menu-target="all" onclick="showAllMenuSections()"><span class="side-menu-icon">⌘</span><span class="side-menu-text"><span class="side-menu-title">แสดงทั้งหมด</span><span class="side-menu-desc">ทุกการ์ดและทุกตาราง</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-overview" onclick="showMenuSection('section-overview')"><span class="side-menu-icon">▦</span><span class="side-menu-text"><span class="side-menu-title">ภาพรวม</span><span class="side-menu-desc">ยอดรวมแยกบริษัท</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-company-accounts" onclick="showMenuSection('section-company-accounts')"><span class="side-menu-icon">🏦</span><span class="side-menu-text"><span class="side-menu-title">บัญชี/ค้นสลิป</span><span class="side-menu-desc">บัญชีรับเงินและดูรูปสลิปต่อบัญชี</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-pending" onclick="showMenuSection('section-pending')"><span class="side-menu-icon">⏳</span><span class="side-menu-text"><span class="side-menu-title">รออนุมัติ <span id="pendingBadge" class="pending-badge" hidden>0</span></span><span class="side-menu-desc">two-person approval · ยังไม่ได้อนุมัติ</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-date-sender" onclick="showMenuSection('section-date-sender')"><span class="side-menu-icon">◷</span><span class="side-menu-text"><span class="side-menu-title">วันที่/ผู้ส่งรูป</span><span class="side-menu-desc">ยอดรายวันและคนส่งรูป</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="limitSection" onclick="showMenuSection('limitSection')"><span class="side-menu-icon">↯</span><span class="side-menu-text"><span class="side-menu-title">ฝั่งถอน/วงเงิน</span><span class="side-menu-desc">วงเงินรายวัน/ผู้โอนถอน</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-deposit-slips" onclick="showMenuSection('section-deposit-slips')"><span class="side-menu-icon">＋</span><span class="side-menu-text"><span class="side-menu-title">ฝาก/เติมมือ</span><span class="side-menu-desc">สลิปลูกค้า ไม่มีวงเงิน</span></span></button>
@@ -4298,7 +4365,31 @@ def render_dashboard_html(token: str = "") -> str:
       <div class="card"><h3>Recent slips</h3><div id="recent"></div></div>
       <div class="card"><h3>Queue / Issues</h3><div id="issues"></div><h3>Provider usage</h3><div id="usage"></div></div>
     </section>
+    <section id="section-pending" class="sections menu-section" hidden>
+      <div class="card">
+        <h3>รออนุมัติ (Two-person approval)</h3>
+        <div class="mini">รายการที่ผู้ใช้ขออนุมัติ — ต้องใช้คนละ token approve เท่านั้น</div>
+        <div class="pending-toolbar">
+          <label class="mini">สถานะ
+            <select id="pendingStatusFilter" title="กรองสถานะคำขอ">
+              <option value="pending">pending</option>
+              <option value="approved">approved</option>
+              <option value="executed">executed</option>
+              <option value="rejected">rejected</option>
+              <option value="cancelled">cancelled</option>
+              <option value="expired">expired</option>
+              <option value="all">ทั้งหมด</option>
+            </select>
+          </label>
+          <button id="pendingRefreshBtn" type="button" onclick="loadPendingActions({{scrollTop:false}})">รีเฟรช</button>
+          <span id="pendingMeta" class="mini muted">โหลด...</span>
+        </div>
+        <div id="pendingTableContainer"></div>
+        <div class="mini">approve/reject ทำได้เฉพาะ role admin หรือ auditor และห้าม self-approve</div>
+      </div>
+    </section>
     </main>
+    <div id="pendingToastHost" class="pending-toast-host" aria-live="polite"></div>
   </div>
   <div id="dashboardModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="dashboardModalTitle" aria-hidden="true">
     <div class="modal-card">
@@ -5044,6 +5135,217 @@ async function runReconcile() {{
   box.innerHTML = reconcileSummary(data);
   enhanceResponsiveTables(box);
 }}
+function showToast(msg, type='info') {{
+  try {{
+    const host = document.getElementById('pendingToastHost');
+    if (!host) {{ return; }}
+    const div = document.createElement('div');
+    div.className = 'pending-toast ' + (type === 'success' ? 'success' : (type === 'error' ? 'error' : ''));
+    div.textContent = String(msg || '');
+    host.appendChild(div);
+    setTimeout(() => {{ try {{ div.remove(); }} catch (e) {{}} }}, 4200);
+  }} catch (e) {{}}
+}}
+const PENDING_ACTION_ICONS = {{
+  'slip.delete': '🗑️',
+  'period.close': '🔒',
+  'account_limit': '💰',
+  'account_limit.delete': '💰',
+  'company_account': '🏦',
+  'company_account.delete': '🏦',
+  'reconcile': '🔁',
+  'token.create': '🔑',
+  'token.revoke': '🔑',
+  'token.update': '🔑'
+}};
+function pendingActionEmoji(action) {{
+  const key = String(action || '');
+  if (PENDING_ACTION_ICONS[key]) return PENDING_ACTION_ICONS[key];
+  if (key.startsWith('slip.delete') || key.endsWith('.delete')) return '🗑️';
+  if (key.startsWith('period.close') || key.endsWith('.close')) return '🔒';
+  if (key.startsWith('account_limit')) return '💰';
+  if (key.startsWith('company_account')) return '🏦';
+  if (key.startsWith('reconcile')) return '🔁';
+  if (key.startsWith('token.')) return '🔑';
+  return '•';
+}}
+function pendingPayloadSummaryText(summary) {{
+  if (!summary || typeof summary !== 'object') return '';
+  const parts = [];
+  ['id','slip_id','company_name','bot_key','chat_id','reason','note'].forEach(k => {{
+    if (summary[k] !== undefined && summary[k] !== null && String(summary[k]) !== '') {{
+      parts.push(esc(k) + ':' + esc(String(summary[k])));
+    }}
+  }});
+  return parts.join(' · ');
+}}
+function pendingShortFp(fp) {{
+  const s = String(fp || '');
+  if (!s) return '-';
+  return esc(s.substring(0, 8));
+}}
+function pendingStatusBadge(status) {{
+  const s = String(status || '');
+  const cls = (s === 'pending') ? 'warn' : (s === 'rejected' || s === 'expired' || s === 'cancelled') ? 'bad' : (s === 'executed' || s === 'approved') ? 'good' : '';
+  return '<span class="'+cls+'">'+esc(s || '-')+'</span>';
+}}
+function pendingDisplayTime(value) {{
+  const s = String(value || '');
+  if (!s) return '-';
+  return esc(s.replace('T', ' ').replace(/\\.[0-9]+Z?$/, '').replace(/Z$/, ''));
+}}
+function pendingRowsTable(rows) {{
+  if (!rows || !rows.length) return '<div class="muted">ไม่มีคำขอในสถานะนี้</div>';
+  const head = '<thead><tr>'+
+    '<th>ID</th>'+
+    '<th>Action</th>'+
+    '<th>ผู้ขอ</th>'+
+    '<th>เวลาขอ</th>'+
+    '<th>expire</th>'+
+    '<th>status</th>'+
+    '<th class="action-col">จัดการ</th>'+
+    '</tr></thead>';
+  const body = rows.map(r => {{
+    const id = Number(r.id || 0);
+    const status = String(r.status || '');
+    const action = String(r.action || '');
+    const summary = pendingPayloadSummaryText(r.payload_summary || {{}});
+    const actionCell = pendingActionEmoji(action) + ' ' + esc(action) + (summary ? '<div class="mini muted">'+summary+'</div>' : '');
+    const buttons = [];
+    if (status === 'pending') {{
+      buttons.push('<button data-pending-id="'+id+'" data-admin-only="true" onclick="approvePending('+id+')">อนุมัติ</button>');
+      buttons.push('<button class="danger" data-pending-id="'+id+'" data-admin-only="true" onclick="rejectPending('+id+')">ปฏิเสธ</button>');
+      buttons.push('<button data-pending-id="'+id+'" onclick="cancelPending('+id+')">ยกเลิก</button>');
+    }} else if (status === 'approved') {{
+      buttons.push('<button data-pending-id="'+id+'" data-admin-only="true" onclick="executePending('+id+')">execute</button>');
+    }}
+    const actionsHtml = buttons.length ? buttons.join(' ') : '<span class="muted mini">-</span>';
+    return '<tr>'+
+      '<td>'+esc(String(id))+'</td>'+
+      '<td>'+actionCell+'</td>'+
+      '<td>'+pendingShortFp(r.requested_by)+'</td>'+
+      '<td>'+pendingDisplayTime(r.requested_at)+'</td>'+
+      '<td>'+pendingDisplayTime(r.expires_at)+'</td>'+
+      '<td>'+pendingStatusBadge(status)+'</td>'+
+      '<td class="action-cell">'+actionsHtml+'</td>'+
+      '</tr>';
+  }}).join('');
+  return '<div class="responsive-table"><table>'+head+'<tbody>'+body+'</tbody></table></div>';
+}}
+async function loadPendingActions(options={{}}) {{
+  const filterEl = document.getElementById('pendingStatusFilter');
+  const container = document.getElementById('pendingTableContainer');
+  const meta = document.getElementById('pendingMeta');
+  if (!container) return;
+  const status = filterEl ? (filterEl.value || 'pending') : 'pending';
+  const qs = (status && status !== 'all') ? ('?status=' + encodeURIComponent(status)) : '';
+  try {{
+    const res = await fetch('/api/pending' + qs, {{cache:'no-store'}});
+    if (!res.ok) {{
+      container.innerHTML = '<div class="bad">โหลดรายการรออนุมัติไม่สำเร็จ ('+res.status+')</div>';
+      if (meta) meta.textContent = '';
+      return;
+    }}
+    const data = await res.json();
+    const rows = (data && data.items) || [];
+    container.innerHTML = pendingRowsTable(rows);
+    enhanceResponsiveTables(container);
+    if (meta) meta.textContent = 'พบ ' + (data.count || rows.length || 0) + ' รายการ';
+    if (status === 'pending') {{ updatePendingBadge(rows.length); }}
+  }} catch (err) {{
+    container.innerHTML = '<div class="bad">โหลดรายการรออนุมัติไม่สำเร็จ</div>';
+    if (meta) meta.textContent = '';
+  }}
+}}
+function updatePendingBadge(count) {{
+  const badge = document.getElementById('pendingBadge');
+  if (!badge) return;
+  const n = Number(count || 0);
+  if (n > 0) {{
+    badge.textContent = String(n);
+    badge.hidden = false;
+  }} else {{
+    badge.textContent = '0';
+    badge.hidden = true;
+  }}
+}}
+async function refreshPendingBadge() {{
+  try {{
+    const res = await fetch('/api/pending?status=pending', {{cache:'no-store'}});
+    if (!res.ok) return;
+    const data = await res.json();
+    updatePendingBadge((data && (data.count || (data.items || []).length)) || 0);
+  }} catch (err) {{}}
+}}
+async function approvePending(pendingId) {{
+  const ok = await dashboardConfirm('อนุมัติคำขอ #' + pendingId + '?', 'ยืนยันการอนุมัติ');
+  if (!ok) return;
+  try {{
+    const res = await fetch('/api/pending/approve', {{method:'POST', headers:postHeaders(), body: JSON.stringify({{pending_id: pendingId}})}});
+    const data = await res.json().catch(() => ({{}}));
+    if (res.ok && data && data.ok) {{
+      showToast('อนุมัติคำขอ #' + pendingId + ' แล้ว', 'success');
+    }} else {{
+      showToast('อนุมัติไม่สำเร็จ: ' + (data && data.error ? data.error : res.status), 'error');
+    }}
+  }} catch (err) {{
+    showToast('อนุมัติไม่สำเร็จ', 'error');
+  }}
+  await loadPendingActions({{scrollTop:false}});
+  refreshPendingBadge();
+}}
+async function rejectPending(pendingId) {{
+  let reason = '';
+  try {{ reason = window.prompt('เหตุผลที่ปฏิเสธคำขอ #' + pendingId + ' (ระบุก็ได้)', '') || ''; }} catch (e) {{ reason = ''; }}
+  if (reason === null) return;
+  try {{
+    const res = await fetch('/api/pending/reject', {{method:'POST', headers:postHeaders(), body: JSON.stringify({{pending_id: pendingId, reason: reason}})}});
+    const data = await res.json().catch(() => ({{}}));
+    if (res.ok && data && data.ok) {{
+      showToast('ปฏิเสธคำขอ #' + pendingId + ' แล้ว', 'success');
+    }} else {{
+      showToast('ปฏิเสธไม่สำเร็จ: ' + (data && data.error ? data.error : res.status), 'error');
+    }}
+  }} catch (err) {{
+    showToast('ปฏิเสธไม่สำเร็จ', 'error');
+  }}
+  await loadPendingActions({{scrollTop:false}});
+  refreshPendingBadge();
+}}
+async function cancelPending(pendingId) {{
+  const ok = await dashboardConfirm('ยกเลิกคำขอ #' + pendingId + '? (ใช้ได้เฉพาะผู้ที่ขอ)', 'ยืนยันยกเลิก', true);
+  if (!ok) return;
+  try {{
+    const res = await fetch('/api/pending/cancel', {{method:'POST', headers:postHeaders(), body: JSON.stringify({{pending_id: pendingId}})}});
+    const data = await res.json().catch(() => ({{}}));
+    if (res.ok && data && data.ok) {{
+      showToast('ยกเลิกคำขอ #' + pendingId + ' แล้ว', 'success');
+    }} else {{
+      showToast('ยกเลิกไม่สำเร็จ: ' + (data && data.error ? data.error : res.status), 'error');
+    }}
+  }} catch (err) {{
+    showToast('ยกเลิกไม่สำเร็จ', 'error');
+  }}
+  await loadPendingActions({{scrollTop:false}});
+  refreshPendingBadge();
+}}
+async function executePending(pendingId) {{
+  const ok = await dashboardConfirm('ดำเนินการคำขอที่อนุมัติแล้ว #' + pendingId + '?', 'ยืนยัน execute');
+  if (!ok) return;
+  try {{
+    const res = await fetch('/api/pending/approve?approval=execute', {{method:'POST', headers:postHeaders(), body: JSON.stringify({{pending_id: pendingId, approval: 'execute'}})}});
+    const data = await res.json().catch(() => ({{}}));
+    if (res.ok && data && data.ok) {{
+      showToast('execute สำเร็จ #' + pendingId, 'success');
+    }} else {{
+      showToast('execute ไม่สำเร็จ: ' + (data && data.error ? data.error : res.status), 'error');
+    }}
+  }} catch (err) {{
+    showToast('execute ไม่สำเร็จ', 'error');
+  }}
+  await loadPendingActions({{scrollTop:false}});
+  refreshPendingBadge();
+}}
 async function load(options={{}}) {{
   const botEl = document.getElementById('botFilter');
   const exportCompanyEl = document.getElementById('exportCompanyFilter');
@@ -5216,6 +5518,7 @@ async function load(options={{}}) {{
   updateExcel();
   if (!initialMenuApplied || (options && options.home)) {{ initialMenuApplied = true; showMenuSection('section-operator-home', {{scroll:false, persist:false}}); }}
   if (options && options.scrollTop) scrollDashboardTop(options.smooth !== false);
+  try {{ loadPendingActions({{scrollTop:false}}); }} catch (e) {{}}
 }}
 function selectedDashboardScope() {{
   const scopeEl = document.getElementById('scope');
@@ -5315,8 +5618,13 @@ document.getElementById('reconcileFlowFilter').addEventListener('change', update
 document.getElementById('exportStartDate').addEventListener('change', updateExcel);
 document.getElementById('exportEndDate').addEventListener('change', updateExcel);
 document.getElementById('slipSearch').addEventListener('keydown', (event) => {{ if (event.key === 'Enter') {{ window.__accountSearchMode = 'scoped'; load({{scrollTop:true}}); }} }});
+(function () {{
+  const pendingFilterEl = document.getElementById('pendingStatusFilter');
+  if (pendingFilterEl) pendingFilterEl.addEventListener('change', () => loadPendingActions({{scrollTop:false}}));
+}})();
 try {{ if (location.search && /[?&]token=/.test(location.search)) {{ const cleaned = location.search.replace(/([?&])token=[^&]*/g, '$1').replace(/[?&]$/, '').replace(/&&+/g, '&').replace(/^\\?&/, '?'); window.history.replaceState({{}}, '', location.pathname + (cleaned && cleaned !== '?' ? cleaned : '') + location.hash); }} }} catch (e) {{}}
 load({{home:true, scrollTop:true, smooth:false}}); setInterval(() => load({{lite:true}}), 10000);
+loadPendingActions({{scrollTop:false}}); refreshPendingBadge(); setInterval(refreshPendingBadge, 30000);
 </script>
 </body>
 </html>"""
@@ -5669,10 +5977,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = dashboard_close_period(DB_PATH, chat_id, note, bot_key=bot_key, company_name=company_name)
             except Exception as exc:
                 logger.exception("api_close failed")
-                record_mutation(DB_PATH, "close", actor=actor_fp, chat_id=chat_id, bot_key=bot_key, payload=stored_payload, result_status="error", result_summary=safe_error(exc))
+                close_req_id = str(pending_row.get("request_id") or "")
+                record_endpoint_mutation(DB_PATH, "close", actor=actor_fp, request_id=close_req_id, chat_id=chat_id, bot_key=bot_key, payload=stored_payload, result_status="error", result_summary=safe_error(exc))
                 self.send_json({"ok": False, "error": safe_error(exc), "pending_id": pending_id_executed}, 400)
                 return
-            record_mutation(DB_PATH, "close", actor=actor_fp, chat_id=chat_id, bot_key=bot_key, payload=stored_payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("settlement_id") or result.get("error") or ""))
+            close_req_id = str(pending_row.get("request_id") or "")
+            record_endpoint_mutation(DB_PATH, "close", actor=actor_fp, request_id=close_req_id, chat_id=chat_id, bot_key=bot_key, payload=stored_payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("settlement_id") or result.get("error") or ""))
             if result.get("ok"):
                 mark_pending_executed(DB_PATH, pending_id_executed, executed_result=str(result.get("settlement_id") or ""))
             if isinstance(result, dict):
@@ -5682,49 +5992,117 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/account-limit":
             if not self.role_or_401("admin"):
                 return
-            request_id = uuid.uuid4().hex[:12]
+            actor_fp = self.actor_fingerprint()
+            approval_mode = self.parse_approval_param()
+            if approval_mode == "request":
+                request_id = uuid.uuid4().hex[:12]
+                pending_id = create_pending_action(
+                    DB_PATH,
+                    action="account.limit",
+                    payload=payload,
+                    requested_by=actor_fp,
+                    request_id=request_id,
+                )
+                record_endpoint_mutation(DB_PATH, "account_limit.request", actor=actor_fp, request_id=request_id, chat_id=str(payload.get("chat_id") or ""), payload=payload, result_status="pending", result_summary=f"pending_id={pending_id}")
+                self.send_json({"ok": True, "status": "pending", "pending_id": pending_id, "request_id": request_id, "expires_in_hours": PENDING_ACTION_TTL_HOURS})
+                return
+            # approval_mode == "execute"
+            try:
+                pending_id_executed = int(payload.get("pending_id") or 0)
+            except (TypeError, ValueError):
+                pending_id_executed = 0
+            if not pending_id_executed:
+                self.send_json({"ok": False, "error": "pending_id required for execute"}, 400)
+                return
+            expire_old_pending_actions(DB_PATH)
+            pending_row = load_pending_action(DB_PATH, pending_id_executed)
+            if not pending_row or pending_row.get("action") != "account.limit":
+                self.send_json({"ok": False, "error": "pending action not found"}, 404)
+                return
+            if pending_row.get("status") != "approved":
+                self.send_json({"ok": False, "error": f"not approved (status={pending_row.get('status')})"}, 409)
+                return
+            stored_payload = pending_action_payload(pending_row)
+            request_id = str(pending_row.get("request_id") or uuid.uuid4().hex[:12])
             try:
                 result = save_account_limit(
                     DB_PATH,
-                    str(payload.get("chat_id") or ""),
-                    str(payload.get("limit_key") or ""),
-                    str(payload.get("display_name") or ""),
-                    str(payload.get("bank") or ""),
-                    str(payload.get("account") or ""),
-                    parse_number(payload.get("limit_amount")),
+                    str(stored_payload.get("chat_id") or ""),
+                    str(stored_payload.get("limit_key") or ""),
+                    str(stored_payload.get("display_name") or ""),
+                    str(stored_payload.get("bank") or ""),
+                    str(stored_payload.get("account") or ""),
+                    parse_number(stored_payload.get("limit_amount")),
                 )
-                record_endpoint_mutation(DB_PATH, "account_limit", actor=self.actor_fingerprint(), request_id=request_id, chat_id=str(payload.get("chat_id") or ""), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("limit_key") or result.get("error") or ""))
+                record_endpoint_mutation(DB_PATH, "account_limit", actor=actor_fp, request_id=request_id, chat_id=str(stored_payload.get("chat_id") or ""), payload=stored_payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("limit_key") or result.get("error") or ""))
+                if result.get("ok"):
+                    mark_pending_executed(DB_PATH, pending_id_executed, executed_result=str(result.get("limit_key") or ""))
                 if isinstance(result, dict):
                     result["request_id"] = request_id
+                    result["pending_id"] = pending_id_executed
                 self.send_json(result)
             except Exception as exc:
                 logger.exception("api_account_limit failed")
-                record_endpoint_mutation(DB_PATH, "account_limit", actor=self.actor_fingerprint(), request_id=request_id, chat_id=str(payload.get("chat_id") or ""), payload=payload, result_status="error", result_summary=safe_error(exc))
-                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
+                record_endpoint_mutation(DB_PATH, "account_limit", actor=actor_fp, request_id=request_id, chat_id=str(stored_payload.get("chat_id") or ""), payload=stored_payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id, "pending_id": pending_id_executed}, 400)
             return
         if parsed.path == "/api/company-account":
             if not self.role_or_401("admin"):
                 return
-            request_id = uuid.uuid4().hex[:12]
+            actor_fp = self.actor_fingerprint()
+            approval_mode = self.parse_approval_param()
+            if approval_mode == "request":
+                request_id = uuid.uuid4().hex[:12]
+                pending_id = create_pending_action(
+                    DB_PATH,
+                    action="company.account",
+                    payload=payload,
+                    requested_by=actor_fp,
+                    request_id=request_id,
+                )
+                record_endpoint_mutation(DB_PATH, "company_account.request", actor=actor_fp, request_id=request_id, chat_id=str(payload.get("chat_id") or ""), bot_key=str(payload.get("bot_key") or "default"), payload=payload, result_status="pending", result_summary=f"pending_id={pending_id}")
+                self.send_json({"ok": True, "status": "pending", "pending_id": pending_id, "request_id": request_id, "expires_in_hours": PENDING_ACTION_TTL_HOURS})
+                return
+            # approval_mode == "execute"
+            try:
+                pending_id_executed = int(payload.get("pending_id") or 0)
+            except (TypeError, ValueError):
+                pending_id_executed = 0
+            if not pending_id_executed:
+                self.send_json({"ok": False, "error": "pending_id required for execute"}, 400)
+                return
+            expire_old_pending_actions(DB_PATH)
+            pending_row = load_pending_action(DB_PATH, pending_id_executed)
+            if not pending_row or pending_row.get("action") != "company.account":
+                self.send_json({"ok": False, "error": "pending action not found"}, 404)
+                return
+            if pending_row.get("status") != "approved":
+                self.send_json({"ok": False, "error": f"not approved (status={pending_row.get('status')})"}, 409)
+                return
+            stored_payload = pending_action_payload(pending_row)
+            request_id = str(pending_row.get("request_id") or uuid.uuid4().hex[:12])
             try:
                 result = save_company_account(
                     DB_PATH,
-                    bot_key=str(payload.get("bot_key") or "default"),
-                    chat_id=str(payload.get("chat_id") or ""),
-                    company_name=str(payload.get("company_name") or ""),
-                    bank=str(payload.get("bank") or ""),
-                    account_no=str(payload.get("account_no") or ""),
-                    account_name=str(payload.get("account_name") or ""),
-                    daily_limit=parse_number(payload.get("daily_limit")),
+                    bot_key=str(stored_payload.get("bot_key") or "default"),
+                    chat_id=str(stored_payload.get("chat_id") or ""),
+                    company_name=str(stored_payload.get("company_name") or ""),
+                    bank=str(stored_payload.get("bank") or ""),
+                    account_no=str(stored_payload.get("account_no") or ""),
+                    account_name=str(stored_payload.get("account_name") or ""),
+                    daily_limit=parse_number(stored_payload.get("daily_limit")),
                 )
-                record_endpoint_mutation(DB_PATH, "company_account", actor=self.actor_fingerprint(), request_id=request_id, chat_id=str(payload.get("chat_id") or ""), bot_key=str(payload.get("bot_key") or "default"), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("account_key") or result.get("error") or ""))
+                record_endpoint_mutation(DB_PATH, "company_account", actor=actor_fp, request_id=request_id, chat_id=str(stored_payload.get("chat_id") or ""), bot_key=str(stored_payload.get("bot_key") or "default"), payload=stored_payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("account_key") or result.get("error") or ""))
+                if result.get("ok"):
+                    mark_pending_executed(DB_PATH, pending_id_executed, executed_result=str(result.get("account_key") or ""))
                 if isinstance(result, dict):
                     result["request_id"] = request_id
+                    result["pending_id"] = pending_id_executed
                 self.send_json(result)
             except Exception as exc:
                 logger.exception("api_company_account failed")
-                record_endpoint_mutation(DB_PATH, "company_account", actor=self.actor_fingerprint(), request_id=request_id, chat_id=str(payload.get("chat_id") or ""), bot_key=str(payload.get("bot_key") or "default"), payload=payload, result_status="error", result_summary=safe_error(exc))
-                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
+                record_endpoint_mutation(DB_PATH, "company_account", actor=actor_fp, request_id=request_id, chat_id=str(stored_payload.get("chat_id") or ""), bot_key=str(stored_payload.get("bot_key") or "default"), payload=stored_payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id, "pending_id": pending_id_executed}, 400)
             return
         if parsed.path == "/api/duplicate/unmark":
             if not self.role_or_401("admin", "operator"):
@@ -5869,27 +6247,69 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/reconcile":
             if not self.role_or_401("admin"):
                 return
-            request_id = uuid.uuid4().hex[:12]
+            actor_fp = self.actor_fingerprint()
+            approval_mode = self.parse_approval_param()
+            if approval_mode == "request":
+                request_id = uuid.uuid4().hex[:12]
+                # Capture excel_path resolution into the stored payload so that the eventual
+                # execute branch reconciles against the same file. uploaded_excel_path may be a
+                # temp file written by this request; we persist its string form.
+                req_payload = dict(payload) if isinstance(payload, dict) else {}
+                if uploaded_excel_path and not req_payload.get("excel_path"):
+                    req_payload["excel_path"] = str(uploaded_excel_path)
+                pending_id = create_pending_action(
+                    DB_PATH,
+                    action="reconcile.run",
+                    payload=req_payload,
+                    requested_by=actor_fp,
+                    request_id=request_id,
+                )
+                record_endpoint_mutation(DB_PATH, "reconcile.request", actor=actor_fp, request_id=request_id, chat_id=str(req_payload.get("chat_id") or ""), bot_key=str(req_payload.get("bot_key") or ""), payload=req_payload, result_status="pending", result_summary=f"pending_id={pending_id}")
+                self.send_json({"ok": True, "status": "pending", "pending_id": pending_id, "request_id": request_id, "expires_in_hours": PENDING_ACTION_TTL_HOURS})
+                return
+            # approval_mode == "execute"
+            try:
+                pending_id_executed = int(payload.get("pending_id") or 0)
+            except (TypeError, ValueError):
+                pending_id_executed = 0
+            if not pending_id_executed:
+                self.send_json({"ok": False, "error": "pending_id required for execute"}, 400)
+                return
+            expire_old_pending_actions(DB_PATH)
+            pending_row = load_pending_action(DB_PATH, pending_id_executed)
+            if not pending_row or pending_row.get("action") != "reconcile.run":
+                self.send_json({"ok": False, "error": "pending action not found"}, 404)
+                return
+            if pending_row.get("status") != "approved":
+                self.send_json({"ok": False, "error": f"not approved (status={pending_row.get('status')})"}, 409)
+                return
+            # Use the originally-requested payload so an attacker re-posting the execute
+            # request cannot swap arguments after approval.
+            payload = pending_action_payload(pending_row)
+            request_id = str(pending_row.get("request_id") or uuid.uuid4().hex[:12])
             try:
                 chat_id = str(payload.get("chat_id") or "")
                 bot_key = str(payload.get("bot_key") or "")
                 flow_type = str(payload.get("flow_type") or "all")
                 scope = str(payload.get("scope") or "all")
-                excel_path = safe_backend_excel_path(uploaded_excel_path or str(payload.get("excel_path") or ""))
+                excel_path = safe_backend_excel_path(str(payload.get("excel_path") or ""))
                 if not excel_path.exists():
-                    record_endpoint_mutation(DB_PATH, "reconcile", actor=self.actor_fingerprint(), request_id=request_id, chat_id=chat_id, bot_key=bot_key, payload=payload, result_status="error", result_summary="excel not found")
-                    self.send_json({"ok": False, "error": f"excel not found: {excel_path}", "request_id": request_id}, 404)
+                    record_endpoint_mutation(DB_PATH, "reconcile", actor=actor_fp, request_id=request_id, chat_id=chat_id, bot_key=bot_key, payload=payload, result_status="error", result_summary="excel not found")
+                    self.send_json({"ok": False, "error": f"excel not found: {excel_path}", "request_id": request_id, "pending_id": pending_id_executed}, 404)
                     return
                 result = reconcile_backend_excel(DB_PATH, excel_path, chat_id=chat_id, scope=scope, bot_key=bot_key, flow_type=flow_type)
                 summary = f"diff={result.get('diff_amount')} matched={result.get('matched', {}).get('count')} missing={result.get('missing', {}).get('count')} extra={result.get('extra', {}).get('count')}"
-                record_endpoint_mutation(DB_PATH, "reconcile", actor=self.actor_fingerprint(), request_id=request_id, chat_id=chat_id, bot_key=bot_key, payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=summary)
+                record_endpoint_mutation(DB_PATH, "reconcile", actor=actor_fp, request_id=request_id, chat_id=chat_id, bot_key=bot_key, payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=summary)
+                if result.get("ok"):
+                    mark_pending_executed(DB_PATH, pending_id_executed, executed_result=summary)
                 if isinstance(result, dict):
                     result["request_id"] = request_id
+                    result["pending_id"] = pending_id_executed
                 self.send_json(result)
             except Exception as exc:
                 logger.exception("api_reconcile failed")
-                record_endpoint_mutation(DB_PATH, "reconcile", actor=self.actor_fingerprint(), request_id=request_id, payload=payload, result_status="error", result_summary=safe_error(exc))
-                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
+                record_endpoint_mutation(DB_PATH, "reconcile", actor=actor_fp, request_id=request_id, payload=payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id, "pending_id": pending_id_executed}, 400)
             return
         if parsed.path == "/api/tokens/create":
             if not self.role_or_401("admin"):
