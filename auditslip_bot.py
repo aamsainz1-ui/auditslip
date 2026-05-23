@@ -829,11 +829,15 @@ class AuditslipBot:
             return {"ok": True, "result": {}}
         if not self.token:
             raise RuntimeError("BOT_TOKEN missing")
-        resp = requests.post(f"{self.api_base}/{method}", data=data, files=files, timeout=90)
         try:
-            obj = resp.json()
-        except Exception:
-            obj = {"ok": False, "description": resp.text}
+            resp = requests.post(f"{self.api_base}/{method}", data=data, files=files, timeout=90)
+            try:
+                obj = resp.json()
+            except ValueError:
+                obj = {"ok": False, "description": resp.text}
+        except (requests.ConnectionError, requests.Timeout, requests.RequestException) as exc:
+            log(f"telegram network error: {exc}")
+            raise RuntimeError(f"Telegram {method} network error: {exc}") from exc
         if resp.status_code >= 400 or not obj.get("ok", False):
             raise RuntimeError(f"Telegram {method} failed: {resp.status_code} {obj}")
         return obj
@@ -841,9 +845,14 @@ class AuditslipBot:
     def telegram_get(self, method: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if self.dry_run:
             return {"ok": True, "result": {}}
-        resp = requests.get(f"{self.api_base}/{method}", params=params, timeout=90)
-        obj = resp.json()
-        if resp.status_code >= 400 or not obj.get("ok", False):
+        try:
+            resp = requests.get(f"{self.api_base}/{method}", params=params, timeout=90)
+            resp.raise_for_status()
+            obj = resp.json()
+        except (requests.ConnectionError, requests.Timeout, requests.RequestException, ValueError) as exc:
+            log(f"telegram network error: {exc}")
+            raise RuntimeError(f"Telegram {method} network error: {exc}") from exc
+        if not obj.get("ok", False):
             raise RuntimeError(f"Telegram {method} failed: {resp.status_code} {obj}")
         return obj
 
