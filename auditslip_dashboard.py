@@ -2185,6 +2185,7 @@ def ensure_dashboard_mutation_log_table(db_path: Path) -> None:
         except sqlite3.OperationalError:
             pass
         conn.execute("CREATE INDEX IF NOT EXISTS idx_mutation_entry_hash ON dashboard_mutation_log(entry_hash)")
+        _backfill_legacy_mutation_hashes(conn)
         conn.commit()
     _MUTATION_LOG_READY = True
 
@@ -2200,6 +2201,36 @@ def compute_mutation_hash(prev_hash: str, row: Dict[str, Any]) -> str:
     canonical_obj = {k: row[k] for k in sorted(row.keys()) if k not in _MUTATION_HASH_EXCLUDE_KEYS}
     canonical = json.dumps(canonical_obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(((prev_hash or "") + "|" + canonical).encode("utf-8")).hexdigest()
+
+
+def _backfill_legacy_mutation_hashes(conn: sqlite3.Connection) -> None:
+    """Populate hashes for pre-Phase-B mutation rows whose hash fields were empty.
+
+    This is a one-time migration for production rows created before `prev_hash` and
+    `entry_hash` existed. Never overwrite non-empty hashes: if a row already carries
+    a hash, the verifier must be allowed to catch any mismatch instead of silently
+    repairing possible tampering.
+    """
+    rows = conn.execute(
+        "SELECT id, ts_iso, action, actor, chat_id, bot_key, slip_id, payload_json, "
+        "       result_status, result_summary, prev_hash, entry_hash "
+        "FROM dashboard_mutation_log ORDER BY id ASC"
+    ).fetchall()
+    last_entry_hash = ""
+    for row in rows:
+        row_dict = dict(row)
+        stored_prev = row_dict.get("prev_hash") or ""
+        stored_entry = row_dict.get("entry_hash") or ""
+        if not stored_prev and not stored_entry:
+            row_dict["prev_hash"] = last_entry_hash
+            entry_hash = compute_mutation_hash(last_entry_hash, row_dict)
+            conn.execute(
+                "UPDATE dashboard_mutation_log SET prev_hash=?, entry_hash=? WHERE id=?",
+                (last_entry_hash, entry_hash, row_dict["id"]),
+            )
+            last_entry_hash = entry_hash
+        else:
+            last_entry_hash = stored_entry
 
 
 _MUTATION_PAYLOAD_REDACT_KEYS = {"token", "cookie", "authorization", "auth", "password", "secret"}
