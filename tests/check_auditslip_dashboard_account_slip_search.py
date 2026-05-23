@@ -67,7 +67,7 @@ Dash = importlib.util.module_from_spec(dash_spec)
 sys.modules["auditslip_dashboard"] = Dash
 dash_spec.loader.exec_module(Dash)
 
-snap = Dash.dashboard_snapshot(db_path, bot_key="botA", flow_type="deposit", scope="2026-05-22", slip_search="A-ACC-001")
+snap = Dash.dashboard_snapshot(db_path, bot_key="botA", flow_type="deposit", scope="2026-05-22", slip_search="A-ACC-001", account_search_mode="scoped")
 search = snap["account_slip_search"]
 assert search["query"] == "A-ACC-001", search
 assert search["count"] == 2, search
@@ -78,6 +78,15 @@ assert all(r["bot_key"] == "botA" for r in search["rows"]), search["rows"]
 assert all(r["status"] == "success" and not int(r.get("is_duplicate") or 0) for r in search["rows"]), search["rows"]
 assert all(r["date_key"] == "2026-05-22" for r in search["rows"]), search["rows"]
 assert {r["matched_side"] for r in search["rows"]} == {"to"}, search["rows"]
+
+# Pressing “ดูสลิปบัญชีนี้” reuses slip_search for the image drill-down, but the
+# account index above it must remain complete so other accounts do not disappear.
+account_daily_accounts = {r["account"] for r in snap["company_account_daily"] if r["flow_type"] == "deposit"}
+assert account_daily_accounts == {"A-ACC-001", "A-ACC-999"}, snap["company_account_daily"]
+
+# Internal combined-filter mode is still available for callers that explicitly ask for it.
+snap_both = Dash.dashboard_snapshot(db_path, bot_key="botA", flow_type="deposit", scope="2026-05-22", slip_search="A-ACC-001", account_search_mode="both")
+assert {r["account"] for r in snap_both["company_account_daily"] if r["flow_type"] == "deposit"} == {"A-ACC-001"}, snap_both["company_account_daily"]
 
 # Compact account-number search should work even when users omit punctuation/spaces.
 snap_compact = Dash.dashboard_snapshot(db_path, bot_key="botA", flow_type="deposit", scope="2026-05-22", slip_search="AACC001")

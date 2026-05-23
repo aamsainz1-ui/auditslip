@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Auditslip lightweight VPS dashboard.
 
-Serves a token-protected dashboard for accounting totals, OCR queue health,
-recent slips, and Excel exports.
+Serves a public read-only dashboard for accounting totals, OCR queue health,
+recent slips, and Excel exports. Admin mutations require token or owner login.
 """
 from __future__ import annotations
 
@@ -72,6 +72,8 @@ from auditslip_bot import (
 HOST = os.environ.get("AUDITSLIP_DASHBOARD_HOST", "0.0.0.0")
 PORT = int(os.environ.get("AUDITSLIP_DASHBOARD_PORT", "8095"))
 DASHBOARD_TOKEN = os.environ.get("AUDITSLIP_DASHBOARD_TOKEN", "")
+DASHBOARD_OWNER_USER = os.environ.get("AUDITSLIP_DASHBOARD_OWNER_USER", "owner").strip()
+DASHBOARD_OWNER_PASSWORD = os.environ.get("AUDITSLIP_DASHBOARD_OWNER_PASSWORD", "").strip()
 COOKIE_NAME = "auditslip_dashboard_token"
 TWALLET_DASHBOARD_URL = os.environ.get("AUDITSLIP_TWALLET_DASHBOARD_URL", "http://76.13.190.65:3051").rstrip("/")
 TWALLET_TIMEOUT_SECONDS = float(os.environ.get("AUDITSLIP_TWALLET_TIMEOUT", "2.5"))
@@ -286,13 +288,59 @@ def ensure_account_limit_table(conn: sqlite3.Connection) -> None:
     )
 
 
-def load_account_limits(conn: sqlite3.Connection, chat_id: str) -> Dict[str, Dict[str, Any]]:
+def account_limit_scope_key(chat_id: str = "", bot_key: str = "") -> str:
+    """Return the storage scope for account limits.
+
+    Historical limits were saved per Telegram chat_id. Operators now often select a
+    whole company/bot (for example บริษัท 6) and set limits from the company-level
+    account rows, where there is no single chat_id selected.  Store those as
+    bot-scoped rows (`bot:<bot_key>`) while keeping chat-scoped rows as an override.
+    """
+    chat = clean_display(chat_id)
+    if chat:
+        return chat
+    bot = clean_display(bot_key)
+    if bot and bot not in {"__all__", "all"}:
+        return f"bot:{bot}"
+    return ""
+
+
+def load_account_limits(conn: sqlite3.Connection, chat_id: str, bot_key: str = "") -> Dict[str, Dict[str, Any]]:
     ensure_account_limit_table(conn)
-    rows = conn.execute("SELECT * FROM account_limits WHERE chat_id=?", (str(chat_id),)).fetchall()
-    return {str(r["limit_key"]): dict(r) for r in rows}
+    scopes: List[str] = []
+    bot_scope = account_limit_scope_key("", bot_key)
+    chat_scope = account_limit_scope_key(chat_id, "")
+    # Bot-level limits are defaults; chat-level limits override the same limit_key.
+    for scope in [bot_scope, chat_scope]:
+        if scope and scope not in scopes:
+            scopes.append(scope)
+    if not scopes:
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for scope in scopes:
+        rows = conn.execute("SELECT * FROM account_limits WHERE chat_id=?", (scope,)).fetchall()
+        for r in rows:
+            out[str(r["limit_key"])] = dict(r)
+    return out
+
+
+def account_limit_payload_error(payload: Dict[str, Any]) -> str:
+    if not clean_display(payload.get("chat_id")):
+        return "chat_id required"
+    if not clean_display(payload.get("limit_key")):
+        return "limit_key required"
+    if not clean_display(payload.get("account")):
+        return "account required"
+    return ""
 
 
 def save_account_limit(db_path: Path, chat_id: str, limit_key: str, display_name: str, bank: str, account: str, limit_amount: float) -> Dict[str, Any]:
+    chat_scope = clean_display(chat_id)
+    key = clean_display(limit_key)
+    account_clean = clean_display(account)
+    err = account_limit_payload_error({"chat_id": chat_scope, "limit_key": key, "account": account_clean})
+    if err:
+        return {"ok": False, "error": err, "status_code": 400}
     with connect(db_path) as conn:
         ensure_account_limit_table(conn)
         conn.execute(
@@ -306,10 +354,10 @@ def save_account_limit(db_path: Path, chat_id: str, limit_key: str, display_name
               limit_amount=excluded.limit_amount,
               updated_at=excluded.updated_at
             """,
-            (str(chat_id), str(limit_key), clean_display(display_name), display_bank(bank), clean_display(account), float(limit_amount or 0), int(time.time())),
+            (chat_scope, key, clean_display(display_name), display_bank(bank), account_clean, float(limit_amount or 0), int(time.time())),
         )
         conn.commit()
-    return {"ok": True, "chat_id": str(chat_id), "limit_key": str(limit_key), "limit_amount": float(limit_amount or 0)}
+    return {"ok": True, "chat_id": chat_scope, "limit_key": key, "limit_amount": float(limit_amount or 0)}
 
 
 def account_key_for(company_name: Any, bank: Any, account_no: Any, account_name: Any) -> str:
@@ -682,7 +730,8 @@ def daily_account_totals(conn: sqlite3.Connection, where_clause: str, params: Li
     sorted_groups = sorted(sorted_groups, key=lambda g: float(g["amount"] or 0), reverse=True)
     sorted_groups = sorted(sorted_groups, key=dict_company_sort_key)
     sorted_groups = sorted(sorted_groups, key=lambda g: str(g["sort_date"] or ""), reverse=True)
-    for group in sorted_groups[:limit]:
+    selected_groups = sorted_groups if not limit or limit <= 0 else sorted_groups[:limit]
+    for group in selected_groups:
         limit_row = account_limits.get(group["limit_key"], {})
         raw_limit = limit_row.get("limit_amount") if limit_row else bank_limit_amount(group["bank"])
         daily_limit = float(raw_limit or 0)
@@ -711,6 +760,82 @@ def daily_account_totals(conn: sqlite3.Connection, where_clause: str, params: Li
             }
         )
     return out
+
+
+def withdraw_limit_usage_summary(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Aggregate daily withdrawal account rows into company-level amount vs capacity."""
+    groups: Dict[str, Dict[str, Any]] = {}
+    for row in rows or []:
+        bot_key = clean_display(row.get("bot_key")) or "default"
+        company_name = clean_company_name(row.get("company_name"), bot_key)
+        group = groups.setdefault(
+            bot_key,
+            {
+                "bot_key": bot_key,
+                "company_name": company_name,
+                "withdraw_count": 0,
+                "withdraw_amount": 0.0,
+                "limit_amount": 0.0,
+                "remaining_amount": 0.0,
+                "over_limit_amount": 0.0,
+                "usage_percent": 0.0,
+                "account_count": 0,
+                "account_day_count": 0,
+                "known_limit_account_day_count": 0,
+                "no_limit_account_day_count": 0,
+                "over_limit": False,
+                "accounts": set(),
+                "days": set(),
+            },
+        )
+        amount = float(row.get("amount") or 0)
+        count = int(row.get("count") or 0)
+        limit_amount = float(row.get("daily_limit") or row.get("limit_amount") or 0)
+        account_key = f"{bank_key(row.get('bank'))}|{bank_key(row.get('account'))}"
+        date_key = clean_display(row.get("date_key") or row.get("date"))
+        group["withdraw_count"] += count
+        group["withdraw_amount"] += amount
+        group["limit_amount"] += limit_amount
+        group["account_day_count"] += 1
+        if account_key.strip("|"):
+            group["accounts"].add(account_key)
+        if date_key:
+            group["days"].add(date_key)
+        if limit_amount > 0:
+            group["known_limit_account_day_count"] += 1
+            if amount > limit_amount:
+                group["over_limit_amount"] += amount - limit_amount
+        else:
+            group["no_limit_account_day_count"] += 1
+    out: List[Dict[str, Any]] = []
+    for group in groups.values():
+        limit_amount = float(group["limit_amount"] or 0)
+        withdraw_amount = float(group["withdraw_amount"] or 0)
+        remaining = limit_amount - withdraw_amount if limit_amount else 0.0
+        group["remaining_amount"] = remaining
+        group["usage_percent"] = (withdraw_amount / limit_amount * 100.0) if limit_amount else 0.0
+        group["over_limit"] = bool(limit_amount and withdraw_amount > limit_amount)
+        group["account_count"] = len(group.pop("accounts"))
+        group["day_count"] = len(group.pop("days"))
+        out.append(group)
+    out.sort(key=dict_company_sort_key)
+    return out
+
+
+def withdraw_limit_usage_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    withdraw_amount = sum(float(r.get("withdraw_amount") or 0) for r in rows or [])
+    limit_amount = sum(float(r.get("limit_amount") or 0) for r in rows or [])
+    over_amount = sum(float(r.get("over_limit_amount") or 0) for r in rows or [])
+    account_count = sum(int(r.get("account_count") or 0) for r in rows or [])
+    account_day_count = sum(int(r.get("account_day_count") or 0) for r in rows or [])
+    return {
+        "withdraw_limit_capacity_amount": limit_amount,
+        "withdraw_limit_remaining_amount": (limit_amount - withdraw_amount) if limit_amount else 0.0,
+        "withdraw_limit_over_amount": over_amount,
+        "withdraw_limit_usage_percent": (withdraw_amount / limit_amount * 100.0) if limit_amount else 0.0,
+        "withdraw_limit_account_count": account_count,
+        "withdraw_limit_account_day_count": account_day_count,
+    }
 
 
 def company_account_row_identity(row: sqlite3.Row) -> Tuple[str, str, str, str]:
@@ -1653,6 +1778,10 @@ def duplicate_pair_rows(conn: sqlite3.Connection, chat_id: str, scope: str = "op
     rows = conn.execute(
         f"""
         SELECT d.id AS duplicate_id,
+               COALESCE(NULLIF(d.bot_key,''),'default') AS duplicate_bot_key,
+               d.company_name AS duplicate_company_name,
+               d.chat_id AS duplicate_chat_id,
+               d.chat_title AS duplicate_chat_title,
                d.file_id AS duplicate_file_id,
                d.message_id AS duplicate_message_id,
                d.sender_name AS duplicate_sender_name,
@@ -1670,6 +1799,10 @@ def duplicate_pair_rows(conn: sqlite3.Connection, chat_id: str, scope: str = "op
                d.from_bank AS from_bank,
                d.to_bank AS to_bank,
                d.issuer_bank AS issuer_bank,
+               COALESCE(NULLIF(o.bot_key,''),'default') AS original_bot_key,
+               o.company_name AS original_company_name,
+               o.chat_id AS original_chat_id,
+               o.chat_title AS original_chat_title,
                o.file_id AS original_file_id,
                o.message_id AS original_message_id,
                o.sender_name AS original_sender_name,
@@ -1698,6 +1831,14 @@ def duplicate_pair_rows(conn: sqlite3.Connection, chat_id: str, scope: str = "op
     for row in out:
         row["duplicate_image_url"] = image_url_for(row.get("duplicate_file_id"), row.get("duplicate_id"))
         row["original_image_url"] = image_url_for(row.get("original_file_id"), row.get("original_id"))
+        dup_bot = clean_display(row.get("duplicate_bot_key")) or "default"
+        orig_bot = clean_display(row.get("original_bot_key")) or dup_bot
+        row["duplicate_company_name"] = clean_company_name(row.get("duplicate_company_name"), dup_bot)
+        row["original_company_name"] = clean_company_name(row.get("original_company_name"), orig_bot)
+        row["duplicate_flow_type"] = flow_type_for_title(row.get("duplicate_chat_title"), dup_bot, row.get("duplicate_chat_id"))
+        row["original_flow_type"] = flow_type_for_title(row.get("original_chat_title"), orig_bot, row.get("original_chat_id"))
+        row["duplicate_flow_label"] = flow_label(row["duplicate_flow_type"])
+        row["original_flow_label"] = flow_label(row["original_flow_type"])
         row["from_bank"] = display_bank(row.get("from_bank"))
         row["to_bank"] = display_bank(row.get("to_bank"))
         row["issuer_bank"] = display_bank(row.get("issuer_bank"))
@@ -1817,6 +1958,7 @@ DASHBOARD_LITE_EMPTY_ARRAY_KEYS = (
     "jobs_recent",
     "provider_usage",
     "company_account_daily",
+    "withdraw_limit_usage",
     "account_cross_company",
     "by_transferor",
     "by_account_day",
@@ -1984,15 +2126,16 @@ def flow_split_panels(
     flow_type: str,
     account_limits: Dict[str, Dict[str, Any]],
     search: str = "",
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
     limit_where, limit_params = limit_scope_clause(selected_where, selected_params, flow_type)
     deposit_where, deposit_params = deposit_customer_scope_clause(selected_where, selected_params, flow_type)
     by_transferor = transferor_totals(conn, limit_where, limit_params, account_limits=account_limits)
     by_account_day = daily_account_totals(conn, limit_where, limit_params, account_limits=account_limits)
+    withdraw_limit_usage = withdraw_limit_usage_summary(daily_account_totals(conn, limit_where, limit_params, account_limits=account_limits, limit=0))
     deposit_customer_slips = slip_list_rows(conn, deposit_where, deposit_params, search)
     withdraw_limit_totals = count_amount_for_where(conn, limit_where, limit_params)
     deposit_customer_totals = count_amount_for_where(conn, deposit_where, deposit_params)
-    return by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals
+    return by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals, withdraw_limit_usage
 
 
 def ensure_bank_review_log_table(conn: sqlite3.Connection) -> None:
@@ -2020,6 +2163,32 @@ _DASHBOARD_TOKENS_BOOTSTRAPPED = False
 
 def _hash_token(token: str) -> str:
     return hashlib.sha256((token or "").encode("utf-8", "replace")).hexdigest()
+
+
+def dashboard_owner_login_enabled() -> bool:
+    return bool(DASHBOARD_OWNER_USER and DASHBOARD_OWNER_PASSWORD)
+
+
+def dashboard_owner_session_token() -> str:
+    if not dashboard_owner_login_enabled():
+        return ""
+    material = f"auditslip-owner-session-v1|{DASHBOARD_OWNER_USER}|{DASHBOARD_OWNER_PASSWORD}"
+    return hashlib.sha256(material.encode("utf-8", "replace")).hexdigest()
+
+
+def dashboard_owner_credentials_valid(username: str, password: str) -> bool:
+    if not dashboard_owner_login_enabled():
+        return False
+    import hmac as _hmac
+    return _hmac.compare_digest(clean_display(username), DASHBOARD_OWNER_USER) and _hmac.compare_digest(str(password or ""), DASHBOARD_OWNER_PASSWORD)
+
+
+def dashboard_owner_session_role(token: str) -> str:
+    expected = dashboard_owner_session_token()
+    if not expected or not token:
+        return ""
+    import hmac as _hmac
+    return "admin" if _hmac.compare_digest(token, expected) else ""
 
 
 def ensure_dashboard_tokens_table(db_path: Path) -> None:
@@ -2186,6 +2355,34 @@ def revoke_dashboard_token(db_path: Path, token_hash_prefix: str) -> Dict[str, A
         )
         conn.commit()
     return {"ok": True, "token_hash_prefix": target["token_hash"][:12]}
+
+
+def active_dashboard_token_count(db_path: Path, roles: set[str] | None = None) -> int:
+    ensure_dashboard_tokens_table(db_path)
+    with connect(db_path) as conn:
+        if roles:
+            placeholders = ",".join(["?"] * len(roles))
+            row = conn.execute(
+                f"SELECT COUNT(*) AS c FROM dashboard_tokens WHERE revoked_at IS NULL AND role IN ({placeholders})",
+                list(roles),
+            ).fetchone()
+        else:
+            row = conn.execute("SELECT COUNT(*) AS c FROM dashboard_tokens WHERE revoked_at IS NULL").fetchone()
+    return int(row["c"] if row else 0)
+
+
+def simple_approval_enabled(db_path: Path, actor_fp: str = "", actor_role: str = "") -> bool:
+    """Allow a one-token production setup to approve+execute its own pending action.
+
+    This keeps the pending/audit-chain record, but removes the impossible two-person
+    requirement when the live dashboard has only one active token. Set
+    AUDITSLIP_SIMPLE_APPROVAL=0 to force strict two-person approval.
+    """
+    if os.environ.get("AUDITSLIP_SIMPLE_APPROVAL", "1") in {"0", "false", "False", "no"}:
+        return False
+    if (actor_role or "").strip().lower() != "admin":
+        return False
+    return active_dashboard_token_count(db_path) == 1
 
 
 _MUTATION_LOG_READY = False
@@ -2643,8 +2840,8 @@ def expire_old_pending_actions(db_path: Path) -> int:
         return int(cur.rowcount or 0)
 
 
-def approve_pending_action(db_path: Path, pending_id: int, approver_fp: str) -> Dict[str, Any]:
-    """Approve a pending action. Rejects self-approval (requester == approver)."""
+def approve_pending_action(db_path: Path, pending_id: int, approver_fp: str, allow_self_approval: bool = False) -> Dict[str, Any]:
+    """Approve a pending action. Rejects self-approval unless simple mode explicitly allows it."""
     ensure_pending_actions_table(db_path)
     expire_old_pending_actions(db_path)
     row = load_pending_action(db_path, pending_id)
@@ -2654,7 +2851,7 @@ def approve_pending_action(db_path: Path, pending_id: int, approver_fp: str) -> 
         return {"ok": False, "error": f"cannot approve status={row.get('status')}", "status": 409}
     if not approver_fp:
         return {"ok": False, "error": "approver fingerprint required", "status": 403}
-    if row.get("requested_by") == approver_fp:
+    if row.get("requested_by") == approver_fp and not allow_self_approval:
         return {"ok": False, "error": "self-approval not allowed", "status": 403}
     now_iso = _utc_now_iso()
     with connect(db_path) as conn:
@@ -2725,6 +2922,101 @@ def pending_action_payload(row: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def execute_pending_action(db_path: Path, pending_id: int, actor_fp: str) -> Dict[str, Any]:
+    """Execute an already-approved pending action using its stored payload."""
+    ensure_pending_actions_table(db_path)
+    expire_old_pending_actions(db_path)
+    row = load_pending_action(db_path, pending_id)
+    if not row:
+        return {"ok": False, "error": "pending action not found", "status_code": 404}
+    if row.get("status") != "approved":
+        return {"ok": False, "error": f"not approved (status={row.get('status')})", "pending_id": int(pending_id), "status_code": 409}
+    action = str(row.get("action") or "")
+    payload = pending_action_payload(row)
+    request_id = str(row.get("request_id") or uuid.uuid4().hex[:12])
+    result: Dict[str, Any]
+    mutation_action = action.replace(".", "_")
+    chat_id = str(payload.get("chat_id") or "")
+    bot_key = str(payload.get("bot_key") or "")
+    try:
+        if action == "account.limit":
+            result = save_account_limit(
+                db_path,
+                chat_id,
+                str(payload.get("limit_key") or ""),
+                str(payload.get("display_name") or ""),
+                str(payload.get("bank") or ""),
+                str(payload.get("account") or ""),
+                parse_number(payload.get("limit_amount")),
+            )
+            mutation_action = "account_limit"
+            summary = str(result.get("limit_key") or result.get("error") or "")
+        elif action == "company.account":
+            result = save_company_account(
+                db_path,
+                bot_key=bot_key or "default",
+                chat_id=chat_id,
+                company_name=str(payload.get("company_name") or ""),
+                bank=str(payload.get("bank") or ""),
+                account_no=str(payload.get("account_no") or ""),
+                account_name=str(payload.get("account_name") or ""),
+                daily_limit=parse_number(payload.get("daily_limit")),
+            )
+            mutation_action = "company_account"
+            summary = str(result.get("account_key") or result.get("error") or "")
+        elif action == "slip.delete":
+            slip_id = str(payload.get("id") or payload.get("slip_id") or "")
+            result = delete_dashboard_slip(db_path, slip_id, bot_key, str(payload.get("reason") or "dashboard operator delete"))
+            mutation_action = "delete"
+            summary = str(result.get("previous_status") or result.get("error") or "")
+        elif action == "period.close":
+            result = dashboard_close_period(db_path, chat_id, str(payload.get("note") or "dashboard close"), bot_key=bot_key or "default", company_name=str(payload.get("company_name") or ""))
+            mutation_action = "close"
+            summary = str(result.get("settlement_id") or result.get("error") or "")
+        elif action == "reconcile.run":
+            flow_type = str(payload.get("flow_type") or "all")
+            scope = str(payload.get("scope") or "all")
+            excel_path = safe_backend_excel_path(str(payload.get("excel_path") or ""))
+            if not excel_path.exists():
+                result = {"ok": False, "error": f"excel not found: {excel_path}", "status_code": 404}
+                mutation_action = "reconcile"
+                summary = "excel not found"
+            else:
+                result = reconcile_backend_excel(db_path, excel_path, chat_id=chat_id, scope=scope, bot_key=bot_key, flow_type=flow_type)
+                mutation_action = "reconcile"
+                summary = f"diff={result.get('diff_amount')} matched={result.get('matched', {}).get('count')} missing={result.get('missing', {}).get('count')} extra={result.get('extra', {}).get('count')}"
+        else:
+            return {"ok": False, "error": f"unsupported pending action: {action}", "pending_id": int(pending_id), "status_code": 400}
+    except Exception as exc:
+        logger.exception("execute_pending_action failed action=%s pending_id=%s", action, pending_id)
+        record_endpoint_mutation(db_path, mutation_action, actor=actor_fp, request_id=request_id, chat_id=chat_id, bot_key=bot_key, payload=payload, result_status="error", result_summary=safe_error(exc))
+        return {"ok": False, "error": safe_error(exc), "pending_id": int(pending_id), "request_id": request_id, "status_code": 400}
+
+    ok = bool(isinstance(result, dict) and result.get("ok"))
+    record_endpoint_mutation(db_path, mutation_action, actor=actor_fp, request_id=request_id, chat_id=chat_id, bot_key=bot_key, slip_id=str(payload.get("id") or payload.get("slip_id") or ""), payload=payload, result_status=("ok" if ok else "error"), result_summary=summary)
+    if ok:
+        mark_pending_executed(db_path, pending_id, executed_result=summary)
+    if isinstance(result, dict):
+        result["pending_id"] = int(pending_id)
+        result["request_id"] = request_id
+        result["action"] = action
+        if ok:
+            result["status"] = "executed"
+    return result
+
+
+def simple_auto_execute_pending(db_path: Path, pending_id: int, actor_fp: str, actor_role: str) -> Dict[str, Any]:
+    if not simple_approval_enabled(db_path, actor_fp, actor_role):
+        return {}
+    approval = approve_pending_action(db_path, pending_id, actor_fp, allow_self_approval=True)
+    if not approval.get("ok"):
+        return approval
+    result = execute_pending_action(db_path, pending_id, actor_fp)
+    if isinstance(result, dict):
+        result["simple_approval"] = True
+    return result
 
 
 def verify_mutation_chain(db_path: Path) -> Dict[str, Any]:
@@ -3048,6 +3340,12 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
     account_search_mode_key = clean_display(account_search_mode).lower()
     if account_search_mode_key not in {"scoped", "cross", "both", ""}:
         account_search_mode_key = ""
+    # Keep the company account index as the drill-down launcher. When the operator
+    # clicks “ดูสลิปบัญชีนี้”, slip_search is reused for the image-heavy slip pane;
+    # filtering the account table by that same query makes the list collapse to the
+    # selected account only. Preserve the old combined filtering only for explicit
+    # internal callers that pass account_search_mode="both".
+    account_daily_search_key = slip_search_key if account_search_mode_key == "both" else ""
     with connect(db_path) as conn:
         chats = conn.execute(
             """
@@ -3128,7 +3426,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
             job_params = []
             job_recent_where = "WHERE status IN ('queued','processing','failed')"
             job_recent_params = []
-            by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals = flow_split_panels(
+            by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals, withdraw_limit_usage = flow_split_panels(
                 conn, selected_where, selected_params, flow_type_key, account_limits, slip_search_key
             )
             duplicate_pairs = duplicate_pair_rows(conn, "", scope, "", slip_search_key, flow_type=flow_type_key)
@@ -3139,7 +3437,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
             by_from_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(from_bank,''), '(ไม่ทราบธนาคารต้นทาง)')", "(ไม่ทราบธนาคารต้นทาง)")
             by_to_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(to_bank,''), '(ไม่ทราบธนาคารปลายทาง)')", "(ไม่ทราบธนาคารปลายทาง)")
             by_sender = grouped_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(sender_name,''), NULLIF(username,''), '(ไม่ทราบผู้ส่งรูป)')")
-            company_account_daily = company_account_daily_totals(conn, selected_where, selected_params, slip_search_key)
+            company_account_daily = company_account_daily_totals(conn, selected_where, selected_params, account_daily_search_key)
             account_slip_search = account_slip_search_rows(conn, selected_where, selected_params, slip_search_key)
             account_cross_company = cross_company_account_usage(conn, scope, flow_type_key, selected_bot_key, slip_search_key)
         elif selected_chat_id:
@@ -3149,7 +3447,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
             selected_all_where, selected_all_params = apply_flow_sql(selected_all_where, selected_all_params, flow_type_key)
             duplicate_where = selected_all_where + " AND status='success' AND COALESCE(is_duplicate,0)=1"
             duplicate_params = selected_all_params
-            account_limits = load_account_limits(conn, selected_chat_id)
+            account_limits = load_account_limits(conn, selected_chat_id, selected_bot_key)
             company_accounts = load_company_accounts(conn, selected_bot_key, selected_chat_id)
             open_totals = scoped_counts(conn, selected_chat_id, "open", bot_key=selected_bot_key)
             all_totals = scoped_counts(conn, selected_chat_id, "all", bot_key=selected_bot_key)
@@ -3186,7 +3484,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
             job_params = [selected_chat_id, selected_bot_key]
             job_recent_where = "WHERE chat_id=? AND COALESCE(bot_key,'default')=? AND status IN ('queued','processing','failed')"
             job_recent_params = [selected_chat_id, selected_bot_key]
-            by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals = flow_split_panels(
+            by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals, withdraw_limit_usage = flow_split_panels(
                 conn, selected_where, selected_params, flow_type_key, account_limits, slip_search_key
             )
             duplicate_pairs = duplicate_pair_rows(conn, selected_chat_id, scope, selected_bot_key, slip_search_key, flow_type=flow_type_key)
@@ -3197,7 +3495,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
             by_from_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(from_bank,''), '(ไม่ทราบธนาคารต้นทาง)')", "(ไม่ทราบธนาคารต้นทาง)")
             by_to_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(to_bank,''), '(ไม่ทราบธนาคารปลายทาง)')", "(ไม่ทราบธนาคารปลายทาง)")
             by_sender = grouped_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(sender_name,''), NULLIF(username,''), '(ไม่ทราบผู้ส่งรูป)')")
-            company_account_daily = company_account_daily_totals(conn, selected_where, selected_params, slip_search_key)
+            company_account_daily = company_account_daily_totals(conn, selected_where, selected_params, account_daily_search_key)
             account_slip_search = account_slip_search_rows(conn, selected_where, selected_params, slip_search_key)
             account_cross_company = cross_company_account_usage(conn, scope, flow_type_key, selected_bot_key, slip_search_key)
         else:
@@ -3217,7 +3515,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
                 all_totals = conn.execute(f"SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount FROM slips WHERE {all_where}", all_params).fetchone()
                 selected_totals = conn.execute(f"SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount FROM slips WHERE {selected_where}", selected_params).fetchone()
                 duplicate_totals = conn.execute(f"SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount FROM slips WHERE {duplicate_where}", duplicate_params).fetchone()
-                account_limits = {}
+                account_limits = load_account_limits(conn, "", selected_bot_key)
                 company_accounts = load_company_accounts(conn, selected_bot_key, "")
                 status_where = "WHERE COALESCE(bot_key,'default')=?"
                 status_params = [selected_bot_key]
@@ -3244,7 +3542,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
                 job_params = [selected_bot_key]
                 job_recent_where = "WHERE COALESCE(bot_key,'default')=? AND status IN ('queued','processing','failed')"
                 job_recent_params = [selected_bot_key]
-                by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals = flow_split_panels(
+                by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals, withdraw_limit_usage = flow_split_panels(
                     conn, selected_where, selected_params, flow_type_key, account_limits, slip_search_key
                 )
                 duplicate_pairs = duplicate_pair_rows(conn, "", scope, selected_bot_key, slip_search_key, flow_type=flow_type_key)
@@ -3255,7 +3553,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
                 by_from_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(from_bank,''), '(ไม่ทราบธนาคารต้นทาง)')", "(ไม่ทราบธนาคารต้นทาง)")
                 by_to_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(to_bank,''), '(ไม่ทราบธนาคารปลายทาง)')", "(ไม่ทราบธนาคารปลายทาง)")
                 by_sender = grouped_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(sender_name,''), NULLIF(username,''), '(ไม่ทราบผู้ส่งรูป)')")
-                company_account_daily = company_account_daily_totals(conn, selected_where, selected_params, slip_search_key)
+                company_account_daily = company_account_daily_totals(conn, selected_where, selected_params, account_daily_search_key)
                 account_slip_search = account_slip_search_rows(conn, selected_where, selected_params, slip_search_key)
                 account_cross_company = cross_company_account_usage(conn, scope, flow_type_key, selected_bot_key, slip_search_key)
             else:
@@ -3283,6 +3581,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
                 deposit_customer_slips = []
                 withdraw_limit_totals = {"count": 0, "amount": 0.0}
                 deposit_customer_totals = {"count": 0, "amount": 0.0}
+                withdraw_limit_usage = []
                 duplicate_pairs = []
                 source_bank_review = []
                 source_bank_review_total = 0
@@ -3443,7 +3742,9 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
     if not limit_check_enabled:
         by_transferor = []
         by_account_day = []
+        withdraw_limit_usage = []
 
+    withdraw_limit_totals_extra = withdraw_limit_usage_totals(withdraw_limit_usage)
     company_menu_rows = company_overview_dicts(company_rows, company_job_rows)
     selected_company_summary = company_menu_rows
     if selected_bot_key and selected_bot_key not in {"__all__", "all"}:
@@ -3489,6 +3790,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
             "selected_duplicate_amount": float(duplicate_totals["amount"] or 0),
             "withdraw_limit_count": int(withdraw_limit_totals.get("count", 0) or 0),
             "withdraw_limit_amount": float(withdraw_limit_totals.get("amount", 0) or 0),
+            **withdraw_limit_totals_extra,
             "deposit_customer_count": int(deposit_customer_totals.get("count", 0) or 0),
             "deposit_customer_amount": float(deposit_customer_totals.get("amount", 0) or 0),
             "source_bank_review_count": int(source_bank_review_total or 0),
@@ -3501,6 +3803,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
         "company_summary": selected_company_summary,
         "company_menu": company_menu_rows,
         "company_account_daily": aggregate_dicts(company_account_daily),
+        "withdraw_limit_usage": aggregate_dicts(withdraw_limit_usage),
         "account_slip_search": account_slip_search,
         "cross_company_account_slip_search": cross_company_account_slip_search,
         "account_cross_company": aggregate_dicts(account_cross_company),
@@ -4187,6 +4490,15 @@ def render_dashboard_html(token: str = "") -> str:
     .flow-legend {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:6px; color:#cbd5e1; font-size:12px; }}
     .legend-dot {{ width:10px; height:10px; display:inline-block; border-radius:999px; margin-right:4px; }}
     .legend-dot.withdraw {{ background:#3b82f6; }} .legend-dot.deposit {{ background:#10b981; }}
+    .limit-usage-chart {{ display:grid; gap:10px; margin-top:10px; }}
+    .limit-usage-summary {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; margin:8px 0 12px; }}
+    .limit-usage-stat {{ border:1px solid rgba(148,163,184,.12); border-radius:12px; padding:9px; background:rgba(2,6,23,.22); }}
+    .limit-usage-row {{ display:grid; grid-template-columns:minmax(92px,.7fr) minmax(0,2fr) minmax(130px,.8fr); gap:10px; align-items:center; padding:9px 0; border-bottom:1px solid rgba(148,163,184,.10); }}
+    .limit-usage-row:last-child {{ border-bottom:0; }}
+    .limit-usage-track {{ height:18px; border-radius:999px; overflow:hidden; background:rgba(148,163,184,.18); box-shadow:inset 0 0 0 1px rgba(255,255,255,.08); }}
+    .limit-usage-fill {{ height:100%; border-radius:999px; background:linear-gradient(90deg,#38bdf8,#2563eb); min-width:2px; }}
+    .limit-usage-fill.over {{ background:linear-gradient(90deg,#f59e0b,#dc2626); }}
+    .limit-usage-values {{ text-align:right; font-size:12px; color:#cbd5e1; font-variant-numeric:tabular-nums; }}
     body:not(.admin-mode) [data-admin-only="true"] {{ display:none !important; }}
     .card {{ background:rgba(18,26,47,.94); border:1px solid var(--line); border-radius:16px; padding:16px; box-shadow:0 10px 30px rgba(0,0,0,.18); min-width:0; overflow:hidden; }}
     .label {{ color:var(--muted); font-size:13px; }}
@@ -4282,7 +4594,7 @@ def render_dashboard_html(token: str = "") -> str:
       .responsive-table td.action-cell::before {{ display:none; }}
     }}
     @media (max-width: 420px) {{ .responsive-table td {{ grid-template-columns:1fr; text-align:left; }} .responsive-table td::before {{ margin-bottom:2px; }} }}
-    @media (max-width: 560px) {{ .topbar {{ position:static; }} .wrap {{ padding:10px; }} .grid {{ grid-template-columns:1fr; }} .operator-home-grid {{ grid-template-columns:1fr; }} .value {{ font-size:24px; }} .card {{ padding:12px; border-radius:14px; }} h1 {{ font-size:20px; }} .cross-company-head, .cross-company-company-head {{ display:grid; }} .cross-company-chips {{ justify-content:flex-start; }} .cross-company-summary {{ grid-template-columns:1fr; }} .cross-company-companies {{ grid-template-columns:1fr; }} .cross-company-total {{ text-align:left; white-space:normal; }} .cross-company-day-row {{ grid-template-columns:1fr; gap:2px; }} .cross-company-day-row .day-amount {{ text-align:left; white-space:normal; }} }}
+    @media (max-width: 560px) {{ .topbar {{ position:static; }} .wrap {{ padding:10px; }} .grid {{ grid-template-columns:1fr; }} .operator-home-grid {{ grid-template-columns:1fr; }} .value {{ font-size:24px; }} .card {{ padding:12px; border-radius:14px; }} h1 {{ font-size:20px; }} .limit-usage-summary {{ grid-template-columns:1fr; }} .limit-usage-row {{ grid-template-columns:1fr; gap:6px; }} .limit-usage-values {{ text-align:left; }} .cross-company-head, .cross-company-company-head {{ display:grid; }} .cross-company-chips {{ justify-content:flex-start; }} .cross-company-summary {{ grid-template-columns:1fr; }} .cross-company-companies {{ grid-template-columns:1fr; }} .cross-company-total {{ text-align:left; white-space:normal; }} .cross-company-day-row {{ grid-template-columns:1fr; gap:2px; }} .cross-company-day-row .day-amount {{ text-align:left; white-space:normal; }} }}
   </style>
 </head>
 <body>
@@ -4318,6 +4630,14 @@ def render_dashboard_html(token: str = "") -> str:
           <label class="side-field"><span>ค้นหา</span><input id="slipSearch" placeholder="ค้นหาสลิป / ค้นหาสลิปซ้ำ" /></label>
           <div class="side-actions"><button onclick="load({{scrollTop:true}})">ค้นหา</button><button onclick="clearSlipSearch()">ล้างค้นหา</button><button onclick="load({{scrollTop:true}})">Refresh</button></div>
         </section>
+
+        <details class="side-panel side-admin-login-panel" data-admin-only="true" open>
+          <summary><span>เข้าสู่ระบบ Admin</span><small>ไม่ใช้ token URL</small></summary>
+          <div class="side-field" style="margin-top:10px"><span>User</span><input id="adminUsername" autocomplete="username" value="owner" /></div>
+          <div class="side-field"><span>Password</span><input id="adminPassword" type="password" autocomplete="current-password" placeholder="รหัสผ่าน" /></div>
+          <div class="side-actions"><button type="button" onclick="adminLogin()">Login Admin</button><button type="button" onclick="adminLogout()">Logout</button></div>
+          <div id="adminLoginStatus" class="mini muted">เปิดดูข้อมูลได้เลยโดยไม่ต้อง login · login เฉพาะตอนตั้งค่า/อนุมัติ/แก้ไข</div>
+        </details>
 
         <details class="side-panel side-admin-panel" data-admin-only="true">
           <summary><span>ตั้งค่าบอท Telegram</span><small>Admin/debug</small></summary>
@@ -4371,6 +4691,8 @@ def render_dashboard_html(token: str = "") -> str:
     <section id="section-metrics" class="grid menu-section" data-always-visible="true">
       <div class="card"><div class="label">ยอดถอนวันนี้/ช่วงที่เลือก</div><div id="withdrawAmount" class="value good">-</div></div>
       <div class="card"><div class="label">สลิปถอน</div><div id="withdrawCount" class="value">-</div></div>
+      <div class="card"><div class="label">ถอนรวม / วงเงินรวม</div><div id="withdrawLimitUsageRatio" class="value good">-</div><div id="withdrawLimitUsageMeta" class="mini">วงเงินรวมทุกบัญชีถอน</div></div>
+      <div class="card"><div class="label">เหลือ/เกินวงเงินถอน</div><div id="withdrawLimitRemaining" class="value good">-</div><div id="withdrawLimitRemainingMeta" class="mini">เทียบกับวงเงินรวม</div></div>
       <div class="card"><div class="label">ยอดฝาก/เติมมือวันนี้/ช่วงที่เลือก</div><div id="depositAmount" class="value good">-</div></div>
       <div class="card"><div class="label">สลิปฝาก/เติมมือ</div><div id="depositCount" class="value">-</div></div>
       <div class="card"><div class="label">คิวรอ OCR</div><div id="queued" class="value warn">-</div></div>
@@ -4400,6 +4722,7 @@ def render_dashboard_html(token: str = "") -> str:
       <div class="card"><h3>ยอดแยกตามผู้ส่งรูป</h3><div id="bySender"></div></div>
     </section>
     <section id="limitSection" class="sections menu-section" hidden>
+      <div class="card"><h3>ยอดถอนรวม / วงเงินรวมทุกบัญชี</h3><div class="mini">รวมทุกบัญชีถอนในบริษัท/วันที่เลือก · วงเงินเป็นวงเงินรายวันรวมตามบัญชีและวันที่ใน scope</div><div id="withdrawLimitUsageChart"></div></div>
       <div class="card"><h3>ฝั่งถอน · วงเงินรายวันต่อบัญชี</h3><div id="withdrawLimitSummary" class="mini">นับเฉพาะกลุ่มถอน ไม่รวมฝาก/เติมมือ</div><div class="mini">แยกตามวันที่ของสลิปและเลขบัญชีผู้โอน วงเงิน/วันจะ reset ทุกวัน และไม่นับสลิปซ้ำ</div><div id="byAccountDay"></div></div>
       <div class="card"><h3>ฝั่งถอน · ตั้งวงเงินจากยอดรายวัน</h3><div class="mini">แสดงแยกตามวันเท่านั้น ไม่มีการเอาวันอื่นมารวมกัน วงเงินรายวัน reset ทุกวัน</div><div class="toolbar"><input id="limitKey" placeholder="เลือกบัญชีจากปุ่มตั้งวงเงิน" readonly /><input id="limitName" placeholder="ชื่อบัญชี" /><input id="limitBank" placeholder="ธนาคาร" /><input id="limitAccount" placeholder="เลขบัญชี" /><input id="limitAmount" type="number" step="0.01" placeholder="วงเงินต่อวัน" /><button onclick="saveAccountLimit()">บันทึกวงเงิน</button><span class="muted">ตั้งวงเงินบัญชี</span></div><div id="byTransferor"></div></div>
     </section>
@@ -4426,8 +4749,8 @@ def render_dashboard_html(token: str = "") -> str:
     </section>
     <section id="section-pending" class="sections menu-section" hidden>
       <div class="card">
-        <h3>รออนุมัติ (Two-person approval)</h3>
-        <div class="mini">รายการที่ผู้ใช้ขออนุมัติ — ต้องใช้คนละ token approve เท่านั้น</div>
+        <h3>รออนุมัติ (Two-person approval) / โหมดง่าย</h3>
+        <div class="mini">ถ้ามี token เดียว ระบบจะใช้โหมดง่าย: ยังบันทึก pending/audit เหมือนเดิม แต่ admin สามารถอนุมัติ+ทำรายการได้ทันที</div>
         <div class="pending-toolbar">
           <label class="mini">สถานะ
             <select id="pendingStatusFilter" title="กรองสถานะคำขอ">
@@ -4555,6 +4878,10 @@ function scrollDashboardTop(smooth=true) {{
   if (target && target.scrollIntoView) target.scrollIntoView({{behavior: smooth ? 'smooth' : 'auto', block:'start'}});
   window.scrollTo({{top:0, left:0, behavior: smooth ? 'smooth' : 'auto'}});
 }}
+function scrollElementIntoView(id, smooth=true) {{
+  const target = document.getElementById(id);
+  if (target && target.scrollIntoView) target.scrollIntoView({{behavior: smooth ? 'smooth' : 'auto', block:'start'}});
+}}
 function refreshDashboardHome() {{
   showMenuSection('section-operator-home', {{scroll:false, persist:false}});
   return load({{home:true, scrollTop:true, smooth:false}});
@@ -4596,6 +4923,31 @@ function query(params={{}}) {{
   return qs ? '?' + qs : '';
 }}
 function postHeaders(extra={{}}) {{ return {{...ACTION_HEADER, 'Content-Type':'application/json', ...extra}}; }}
+async function adminLogin() {{
+  const status = document.getElementById('adminLoginStatus');
+  const usernameEl = document.getElementById('adminUsername');
+  const passwordEl = document.getElementById('adminPassword');
+  const username = usernameEl ? usernameEl.value : '';
+  const password = passwordEl ? passwordEl.value : '';
+  if (status) status.textContent = 'กำลัง login admin...';
+  const res = await fetch('/api/login', {{method:'POST', headers:postHeaders(), body: JSON.stringify({{username, password}})}});
+  let data = {{}};
+  try {{ data = await res.json(); }} catch (e) {{ data = {{error:'อ่านผล login ไม่ได้'}}; }}
+  if (!res.ok || !data.ok) {{
+    if (status) status.textContent = 'Login ไม่สำเร็จ';
+    return await dashboardNotify(data.error || 'Login ไม่สำเร็จ');
+  }}
+  if (passwordEl) passwordEl.value = '';
+  if (status) status.textContent = 'Login แล้ว · สิทธิ '+(data.role || 'admin');
+  await loadPendingActions({{scrollTop:false}});
+  refreshPendingBadge();
+}}
+async function adminLogout() {{
+  const status = document.getElementById('adminLoginStatus');
+  const res = await fetch('/api/logout', {{method:'POST', headers:ACTION_HEADER}});
+  if (status) status.textContent = res.ok ? 'Logout แล้ว · ยังดู dashboard ได้ตามปกติ' : 'Logout ไม่สำเร็จ';
+  await loadPendingActions({{scrollTop:false}});
+}}
 function scopeName(value) {{ return value === 'open' ? 'รอบเปิด' : (value === 'today' ? 'วันนี้' : (value === 'all' ? 'ทั้งหมด' : value || '-')); }}
 function isSingleChatSelected() {{
   const parts = selectedChatParts();
@@ -4696,6 +5048,32 @@ function renderDailyFlowChart(rows) {{
         + '</div>';
     }}).join('')+'</div>';
 }}
+function renderWithdrawLimitUsageChart(rows, totals={{}}) {{
+  const items = rows || [];
+  const withdrawn = Number((totals && totals.withdraw_limit_amount) || 0);
+  const capacity = Number((totals && totals.withdraw_limit_capacity_amount) || 0);
+  const remaining = Number((totals && totals.withdraw_limit_remaining_amount) || 0);
+  const percent = Number((totals && totals.withdraw_limit_usage_percent) || 0);
+  const over = Number((totals && totals.withdraw_limit_over_amount) || 0);
+  const summary = '<div class="limit-usage-summary">'
+    + '<div class="limit-usage-stat"><div class="label">ถอนรวม</div><div class="value good">'+money(withdrawn)+'</div></div>'
+    + '<div class="limit-usage-stat"><div class="label">วงเงินรวม</div><div class="value">'+(capacity ? money(capacity) : '-')+'</div><div class="mini">'+esc((totals && totals.withdraw_limit_account_day_count) || 0)+' บัญชี/วัน</div></div>'
+    + '<div class="limit-usage-stat"><div class="label">เหลือ/เกิน</div><div class="value '+(remaining < 0 || over > 0 ? 'bad' : 'good')+'">'+(capacity ? money(remaining) : '-')+'</div><div class="mini">'+(capacity ? percent.toFixed(1)+'%' : 'ยังไม่มีวงเงิน')+'</div></div>'
+    + '</div>';
+  if (!items.length) return summary + '<div class="muted">ยังไม่มีข้อมูลวงเงินถอนใน scope นี้</div>';
+  return summary + '<div class="limit-usage-chart">'+items.map(r => {{
+    const rowPercent = Number(r.usage_percent || 0);
+    const width = Math.max(2, Math.min(100, Math.round(rowPercent)));
+    const isOver = Boolean(r.over_limit);
+    const remainingText = Number(r.limit_amount || 0) ? money(r.remaining_amount || 0) : '-';
+    const noLimit = Number(r.no_limit_account_day_count || 0) ? ' · ไม่มีวงเงิน '+esc(r.no_limit_account_day_count)+' บัญชี/วัน' : '';
+    return '<div class="limit-usage-row '+(isOver ? 'over' : '')+'">'
+      + '<div><b>'+esc(r.company_name || r.bot_key || '-')+'</b><div class="mini">'+esc(r.account_count || 0)+' บัญชี · '+esc(r.withdraw_count || 0)+' สลิป</div></div>'
+      + '<div><div class="limit-usage-track"><div class="limit-usage-fill '+(isOver ? 'over' : '')+'" style="width:'+width+'%"></div></div><div class="mini">ใช้ไป '+rowPercent.toFixed(1)+'%'+noLimit+'</div></div>'
+      + '<div class="limit-usage-values"><div>ถอน '+money(r.withdraw_amount || 0)+'</div><div>วงเงิน '+(Number(r.limit_amount || 0) ? money(r.limit_amount || 0) : '-')+'</div><div class="'+(isOver ? 'bad' : 'good')+'">เหลือ/เกิน '+remainingText+'</div></div>'
+      + '</div>';
+  }}).join('')+'</div>';
+}}
 function flowName(value) {{ return value === 'deposit' ? 'ฝาก/เติมมือ' : (value === 'withdraw' ? 'ถอน' : (value === 'other' ? 'อื่นๆ' : 'รวมทุกกลุ่ม')); }}
 function flowChipName(value) {{ return value === 'deposit' ? 'กลุ่มฝาก/เติมมือ' : (value === 'withdraw' ? 'กลุ่มถอน' : (value === 'other' ? 'กลุ่มอื่นๆ' : 'รวมทุกกลุ่ม')); }}
 function renderCompanyAccountDaily(rows) {{
@@ -4727,7 +5105,7 @@ function pickAccountSearch(queryText, crossCompany=false) {{
     document.getElementById('chat').value = '__all__||' + flow;
   }}
   showMenuSection('section-company-accounts', {{scroll:false}});
-  load({{scrollTop:true}});
+  load({{scrollTarget:'accountSlipSearch', smooth:true}});
 }}
 function wireAccountSearchButtons() {{
   document.querySelectorAll('[data-account-search]').forEach(btn => {{
@@ -4948,6 +5326,9 @@ async function reprocessAllIssues(btn) {{
   if (status) status.textContent = 'รี OCR Issues เสร็จ: สำเร็จ '+ok+' / fail '+fail;
   await load();
 }}
+function duplicateContextLine(prefix, company, bot, chatTitle, flowLabel) {{
+  return '<div class="mini dupe-meta"><b>'+esc(prefix)+'</b> · บริษัท/Bot '+esc(company || bot || '-')+' ('+esc(bot || '-')+') · กลุ่ม Telegram '+esc(chatTitle || '-')+' · '+esc(flowLabel || '-').replace('กลุ่ม','กลุ่ม')+'</div>';
+}}
 function renderDuplicatePairs(rows) {{
   if (!rows || !rows.length) return '<div class="muted">ยังไม่พบสลิปซ้ำในช่วงนี้</div>';
   return '<div class="slip-cards">'+rows.map(r => {{
@@ -4960,6 +5341,8 @@ function renderDuplicatePairs(rows) {{
     return '<div class="slip-card dupe-card">'
       + '<div class="dupe-thumbs">'+dupImg+origImg+'</div>'
       + '<div class="slip-body"><div class="top"><b>สลิปซ้ำ</b><span class="pill">ซ้ำกับใบต้นฉบับ</span></div>'
+      + duplicateContextLine('ใบซ้ำ', r.duplicate_company_name, r.duplicate_bot_key, r.duplicate_chat_title, r.duplicate_flow_label || flowName(r.duplicate_flow_type))
+      + duplicateContextLine('ต้นฉบับ', r.original_company_name, r.original_bot_key, r.original_chat_title, r.original_flow_label || flowName(r.original_flow_type))
       + '<div><b>ข้อมูลใบซ้ำ</b>: '+esc((r.slip_date_display || r.slip_date_iso || '')+' '+(r.slip_time || ''))+' · '+esc(r.transferor_name || '(ไม่ทราบผู้โอน)')+' → '+esc(r.recipient_name || '-')+'</div>'
       + '<div class="mini">'+esc(banks)+' · ref '+esc(ref)+' · msg '+esc(r.duplicate_message_id || '-')+'</div>'
       + '<div><b>ข้อมูลต้นฉบับ</b>: '+esc((r.original_slip_date_display || r.original_slip_date_iso || '')+' '+(r.original_slip_time || ''))+' · '+esc(r.original_transferor_name || r.transferor_name || '(ไม่ทราบผู้โอน)')+' → '+esc(r.original_recipient_name || r.recipient_name || '-')+'</div>'
@@ -5089,14 +5472,24 @@ function pickLimit(limitKey, name, bank, account, amount) {{
   document.getElementById('limitAccount').value = account;
   document.getElementById('limitAmount').value = amount || '';
 }}
-async function saveAccountLimit() {{
+function limitScopeKey() {{
   const parts = selectedChatParts();
-  const payload = {{chat_id: parts.chat_id, limit_key: document.getElementById('limitKey').value, display_name: document.getElementById('limitName').value, bank: document.getElementById('limitBank').value, account: document.getElementById('limitAccount').value, limit_amount: Number(document.getElementById('limitAmount').value || 0)}};
-  if (!payload.chat_id || !payload.limit_key) return await dashboardNotify('เลือกบัญชีจากปุ่มตั้งวงเงินก่อน');
-  const res = await fetch('/api/account-limit'+query(), {{method:'POST', headers:postHeaders(), body: JSON.stringify(payload)}});
+  if (parts.chat_id) return parts.chat_id;
+  const bot = selectedBotKey() || parts.bot_key || (currentSnapshot && currentSnapshot.selected_bot_key) || '';
+  if (bot && bot !== '__all__' && bot !== 'all') return 'bot:' + bot;
+  return '';
+}}
+async function saveAccountLimit() {{
+  const scopeKey = limitScopeKey();
+  const payload = {{chat_id: scopeKey, limit_key: document.getElementById('limitKey').value, display_name: document.getElementById('limitName').value, bank: document.getElementById('limitBank').value, account: document.getElementById('limitAccount').value, limit_amount: Number(document.getElementById('limitAmount').value || 0)}};
+  if (!payload.chat_id) return await dashboardNotify('เลือกบริษัทหรือกลุ่มก่อนตั้งวงเงิน');
+  if (!payload.limit_key) return await dashboardNotify('เลือกบัญชีจากปุ่มตั้งวงเงินก่อน');
+  const res = await fetch('/api/account-limit'+query({{approval:'request'}}), {{method:'POST', headers:postHeaders(), body: JSON.stringify(payload)}});
   const data = await res.json();
   if (!res.ok || !data.ok) return await dashboardNotify(data.error || 'บันทึกไม่สำเร็จ');
-  await load();
+  if (data.status === 'pending') await dashboardNotify('ส่งคำขอตั้งวงเงินแล้ว · รออนุมัติ #' + (data.pending_id || '-'));
+  else await dashboardNotify('บันทึกวงเงินแล้ว');
+  await load({{scrollTarget:'byTransferor', smooth:false}});
 }}
 function renderTelegramBots(rows) {{
   if (!rows || !rows.length) return '<div class="muted">ยังไม่มีข้อมูลบอท</div>';
@@ -5260,7 +5653,8 @@ function pendingDisplayTime(value) {{
   if (!s) return '-';
   return esc(s.replace('T', ' ').replace(/\\.[0-9]+Z?$/, '').replace(/Z$/, ''));
 }}
-function pendingRowsTable(rows, currentActor) {{
+// Backward marker for regression tests: pendingRowsTable(rows, currentActor)
+function pendingRowsTable(rows, currentActor, simpleApproval=false) {{
   if (!rows || !rows.length) return '<div class="muted">ไม่มีคำขอในสถานะนี้</div>';
   const head = '<thead><tr>'+
     '<th>ID</th>'+
@@ -5280,7 +5674,10 @@ function pendingRowsTable(rows, currentActor) {{
     const isSelfRequest = currentActor && String(r.requested_by || '') === String(currentActor);
     const buttons = [];
     if (status === 'pending') {{
-      if (isSelfRequest) {{
+      if (isSelfRequest && simpleApproval) {{
+        buttons.push('<button data-pending-id="'+id+'" data-admin-only="true" onclick="executePending('+id+')">อนุมัติ+ทำรายการ</button>');
+        buttons.push('<span class="mini good">โหมดง่าย · token เดียว</span>');
+      }} else if (isSelfRequest) {{
         buttons.push('<button disabled title="คำขอที่คุณสร้างเอง ต้องใช้ token อื่นอนุมัติ">ใช้ token อื่นอนุมัติ</button>');
         buttons.push('<span class="mini warn">คำขอที่คุณสร้างเอง · ห้าม self-approve</span>');
       }} else {{
@@ -5320,9 +5717,9 @@ async function loadPendingActions(options={{}}) {{
     }}
     const data = await res.json();
     const rows = (data && data.items) || [];
-    container.innerHTML = pendingRowsTable(rows, data.current_actor || '');
+    container.innerHTML = pendingRowsTable(rows, data.current_actor || '', Boolean(data.simple_approval_enabled));
     enhanceResponsiveTables(container);
-    if (meta) meta.textContent = 'พบ ' + (data.count || rows.length || 0) + ' รายการ';
+    if (meta) meta.textContent = 'พบ ' + (data.count || rows.length || 0) + ' รายการ' + (data.simple_approval_enabled ? ' · โหมดง่าย token เดียว' : '');
     if (status === 'pending') {{ updatePendingBadge(rows.length); }}
   }} catch (err) {{
     container.innerHTML = '<div class="bad">โหลดรายการรออนุมัติไม่สำเร็จ</div>';
@@ -5456,6 +5853,7 @@ async function load(options={{}}) {{
       jobs_recent: currentSnapshot.jobs_recent || [],
       provider_usage: currentSnapshot.provider_usage || [],
       company_account_daily: currentSnapshot.company_account_daily || [],
+      withdraw_limit_usage: currentSnapshot.withdraw_limit_usage || [],
       account_slip_search: currentSnapshot.account_slip_search || data.account_slip_search,
       cross_company_account_slip_search: currentSnapshot.cross_company_account_slip_search || data.cross_company_account_slip_search,
       account_cross_company: currentSnapshot.account_cross_company || [],
@@ -5504,6 +5902,22 @@ async function load(options={{}}) {{
   }}
   document.getElementById('withdrawAmount').textContent = money(data.totals.withdraw_limit_amount || 0);
   document.getElementById('withdrawCount').textContent = data.totals.withdraw_limit_count || 0;
+  const withdrawCapacity = Number(data.totals.withdraw_limit_capacity_amount || 0);
+  const withdrawRemaining = Number(data.totals.withdraw_limit_remaining_amount || 0);
+  const withdrawUsagePct = Number(data.totals.withdraw_limit_usage_percent || 0);
+  const withdrawOver = Number(data.totals.withdraw_limit_over_amount || 0);
+  const usageRatioEl = document.getElementById('withdrawLimitUsageRatio');
+  const usageMetaEl = document.getElementById('withdrawLimitUsageMeta');
+  const remainingEl = document.getElementById('withdrawLimitRemaining');
+  const remainingMetaEl = document.getElementById('withdrawLimitRemainingMeta');
+  if (usageRatioEl) usageRatioEl.textContent = withdrawCapacity ? (money(data.totals.withdraw_limit_amount || 0) + ' / ' + money(withdrawCapacity)) : '-';
+  if (usageMetaEl) usageMetaEl.textContent = withdrawCapacity ? (withdrawUsagePct.toFixed(1) + '% · ' + esc(data.totals.withdraw_limit_account_day_count || 0) + ' บัญชี/วัน') : 'ยังไม่มีวงเงินถอนใน scope นี้';
+  if (remainingEl) {{
+    remainingEl.textContent = withdrawCapacity ? money(withdrawRemaining) : '-';
+    remainingEl.classList.toggle('bad', withdrawRemaining < 0 || withdrawOver > 0);
+    remainingEl.classList.toggle('good', !(withdrawRemaining < 0 || withdrawOver > 0));
+  }}
+  if (remainingMetaEl) remainingMetaEl.textContent = withdrawOver > 0 ? ('เกินรวม ' + money(withdrawOver)) : 'เหลือจากวงเงินรวม';
   document.getElementById('depositAmount').textContent = money(data.totals.deposit_customer_amount || 0);
   document.getElementById('depositCount').textContent = data.totals.deposit_customer_count || 0;
   document.getElementById('queued').textContent = data.jobs.queued || 0;
@@ -5563,8 +5977,10 @@ async function load(options={{}}) {{
     document.getElementById('dailyFlowChart').innerHTML = renderDailyFlowChart(data.daily_flow_summary);
     document.getElementById('byDate').innerHTML = dateTable(data.by_date);
     const withdrawSummary = document.getElementById('withdrawLimitSummary');
+    const withdrawUsageChart = document.getElementById('withdrawLimitUsageChart');
     const depositSummary = document.getElementById('depositCustomerSummary');
-    if (withdrawSummary) withdrawSummary.textContent = 'ฝั่งถอน/วงเงิน: ' + (data.totals.withdraw_limit_count || 0) + ' สลิป · ' + money(data.totals.withdraw_limit_amount || 0) + ' · ไม่รวมฝาก/เติมมือ';
+    if (withdrawUsageChart) withdrawUsageChart.innerHTML = renderWithdrawLimitUsageChart(data.withdraw_limit_usage || [], data.totals || {{}});
+    if (withdrawSummary) withdrawSummary.textContent = 'ฝั่งถอน/วงเงิน: ' + (data.totals.withdraw_limit_count || 0) + ' สลิป · ' + money(data.totals.withdraw_limit_amount || 0) + ' / วงเงินรวม ' + money(data.totals.withdraw_limit_capacity_amount || 0) + ' · ไม่รวมฝาก/เติมมือ';
     if (depositSummary) depositSummary.textContent = 'ฝั่งฝาก/เติมมือ: ' + (data.totals.deposit_customer_count || 0) + ' สลิป · ' + money(data.totals.deposit_customer_amount || 0) + ' · สลิปลูกค้า ไม่มีวงเงิน';
     if (data.limit_check_enabled === false) {{
       const limitNote = '<div class="muted">กลุ่มฝาก/เติมมือ ไม่ต้องเช็กวงเงิน</div>';
@@ -5588,8 +6004,12 @@ async function load(options={{}}) {{
   enhanceResponsiveTables();
   updateReconcileScopePreview();
   updateExcel();
-  if (!initialMenuApplied || (options && options.home)) {{ initialMenuApplied = true; showMenuSection('section-operator-home', {{scroll:false, persist:false}}); }}
-  if (options && options.scrollTop) scrollDashboardTop(options.smooth !== false);
+  if (!initialMenuApplied || (options && options.home)) {{
+    initialMenuApplied = true;
+    if (!(options && options.scrollTarget)) showMenuSection('section-operator-home', {{scroll:false, persist:false}});
+  }}
+  if (options && options.scrollTarget) scrollElementIntoView(options.scrollTarget, options.smooth !== false);
+  else if (options && options.scrollTop) scrollDashboardTop(options.smooth !== false);
   try {{ loadPendingActions({{scrollTop:false}}); }} catch (e) {{}}
 }}
 function selectedDashboardScope() {{
@@ -5766,6 +6186,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             import hmac as _hmac
             if _hmac.compare_digest(tok, DASHBOARD_TOKEN):
                 return "admin"
+        owner_role = dashboard_owner_session_role(tok)
+        if owner_role:
+            return owner_role
         return ""
 
     def require_role(self, *allowed: str) -> bool:
@@ -5824,13 +6247,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def send_json(self, obj: Any, status: int = 200) -> None:
         self.send_bytes(status, json.dumps(obj, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
 
+    def read_simple_payload(self) -> Dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        raw = self.rfile.read(length).decode("utf-8") if length else ""
+        if not raw:
+            return {}
+        content_type = self.headers.get("Content-Type", "")
+        if "application/json" in content_type:
+            try:
+                obj = json.loads(raw)
+                return obj if isinstance(obj, dict) else {}
+            except Exception:
+                return {}
+        return {k: v[0] for k, v in parse_qs(raw).items()}
+
+    def set_owner_session_cookie(self) -> str:
+        session_token = dashboard_owner_session_token()
+        return f"{COOKIE_NAME}={session_token}; {self.cookie_attrs()}"
+
+    def clear_owner_session_cookie(self) -> str:
+        return f"{COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
             self.send_json({"ok": True, "app": APP_NAME})
-            return
-        if not self.authorized():
-            self.send_bytes(HTTPStatus.UNAUTHORIZED, b"Unauthorized", "text/plain; charset=utf-8")
             return
         q = parse_qs(parsed.query)
         if q.get("token") and parsed.path in {"/", "/index.html"}:
@@ -5886,7 +6327,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 limit = 200
             rows = list_pending_actions(DB_PATH, status=status_filter, limit=limit)
-            self.send_json({"ok": True, "items": rows, "count": len(rows), "current_actor": self.actor_fingerprint(), "current_role": self.actor_role()})
+            actor_fp = self.actor_fingerprint()
+            actor_role = self.actor_role()
+            self.send_json({"ok": True, "items": rows, "count": len(rows), "current_actor": actor_fp, "current_role": actor_role, "simple_approval_enabled": simple_approval_enabled(DB_PATH, actor_fp, actor_role)})
             return
         if parsed.path == "/api/slip-image":
             q = parse_qs(parsed.query)
@@ -5954,6 +6397,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": safe_error(exc)}, 400)
             return
         if parsed.path == "/api/audit-chain/verify":
+            if not self.role_or_401("admin", "auditor"):
+                return
             try:
                 self.send_json(verify_mutation_chain(DB_PATH))
             except Exception as exc:
@@ -5961,6 +6406,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": safe_error(exc)}, 500)
             return
         if parsed.path == "/api/audit-chain/tail":
+            if not self.role_or_401("admin", "auditor"):
+                return
             q = parse_qs(parsed.query)
             limit_str = (q.get("limit") or ["50"])[0]
             try:
@@ -5973,6 +6420,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/login":
+            if not self.csrf_authorized():
+                self.send_json({"ok": False, "error": "missing action header"}, HTTPStatus.FORBIDDEN)
+                return
+            payload = self.read_simple_payload()
+            username = clean_display(payload.get("username"))
+            password = str(payload.get("password") or "")
+            if not dashboard_owner_credentials_valid(username, password):
+                self.send_json({"ok": False, "error": "invalid credentials"}, HTTPStatus.UNAUTHORIZED)
+                return
+            body = {"ok": True, "role": "admin", "username": DASHBOARD_OWNER_USER, "actor": hashlib.sha256(dashboard_owner_session_token().encode("utf-8")).hexdigest()[:12]}
+            self.send_bytes(200, json.dumps(body, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", {"Set-Cookie": self.set_owner_session_cookie()})
+            return
+        if parsed.path == "/api/logout":
+            if not self.csrf_authorized():
+                self.send_json({"ok": False, "error": "missing action header"}, HTTPStatus.FORBIDDEN)
+                return
+            body = {"ok": True, "role": ""}
+            self.send_bytes(200, json.dumps(body, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8", {"Set-Cookie": self.clear_owner_session_cookie()})
+            return
         if not self.authorized():
             self.send_bytes(HTTPStatus.UNAUTHORIZED, b"Unauthorized", "text/plain; charset=utf-8")
             return
@@ -6021,6 +6488,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     request_id=request_id,
                 )
                 record_endpoint_mutation(DB_PATH, "close.request", actor=actor_fp, request_id=request_id, chat_id=str(payload.get("chat_id") or ""), bot_key=str(payload.get("bot_key") or "default"), payload=payload, result_status="pending", result_summary=f"pending_id={pending_id}")
+                auto_result = simple_auto_execute_pending(DB_PATH, pending_id, actor_fp, self.actor_role())
+                if auto_result:
+                    status_code = int(auto_result.pop("status_code", 200)) if not auto_result.get("ok") else 200
+                    self.send_json(auto_result, status_code)
+                    return
                 self.send_json({"ok": True, "status": "pending", "pending_id": pending_id, "request_id": request_id, "expires_in_hours": PENDING_ACTION_TTL_HOURS})
                 return
             # approval_mode == "execute"
@@ -6067,6 +6539,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             actor_fp = self.actor_fingerprint()
             approval_mode = self.parse_approval_param()
             if approval_mode == "request":
+                payload_err = account_limit_payload_error(payload)
+                if payload_err:
+                    self.send_json({"ok": False, "error": payload_err}, 400)
+                    return
                 request_id = uuid.uuid4().hex[:12]
                 pending_id = create_pending_action(
                     DB_PATH,
@@ -6076,6 +6552,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     request_id=request_id,
                 )
                 record_endpoint_mutation(DB_PATH, "account_limit.request", actor=actor_fp, request_id=request_id, chat_id=str(payload.get("chat_id") or ""), payload=payload, result_status="pending", result_summary=f"pending_id={pending_id}")
+                auto_result = simple_auto_execute_pending(DB_PATH, pending_id, actor_fp, self.actor_role())
+                if auto_result:
+                    status_code = int(auto_result.pop("status_code", 200)) if not auto_result.get("ok") else 200
+                    self.send_json(auto_result, status_code)
+                    return
                 self.send_json({"ok": True, "status": "pending", "pending_id": pending_id, "request_id": request_id, "expires_in_hours": PENDING_ACTION_TTL_HOURS})
                 return
             # approval_mode == "execute"
@@ -6133,6 +6614,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     request_id=request_id,
                 )
                 record_endpoint_mutation(DB_PATH, "company_account.request", actor=actor_fp, request_id=request_id, chat_id=str(payload.get("chat_id") or ""), bot_key=str(payload.get("bot_key") or "default"), payload=payload, result_status="pending", result_summary=f"pending_id={pending_id}")
+                auto_result = simple_auto_execute_pending(DB_PATH, pending_id, actor_fp, self.actor_role())
+                if auto_result:
+                    status_code = int(auto_result.pop("status_code", 200)) if not auto_result.get("ok") else 200
+                    self.send_json(auto_result, status_code)
+                    return
                 self.send_json({"ok": True, "status": "pending", "pending_id": pending_id, "request_id": request_id, "expires_in_hours": PENDING_ACTION_TTL_HOURS})
                 return
             # approval_mode == "execute"
@@ -6220,6 +6706,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     result_status="pending",
                     result_summary=f"pending_id={pending_result.get('pending_id')} already_pending={pending_result.get('already_pending')}",
                 )
+                auto_result = simple_auto_execute_pending(DB_PATH, int(pending_result.get("pending_id") or 0), actor_fp, self.actor_role()) if not pending_result.get("already_pending") else {}
+                if auto_result:
+                    status_code = int(auto_result.pop("status_code", 200)) if not auto_result.get("ok") else 200
+                    self.send_json(auto_result, status_code)
+                    return
                 self.send_json(pending_result)
                 return
             # approval_mode == "execute"
@@ -6347,6 +6838,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     request_id=request_id,
                 )
                 record_endpoint_mutation(DB_PATH, "reconcile.request", actor=actor_fp, request_id=request_id, chat_id=str(req_payload.get("chat_id") or ""), bot_key=str(req_payload.get("bot_key") or ""), payload=req_payload, result_status="pending", result_summary=f"pending_id={pending_id}")
+                auto_result = simple_auto_execute_pending(DB_PATH, pending_id, actor_fp, self.actor_role())
+                if auto_result:
+                    status_code = int(auto_result.pop("status_code", 200)) if not auto_result.get("ok") else 200
+                    self.send_json(auto_result, status_code)
+                    return
                 self.send_json({"ok": True, "status": "pending", "pending_id": pending_id, "request_id": request_id, "expires_in_hours": PENDING_ACTION_TTL_HOURS})
                 return
             # approval_mode == "execute"
@@ -6445,7 +6941,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not pending_id:
                 self.send_json({"ok": False, "error": "pending_id required"}, 400)
                 return
-            result = approve_pending_action(DB_PATH, pending_id, actor_fp)
+            approval_mode = self.parse_approval_param()
+            if approval_mode == "execute":
+                row = load_pending_action(DB_PATH, pending_id)
+                if row and row.get("status") == "pending":
+                    simple_ok = simple_approval_enabled(DB_PATH, actor_fp, self.actor_role())
+                    approval = approve_pending_action(DB_PATH, pending_id, actor_fp, allow_self_approval=simple_ok)
+                    status_code = int(approval.pop("status", 200)) if not approval.get("ok") else 200
+                    record_endpoint_mutation(DB_PATH, "pending.approve", actor=actor_fp, request_id=str(pending_id), payload=payload, result_status=("ok" if approval.get("ok") else "error"), result_summary=str(approval.get("error") or approval.get("approved_at") or ""))
+                    if not approval.get("ok"):
+                        self.send_json(approval, status_code)
+                        return
+                result = execute_pending_action(DB_PATH, pending_id, actor_fp)
+                status_code = int(result.pop("status_code", 200)) if not result.get("ok") else 200
+                self.send_json(result, status_code)
+                return
+            result = approve_pending_action(DB_PATH, pending_id, actor_fp, allow_self_approval=simple_approval_enabled(DB_PATH, actor_fp, self.actor_role()))
             status_code = int(result.pop("status", 200)) if not result.get("ok") else 200
             record_endpoint_mutation(DB_PATH, "pending.approve", actor=actor_fp, request_id=str(pending_id), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("error") or result.get("approved_at") or ""))
             self.send_json(result, status_code)
@@ -6485,11 +6996,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    if not DASHBOARD_TOKEN:
-        raise SystemExit("AUDITSLIP_DASHBOARD_TOKEN is required")
+    if not DASHBOARD_TOKEN and not dashboard_owner_login_enabled():
+        raise SystemExit("AUDITSLIP_DASHBOARD_OWNER_PASSWORD is required when no dashboard token is configured")
     try:
         ensure_dashboard_tokens_table(DB_PATH)
-        bootstrap_dashboard_admin_token(DB_PATH, DASHBOARD_TOKEN)
+        if DASHBOARD_TOKEN:
+            bootstrap_dashboard_admin_token(DB_PATH, DASHBOARD_TOKEN)
     except Exception:
         logger.exception("dashboard_tokens bootstrap failed")
     httpd = ThreadingHTTPServer((HOST, PORT), DashboardHandler)
