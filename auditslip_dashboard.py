@@ -2369,10 +2369,69 @@ def record_mutation(
         logger.exception("record_mutation failed action=%s", action)
 
 
+# Phase C2: high-risk action names (mutation-log convention -- short tokens, not dotted) that
+# warrant a real-time Telegram alert to the owner. Lower-risk actions (reprocess, unmark_dup,
+# bank_review*) are intentionally excluded.
+_ALERT_ACTIONS = {
+    "delete",
+    "close",
+    "clear",
+    "account_limit",
+    "company_account",
+    "token.create",
+    "token.revoke",
+}
+
+
+def send_owner_alert(message: str, action: str = "", request_id: str = "") -> None:
+    """Best-effort Telegram alert to the watchdog/owner chat.
+
+    Reads same env vars as auditslip_watchdog. Network failure is swallowed (logged at WARNING).
+    Returns immediately if token/chat are unset so dev/test environments do not 'fail'.
+    """
+    try:
+        token = (
+            os.environ.get("AUDITSLIP_WATCHDOG_BOT_TOKEN")
+            or os.environ.get("BOT_TOKEN")
+            or os.environ.get("TELEGRAM_BOT_TOKEN")
+            or ""
+        )
+        chat_id = os.environ.get("AUDITSLIP_WATCHDOG_ALERT_CHAT_ID") or next(
+            (x.strip() for x in os.environ.get("AUDITSLIP_ADMIN_IDS", "").split(",") if x.strip()),
+            "",
+        )
+        if not token or not chat_id:
+            return
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        resp = requests.post(url, data={"chat_id": chat_id, "text": message}, timeout=10)
+        # Touch status_code to surface obvious 4xx in logs without raising.
+        if resp.status_code >= 400:
+            logger.warning("send_owner_alert non-2xx status=%s action=%s req=%s", resp.status_code, action, request_id)
+    except Exception:
+        logger.warning("send_owner_alert failed action=%s req=%s", action, request_id, exc_info=True)
+
+
 def record_endpoint_mutation(db_path: Path, action: str, *, actor: str = "", request_id: str = "", payload: Any = None, result_status: str = "ok", result_summary: str = "", chat_id: str = "", bot_key: str = "", slip_id: str = "") -> None:
-    """Thin wrapper around record_mutation that prefixes the per-request request_id into the result_summary."""
+    """Thin wrapper around record_mutation that prefixes the per-request request_id into the result_summary.
+
+    Phase C2: after logging, if `action` is in _ALERT_ACTIONS and AUDITSLIP_ALERT_ON_MUTATION!=0,
+    fire a best-effort Telegram alert. Alert is fire-and-forget; failures never break the mutation.
+    """
     prefix = f"req={request_id} " if request_id else ""
     record_mutation(db_path, action, actor=actor, chat_id=chat_id, bot_key=bot_key, slip_id=slip_id, payload=payload, result_status=result_status, result_summary=(prefix + (result_summary or "")))
+    if action in _ALERT_ACTIONS and os.environ.get("AUDITSLIP_ALERT_ON_MUTATION", "1") != "0":
+        try:
+            actor_short = (actor or "")[:8]
+            summary_snip = (result_summary or "")[:200]
+            text = (
+                f"🚨 Auditslip mutation: {action} by {actor_short} "
+                f"req={request_id or '-'} result={result_status}"
+            )
+            if summary_snip:
+                text = f"{text}\n{summary_snip}"
+            send_owner_alert(text, action=action, request_id=request_id)
+        except Exception:
+            logger.warning("record_endpoint_mutation alert dispatch failed action=%s", action)
 
 
 # Phase B1: parse a 'request_id' (12-hex) prefix stamped by record_endpoint_mutation back out
@@ -2392,7 +2451,7 @@ def _extract_request_id(result_summary: str) -> str:
 # ---------------------------------------------------------------------------
 
 PENDING_ACTION_TTL_HOURS = 24
-APPROVAL_REQUIRED_ACTIONS = {"slip.delete", "period.close"}
+APPROVAL_REQUIRED_ACTIONS = {"slip.delete", "period.close", "account.limit", "company.account", "reconcile.run"}
 _PENDING_ACTIONS_READY = False
 
 
@@ -5669,10 +5728,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = dashboard_close_period(DB_PATH, chat_id, note, bot_key=bot_key, company_name=company_name)
             except Exception as exc:
                 logger.exception("api_close failed")
-                record_mutation(DB_PATH, "close", actor=actor_fp, chat_id=chat_id, bot_key=bot_key, payload=stored_payload, result_status="error", result_summary=safe_error(exc))
+                close_req_id = str(pending_row.get("request_id") or "")
+                record_endpoint_mutation(DB_PATH, "close", actor=actor_fp, request_id=close_req_id, chat_id=chat_id, bot_key=bot_key, payload=stored_payload, result_status="error", result_summary=safe_error(exc))
                 self.send_json({"ok": False, "error": safe_error(exc), "pending_id": pending_id_executed}, 400)
                 return
-            record_mutation(DB_PATH, "close", actor=actor_fp, chat_id=chat_id, bot_key=bot_key, payload=stored_payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("settlement_id") or result.get("error") or ""))
+            close_req_id = str(pending_row.get("request_id") or "")
+            record_endpoint_mutation(DB_PATH, "close", actor=actor_fp, request_id=close_req_id, chat_id=chat_id, bot_key=bot_key, payload=stored_payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("settlement_id") or result.get("error") or ""))
             if result.get("ok"):
                 mark_pending_executed(DB_PATH, pending_id_executed, executed_result=str(result.get("settlement_id") or ""))
             if isinstance(result, dict):
@@ -5682,49 +5743,117 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/account-limit":
             if not self.role_or_401("admin"):
                 return
-            request_id = uuid.uuid4().hex[:12]
+            actor_fp = self.actor_fingerprint()
+            approval_mode = self.parse_approval_param()
+            if approval_mode == "request":
+                request_id = uuid.uuid4().hex[:12]
+                pending_id = create_pending_action(
+                    DB_PATH,
+                    action="account.limit",
+                    payload=payload,
+                    requested_by=actor_fp,
+                    request_id=request_id,
+                )
+                record_endpoint_mutation(DB_PATH, "account_limit.request", actor=actor_fp, request_id=request_id, chat_id=str(payload.get("chat_id") or ""), payload=payload, result_status="pending", result_summary=f"pending_id={pending_id}")
+                self.send_json({"ok": True, "status": "pending", "pending_id": pending_id, "request_id": request_id, "expires_in_hours": PENDING_ACTION_TTL_HOURS})
+                return
+            # approval_mode == "execute"
+            try:
+                pending_id_executed = int(payload.get("pending_id") or 0)
+            except (TypeError, ValueError):
+                pending_id_executed = 0
+            if not pending_id_executed:
+                self.send_json({"ok": False, "error": "pending_id required for execute"}, 400)
+                return
+            expire_old_pending_actions(DB_PATH)
+            pending_row = load_pending_action(DB_PATH, pending_id_executed)
+            if not pending_row or pending_row.get("action") != "account.limit":
+                self.send_json({"ok": False, "error": "pending action not found"}, 404)
+                return
+            if pending_row.get("status") != "approved":
+                self.send_json({"ok": False, "error": f"not approved (status={pending_row.get('status')})"}, 409)
+                return
+            stored_payload = pending_action_payload(pending_row)
+            request_id = str(pending_row.get("request_id") or uuid.uuid4().hex[:12])
             try:
                 result = save_account_limit(
                     DB_PATH,
-                    str(payload.get("chat_id") or ""),
-                    str(payload.get("limit_key") or ""),
-                    str(payload.get("display_name") or ""),
-                    str(payload.get("bank") or ""),
-                    str(payload.get("account") or ""),
-                    parse_number(payload.get("limit_amount")),
+                    str(stored_payload.get("chat_id") or ""),
+                    str(stored_payload.get("limit_key") or ""),
+                    str(stored_payload.get("display_name") or ""),
+                    str(stored_payload.get("bank") or ""),
+                    str(stored_payload.get("account") or ""),
+                    parse_number(stored_payload.get("limit_amount")),
                 )
-                record_endpoint_mutation(DB_PATH, "account_limit", actor=self.actor_fingerprint(), request_id=request_id, chat_id=str(payload.get("chat_id") or ""), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("limit_key") or result.get("error") or ""))
+                record_endpoint_mutation(DB_PATH, "account_limit", actor=actor_fp, request_id=request_id, chat_id=str(stored_payload.get("chat_id") or ""), payload=stored_payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("limit_key") or result.get("error") or ""))
+                if result.get("ok"):
+                    mark_pending_executed(DB_PATH, pending_id_executed, executed_result=str(result.get("limit_key") or ""))
                 if isinstance(result, dict):
                     result["request_id"] = request_id
+                    result["pending_id"] = pending_id_executed
                 self.send_json(result)
             except Exception as exc:
                 logger.exception("api_account_limit failed")
-                record_endpoint_mutation(DB_PATH, "account_limit", actor=self.actor_fingerprint(), request_id=request_id, chat_id=str(payload.get("chat_id") or ""), payload=payload, result_status="error", result_summary=safe_error(exc))
-                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
+                record_endpoint_mutation(DB_PATH, "account_limit", actor=actor_fp, request_id=request_id, chat_id=str(stored_payload.get("chat_id") or ""), payload=stored_payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id, "pending_id": pending_id_executed}, 400)
             return
         if parsed.path == "/api/company-account":
             if not self.role_or_401("admin"):
                 return
-            request_id = uuid.uuid4().hex[:12]
+            actor_fp = self.actor_fingerprint()
+            approval_mode = self.parse_approval_param()
+            if approval_mode == "request":
+                request_id = uuid.uuid4().hex[:12]
+                pending_id = create_pending_action(
+                    DB_PATH,
+                    action="company.account",
+                    payload=payload,
+                    requested_by=actor_fp,
+                    request_id=request_id,
+                )
+                record_endpoint_mutation(DB_PATH, "company_account.request", actor=actor_fp, request_id=request_id, chat_id=str(payload.get("chat_id") or ""), bot_key=str(payload.get("bot_key") or "default"), payload=payload, result_status="pending", result_summary=f"pending_id={pending_id}")
+                self.send_json({"ok": True, "status": "pending", "pending_id": pending_id, "request_id": request_id, "expires_in_hours": PENDING_ACTION_TTL_HOURS})
+                return
+            # approval_mode == "execute"
+            try:
+                pending_id_executed = int(payload.get("pending_id") or 0)
+            except (TypeError, ValueError):
+                pending_id_executed = 0
+            if not pending_id_executed:
+                self.send_json({"ok": False, "error": "pending_id required for execute"}, 400)
+                return
+            expire_old_pending_actions(DB_PATH)
+            pending_row = load_pending_action(DB_PATH, pending_id_executed)
+            if not pending_row or pending_row.get("action") != "company.account":
+                self.send_json({"ok": False, "error": "pending action not found"}, 404)
+                return
+            if pending_row.get("status") != "approved":
+                self.send_json({"ok": False, "error": f"not approved (status={pending_row.get('status')})"}, 409)
+                return
+            stored_payload = pending_action_payload(pending_row)
+            request_id = str(pending_row.get("request_id") or uuid.uuid4().hex[:12])
             try:
                 result = save_company_account(
                     DB_PATH,
-                    bot_key=str(payload.get("bot_key") or "default"),
-                    chat_id=str(payload.get("chat_id") or ""),
-                    company_name=str(payload.get("company_name") or ""),
-                    bank=str(payload.get("bank") or ""),
-                    account_no=str(payload.get("account_no") or ""),
-                    account_name=str(payload.get("account_name") or ""),
-                    daily_limit=parse_number(payload.get("daily_limit")),
+                    bot_key=str(stored_payload.get("bot_key") or "default"),
+                    chat_id=str(stored_payload.get("chat_id") or ""),
+                    company_name=str(stored_payload.get("company_name") or ""),
+                    bank=str(stored_payload.get("bank") or ""),
+                    account_no=str(stored_payload.get("account_no") or ""),
+                    account_name=str(stored_payload.get("account_name") or ""),
+                    daily_limit=parse_number(stored_payload.get("daily_limit")),
                 )
-                record_endpoint_mutation(DB_PATH, "company_account", actor=self.actor_fingerprint(), request_id=request_id, chat_id=str(payload.get("chat_id") or ""), bot_key=str(payload.get("bot_key") or "default"), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("account_key") or result.get("error") or ""))
+                record_endpoint_mutation(DB_PATH, "company_account", actor=actor_fp, request_id=request_id, chat_id=str(stored_payload.get("chat_id") or ""), bot_key=str(stored_payload.get("bot_key") or "default"), payload=stored_payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("account_key") or result.get("error") or ""))
+                if result.get("ok"):
+                    mark_pending_executed(DB_PATH, pending_id_executed, executed_result=str(result.get("account_key") or ""))
                 if isinstance(result, dict):
                     result["request_id"] = request_id
+                    result["pending_id"] = pending_id_executed
                 self.send_json(result)
             except Exception as exc:
                 logger.exception("api_company_account failed")
-                record_endpoint_mutation(DB_PATH, "company_account", actor=self.actor_fingerprint(), request_id=request_id, chat_id=str(payload.get("chat_id") or ""), bot_key=str(payload.get("bot_key") or "default"), payload=payload, result_status="error", result_summary=safe_error(exc))
-                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
+                record_endpoint_mutation(DB_PATH, "company_account", actor=actor_fp, request_id=request_id, chat_id=str(stored_payload.get("chat_id") or ""), bot_key=str(stored_payload.get("bot_key") or "default"), payload=stored_payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id, "pending_id": pending_id_executed}, 400)
             return
         if parsed.path == "/api/duplicate/unmark":
             if not self.role_or_401("admin", "operator"):
@@ -5869,27 +5998,69 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/reconcile":
             if not self.role_or_401("admin"):
                 return
-            request_id = uuid.uuid4().hex[:12]
+            actor_fp = self.actor_fingerprint()
+            approval_mode = self.parse_approval_param()
+            if approval_mode == "request":
+                request_id = uuid.uuid4().hex[:12]
+                # Capture excel_path resolution into the stored payload so that the eventual
+                # execute branch reconciles against the same file. uploaded_excel_path may be a
+                # temp file written by this request; we persist its string form.
+                req_payload = dict(payload) if isinstance(payload, dict) else {}
+                if uploaded_excel_path and not req_payload.get("excel_path"):
+                    req_payload["excel_path"] = str(uploaded_excel_path)
+                pending_id = create_pending_action(
+                    DB_PATH,
+                    action="reconcile.run",
+                    payload=req_payload,
+                    requested_by=actor_fp,
+                    request_id=request_id,
+                )
+                record_endpoint_mutation(DB_PATH, "reconcile.request", actor=actor_fp, request_id=request_id, chat_id=str(req_payload.get("chat_id") or ""), bot_key=str(req_payload.get("bot_key") or ""), payload=req_payload, result_status="pending", result_summary=f"pending_id={pending_id}")
+                self.send_json({"ok": True, "status": "pending", "pending_id": pending_id, "request_id": request_id, "expires_in_hours": PENDING_ACTION_TTL_HOURS})
+                return
+            # approval_mode == "execute"
+            try:
+                pending_id_executed = int(payload.get("pending_id") or 0)
+            except (TypeError, ValueError):
+                pending_id_executed = 0
+            if not pending_id_executed:
+                self.send_json({"ok": False, "error": "pending_id required for execute"}, 400)
+                return
+            expire_old_pending_actions(DB_PATH)
+            pending_row = load_pending_action(DB_PATH, pending_id_executed)
+            if not pending_row or pending_row.get("action") != "reconcile.run":
+                self.send_json({"ok": False, "error": "pending action not found"}, 404)
+                return
+            if pending_row.get("status") != "approved":
+                self.send_json({"ok": False, "error": f"not approved (status={pending_row.get('status')})"}, 409)
+                return
+            # Use the originally-requested payload so an attacker re-posting the execute
+            # request cannot swap arguments after approval.
+            payload = pending_action_payload(pending_row)
+            request_id = str(pending_row.get("request_id") or uuid.uuid4().hex[:12])
             try:
                 chat_id = str(payload.get("chat_id") or "")
                 bot_key = str(payload.get("bot_key") or "")
                 flow_type = str(payload.get("flow_type") or "all")
                 scope = str(payload.get("scope") or "all")
-                excel_path = safe_backend_excel_path(uploaded_excel_path or str(payload.get("excel_path") or ""))
+                excel_path = safe_backend_excel_path(str(payload.get("excel_path") or ""))
                 if not excel_path.exists():
-                    record_endpoint_mutation(DB_PATH, "reconcile", actor=self.actor_fingerprint(), request_id=request_id, chat_id=chat_id, bot_key=bot_key, payload=payload, result_status="error", result_summary="excel not found")
-                    self.send_json({"ok": False, "error": f"excel not found: {excel_path}", "request_id": request_id}, 404)
+                    record_endpoint_mutation(DB_PATH, "reconcile", actor=actor_fp, request_id=request_id, chat_id=chat_id, bot_key=bot_key, payload=payload, result_status="error", result_summary="excel not found")
+                    self.send_json({"ok": False, "error": f"excel not found: {excel_path}", "request_id": request_id, "pending_id": pending_id_executed}, 404)
                     return
                 result = reconcile_backend_excel(DB_PATH, excel_path, chat_id=chat_id, scope=scope, bot_key=bot_key, flow_type=flow_type)
                 summary = f"diff={result.get('diff_amount')} matched={result.get('matched', {}).get('count')} missing={result.get('missing', {}).get('count')} extra={result.get('extra', {}).get('count')}"
-                record_endpoint_mutation(DB_PATH, "reconcile", actor=self.actor_fingerprint(), request_id=request_id, chat_id=chat_id, bot_key=bot_key, payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=summary)
+                record_endpoint_mutation(DB_PATH, "reconcile", actor=actor_fp, request_id=request_id, chat_id=chat_id, bot_key=bot_key, payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=summary)
+                if result.get("ok"):
+                    mark_pending_executed(DB_PATH, pending_id_executed, executed_result=summary)
                 if isinstance(result, dict):
                     result["request_id"] = request_id
+                    result["pending_id"] = pending_id_executed
                 self.send_json(result)
             except Exception as exc:
                 logger.exception("api_reconcile failed")
-                record_endpoint_mutation(DB_PATH, "reconcile", actor=self.actor_fingerprint(), request_id=request_id, payload=payload, result_status="error", result_summary=safe_error(exc))
-                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
+                record_endpoint_mutation(DB_PATH, "reconcile", actor=actor_fp, request_id=request_id, payload=payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id, "pending_id": pending_id_executed}, 400)
             return
         if parsed.path == "/api/tokens/create":
             if not self.role_or_401("admin"):
