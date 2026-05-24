@@ -576,6 +576,78 @@ def banks_compatible(a: Any, b: Any) -> bool:
     return (not left) or (not right) or bank_key(left) == bank_key(right)
 
 
+def masked_account_pattern(value: Any) -> str:
+    """Account number pattern with digits plus x wildcards, stripping formatting.
+
+    Slip OCRs sometimes expose the same bank account with different masks, e.g.
+    `8XX-2-XXX31-5` vs `XXX-X-XX931-5`.  Keep only real digits and common mask
+    markers so compatible masked formats can be grouped without inventing a full
+    account number.
+    """
+    text = clean_display(value).lower()
+    if not text:
+        return ""
+    text = re.sub(r"[\*•●○]+", "x", text)
+    chars: List[str] = []
+    for ch in text:
+        if ch.isdigit():
+            chars.append(ch)
+        elif ch in {"x", "×"}:
+            chars.append("x")
+    return "".join(chars)
+
+
+def masked_account_known_count(pattern: str) -> int:
+    return sum(1 for ch in pattern if ch.isdigit())
+
+
+def masked_account_search_token(pattern: str) -> str:
+    """Best conservative SQL prefilter token from a masked account pattern."""
+    runs = re.findall(r"\d{3,}", pattern or "")
+    if not runs:
+        return ""
+    # Prefer the longest/right-most known digit run; account masks usually keep a suffix.
+    return max(reversed(runs), key=len)
+
+
+def masked_account_patterns_compatible(left: str, right: str) -> bool:
+    """True when two same-length account masks do not conflict on known digits."""
+    left = clean_display(left)
+    right = clean_display(right)
+    if not left or not right or len(left) != len(right):
+        return False
+    known_overlap = 0
+    for a, b in zip(left, right):
+        if a != "x" and b != "x":
+            if a != b:
+                return False
+            known_overlap += 1
+    if known_overlap < 3:
+        return False
+    return max(masked_account_known_count(left), masked_account_known_count(right)) >= 4
+
+
+def masked_account_merge_pattern(current: str, incoming: str) -> str:
+    """Merge compatible patterns into a stricter union; preserve current on conflict."""
+    if not current:
+        return incoming
+    if not incoming or not masked_account_patterns_compatible(current, incoming):
+        return current
+    merged: List[str] = []
+    for a, b in zip(current, incoming):
+        merged.append(a if a != "x" else b)
+    return "".join(merged)
+
+
+def account_display_score(value: Any) -> Tuple[int, int, int]:
+    pattern = masked_account_pattern(value)
+    return (masked_account_known_count(pattern), len(pattern), len(clean_display(value)))
+
+
+def better_account_display(candidate: Any, current: Any) -> bool:
+    return account_display_score(candidate) > account_display_score(current)
+
+
 def transferor_totals(conn: sqlite3.Connection, where_clause: str, params: List[Any], account_limits: Dict[str, Dict[str, Any]] | None = None, limit: int = 50) -> List[Dict[str, Any]]:
     account_limits = account_limits or {}
     rows = conn.execute(
@@ -913,6 +985,7 @@ def company_account_daily_totals(conn: sqlite3.Connection, where_clause: str, pa
         [*params, *search_params],
     ).fetchall()
     groups: Dict[Tuple[str, str, str, str, str, str], Dict[str, Any]] = {}
+    deposit_group_index: Dict[Tuple[str, str, str, str, str], List[Dict[str, Any]]] = {}
     for row in rows:
         bot_key = clean_display(row["bot_key"]) or "default"
         company_name = clean_company_name(row["company_name"], bot_key)
@@ -920,33 +993,56 @@ def company_account_daily_totals(conn: sqlite3.Connection, where_clause: str, pa
         if not account:
             continue
         date_key, date_label, sort_date = date_bucket(row["slip_date_display"], row["slip_date_iso"])
+        account_pattern = masked_account_pattern(account)
+        base_key = (bot_key, flow, date_key, bank_key(bank), account_role)
+        group = None
+        if flow == "deposit":
+            for candidate in deposit_group_index.get(base_key, []):
+                if masked_account_patterns_compatible(candidate.get("account_pattern", ""), account_pattern):
+                    group = candidate
+                    break
         key = (bot_key, flow, date_key, bank_key(bank), bank_key(account), account_role)
-        group = groups.setdefault(
-            key,
-            {
-                "bot_key": bot_key,
-                "company_name": company_name,
-                "flow_type": flow,
-                "flow_label": flow_label(flow),
-                "date_key": date_key,
-                "date": date_label,
-                "sort_date": sort_date,
-                "bank": bank,
-                "account": account,
-                "account_role": account_role,
-                "count": 0,
-                "amount": 0.0,
-                "fee": 0.0,
-                "chat_titles": [],
-            },
-        )
+        if group is None:
+            group = groups.setdefault(
+                key,
+                {
+                    "bot_key": bot_key,
+                    "company_name": company_name,
+                    "flow_type": flow,
+                    "flow_label": flow_label(flow),
+                    "date_key": date_key,
+                    "date": date_label,
+                    "sort_date": sort_date,
+                    "bank": bank,
+                    "account": account,
+                    "account_role": account_role,
+                    "account_pattern": account_pattern,
+                    "account_aliases": [],
+                    "count": 0,
+                    "amount": 0.0,
+                    "fee": 0.0,
+                    "chat_titles": [],
+                },
+            )
+            if flow == "deposit":
+                deposit_group_index.setdefault(base_key, []).append(group)
+        elif flow == "deposit":
+            group["account_pattern"] = masked_account_merge_pattern(group.get("account_pattern", ""), account_pattern)
+        if account and account not in group["account_aliases"]:
+            group["account_aliases"].append(account)
+        if account and better_account_display(account, group.get("account", "")):
+            group["account"] = account
         group["count"] += int(row["count"] or 0)
         group["amount"] += float(row["amount"] or 0)
         group["fee"] += float(row["fee"] or 0)
         title = clean_display(row["chat_title"])
         if title and title not in group["chat_titles"]:
             group["chat_titles"].append(title)
-    out = list(groups.values())
+    out = []
+    for group in groups.values():
+        item = dict(group)
+        item.pop("account_pattern", None)
+        out.append(item)
     out.sort(key=lambda r: (clean_display(r.get("account")), FLOW_TYPE_LABELS.get(r.get("flow_type"), "")))
     out.sort(key=lambda r: str(r.get("sort_date") or ""), reverse=True)
     out.sort(key=dict_company_sort_key)
@@ -1213,6 +1309,20 @@ def detect_column(headers: List[str], aliases: List[str]) -> int:
     return -1
 
 
+def backend_flow_type_for(*values: Any) -> str:
+    text = clean_display(" ".join(clean_display(v) for v in values)).lower()
+    if not text:
+        return ""
+    # These rows are accounting adjustments, not money entering/leaving via slip groups.
+    if any(token in text for token in ["ยกเลิก", "cancel", "void", "โบนัส", "bonus", "เก็บ"]):
+        return "other"
+    if any(token in text for token in ["ถอน", "withdraw", "withdrawal"]):
+        return "withdraw"
+    if any(token in text for token in ["ฝาก", "เติม", "deposit", "topup", "top-up", "ออโต้", "auto"]):
+        return "deposit"
+    return ""
+
+
 def parse_backend_excel(path: Path) -> List[Dict[str, Any]]:
     from openpyxl import load_workbook
 
@@ -1230,8 +1340,10 @@ def parse_backend_excel(path: Path) -> List[Dict[str, Any]]:
     headers = [clean_display(c) for c in rows[header_idx]]
     amount_i = detect_column(headers, ["amount", "ยอด", "ยอดเงิน", "จำนวน", "จำนวนเงิน", "เงิน", "total", "deposit", "credit", "gross amount"])
     received_i = detect_column(headers, ["จำนวนที่ได้รับ", "ยอดที่ได้รับ", "ได้รับ", "received", "received amount", "net amount", "credit amount"])
-    date_i = detect_column(headers, ["date", "วันที่", "transaction date", "วันเวลา", "วันที่เวลา", "วันที่/เวลา", "วันทำรายการ", "created date", "created at"])
+    date_i = detect_column(headers, ["date", "วันที่", "เวลา", "transaction date", "วันเวลา", "วันที่เวลา", "วันที่/เวลา", "วันทำรายการ", "created date", "created at"])
     time_i = detect_column(headers, ["time", "เวลา", "transaction time", "เวลาทำรายการ", "created time"])
+    type_i = detect_column(headers, ["ประเภท", "type", "transaction type", "รายการประเภท"])
+    operation_i = detect_column(headers, ["ประเภทดำเนินการ", "ดำเนินการ", "operation", "operation type", "action", "method"])
     name_i = detect_column(headers, ["name", "ชื่อ", "ชื่อผู้โอน", "ผู้โอน", "ยูสเซอร์", "ยูสเซอร์เนม", "user", "username", "user name", "member", "ลูกค้า", "customer", "payer", "transferor"])
     bank_i = detect_column(headers, ["bank", "ธนาคาร", "ธนาคารผู้โอน", "ธนาคารลูกค้า", "customer bank", "bank name"])
     ref_i = detect_column(headers, ["ref", "reference", "reference no", "เลขอ้างอิง", "หมายเลขอ้างอิง", "รหัส", "รหัสรายการ", "เลขที่รายการ", "รายการ", "transaction", "transaction id", "transaction code", "code", "seq", "id", "order id"])
@@ -1252,6 +1364,9 @@ def parse_backend_excel(path: Path) -> List[Dict[str, Any]]:
         time_text = extract_time_text(raw_time_value, date_raw)
         name = clean_display(values[name_i]) if 0 <= name_i < len(values) else ""
         bank = display_bank(values[bank_i]) if 0 <= bank_i < len(values) else ""
+        transaction_type = clean_display(values[type_i]) if 0 <= type_i < len(values) else ""
+        operation_type = clean_display(values[operation_i]) if 0 <= operation_i < len(values) else ""
+        backend_flow = backend_flow_type_for(transaction_type, operation_type)
         reference = clean_display(values[ref_i]) if 0 <= ref_i < len(values) else ""
         note = clean_display(values[note_i]) if 0 <= note_i < len(values) else ""
         if not reference:
@@ -1273,11 +1388,61 @@ def parse_backend_excel(path: Path) -> List[Dict[str, Any]]:
                 "received_amount": float(received_amount or amount),
                 "reference": reference,
                 "reference_key": normalize_match_text(reference),
+                "transaction_type": transaction_type,
+                "operation_type": operation_type,
+                "flow_type": backend_flow,
+                "flow_label": flow_label(backend_flow) if backend_flow else "",
                 "note": note,
                 "source": source,
             }
         )
     return parsed
+
+
+def backend_date_matches_scope(row: Dict[str, Any], scope: str) -> bool:
+    range_start, range_end, _ = scope_date_range(scope)
+    normalized, _ = scope_to_date(scope)
+    normalized = clean_display(normalized)
+    date_key = normalize_match_date(row.get("date_key") or row.get("date"))
+    if range_start or range_end:
+        if not date_key:
+            return False
+        if range_start and date_key < range_start:
+            return False
+        if range_end and date_key > range_end:
+            return False
+        return True
+    if normalized in {"", "all", "open"}:
+        return True
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", normalized):
+        return date_key == normalized
+    return date_key == normalize_match_date(normalized)
+
+
+def backend_flow_matches(row: Dict[str, Any], flow_type: str) -> bool:
+    flow = normalize_flow_type(flow_type)
+    row_flow = clean_display(row.get("flow_type"))
+    if flow in {"deposit", "withdraw"}:
+        # Legacy Excel files may not have ประเภท/ประเภทดำเนินการ columns; keep
+        # blank-flow rows so older reconciliation still works, but honor explicit
+        # backend classifications when they are present.
+        return row_flow in {"", flow}
+    if flow == "other":
+        return row_flow == "other"
+    # For all-flow reconciliation, keep legacy files with no flow columns, but
+    # exclude rows explicitly classified as accounting adjustments.
+    return row_flow != "other"
+
+
+def filter_backend_reconcile_rows(rows: List[Dict[str, Any]], scope: str, flow_type: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    kept: List[Dict[str, Any]] = []
+    filtered: List[Dict[str, Any]] = []
+    for row in rows:
+        if backend_date_matches_scope(row, scope) and backend_flow_matches(row, flow_type):
+            kept.append(row)
+        else:
+            filtered.append(row)
+    return kept, filtered
 
 
 def reconcile_daily_summary(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1350,9 +1515,10 @@ def slip_reconcile_rows(conn: sqlite3.Connection, chat_id: str = "", scope: str 
 
 
 def reconcile_backend_excel(db_path: Path, excel_path: Path, chat_id: str = "", scope: str = "all", bot_key: str = "", flow_type: str = "all") -> Dict[str, Any]:
-    backend_rows = parse_backend_excel(excel_path)
+    all_backend_rows = parse_backend_excel(excel_path)
     flow = normalize_flow_type(flow_type)
     bot = clean_display(bot_key)
+    backend_rows, backend_filtered_out = filter_backend_reconcile_rows(all_backend_rows, scope, flow)
     with connect(db_path) as conn:
         slip_rows = slip_reconcile_rows(conn, chat_id=chat_id, scope=scope, bot_key=bot, flow_type=flow)
     used_slips: set[int] = set()
@@ -1397,6 +1563,7 @@ def reconcile_backend_excel(db_path: Path, excel_path: Path, chat_id: str = "", 
         "excel_path": str(excel_path),
         "scope": {"chat_id": clean_display(chat_id), "bot_key": bot or "__all__", "flow_type": flow, "flow_label": flow_label(flow), "date_scope": clean_display(scope)},
         "backend": {"count": len(backend_rows), "amount": backend_amount},
+        "backend_filtered_out": {"count": len(backend_filtered_out), "amount": sum(float(r["amount"] or 0) for r in backend_filtered_out)},
         "slips": {"count": len(slip_rows), "amount": slip_amount},
         "matched": {"count": len(matches), "amount": matched_amount, "rows": matches[:100]},
         "missing_in_slips": missing[:100],
@@ -2048,12 +2215,17 @@ def account_slip_match(row: sqlite3.Row, search: str) -> Tuple[str, str]:
         return "", ""
     needle = normalize_match_text(query)
     raw_needle = query.lower()
+    query_account_pattern = masked_account_pattern(query)
     sides: List[Tuple[str, str]] = []
     candidates = [
-        ("from", "บัญชีต้นทาง/ผู้โอน", [row["from_account"], row["from_bank"], row["transferor_name"], row["sender_name"]]),
-        ("to", "บัญชีปลายทาง/ผู้รับ", [row["to_account"], row["to_bank"], row["recipient_name"], row["account_name"]]),
+        ("from", "บัญชีต้นทาง/ผู้โอน", row["from_account"], [row["from_account"], row["from_bank"], row["transferor_name"], row["sender_name"]]),
+        ("to", "บัญชีปลายทาง/ผู้รับ", row["to_account"], [row["to_account"], row["to_bank"], row["recipient_name"], row["account_name"]]),
     ]
-    for side, label, values in candidates:
+    for side, label, account_value, values in candidates:
+        account_pattern = masked_account_pattern(account_value)
+        if query_account_pattern and masked_account_patterns_compatible(query_account_pattern, account_pattern):
+            sides.append((side, label))
+            continue
         compact_values = [normalize_match_text(v) for v in values if clean_display(v)]
         raw_values = [clean_display(v).lower() for v in values if clean_display(v)]
         haystack = normalize_match_text(" ".join(clean_display(v) for v in values))
@@ -2116,6 +2288,8 @@ def account_search_sql_predicate(search: str) -> Tuple[str, List[Any]]:
         return "", []
     raw_needle = query.lower()
     compact_needle = normalize_match_text(query)
+    account_pattern = masked_account_pattern(query)
+    masked_token = masked_account_search_token(account_pattern)
     clauses: List[str] = []
     params: List[Any] = []
     for field in ACCOUNT_SLIP_SEARCH_SQL_FIELDS:
@@ -2131,6 +2305,9 @@ def account_search_sql_predicate(search: str) -> Tuple[str, List[Any]]:
             # behavior, e.g. a query like "SCB 123456" may match bank+account.
             clauses.append(f"({compact_expr} <> '' AND ? LIKE '%' || {compact_expr} || '%')")
             params.append(compact_needle)
+        if masked_token and field in {"from_account", "to_account"}:
+            clauses.append(f"{compact_expr} LIKE ?")
+            params.append(f"%{masked_token}%")
     return "(" + " OR ".join(clauses) + ")", params
 
 
@@ -4842,7 +5019,7 @@ def render_dashboard_html(token: str = "") -> str:
       <div class="card"><h3>หมายเหตุธนาคาร</h3><div class="muted">ตัดตารางยอดแยกตาม issuer ออกแล้ว เหลือเฉพาะต้นทางและปลายทางที่ใช้ตรวจยอดจริง</div></div>
     </section>
     <section id="section-reconcile" class="sections menu-section" hidden>
-      <div class="card"><h3>เทียบ Excel หลังบ้าน</h3><div class="mini">ขั้นตอน: เลือกบริษัท → เลือกยอดฝาก/ถอน → อัปโหลด Excel ของบริษัทนั้น ระบบจะเทียบเฉพาะ scope ที่เลือก ไม่ปนบริษัทอื่น</div><div class="reconcile-controls"><label class="reconcile-step"><span>1 เลือกบริษัทก่อน</span><select id="reconcileCompanyFilter" title="เลือกบริษัทสำหรับเทียบหลังบ้าน"></select></label><label class="reconcile-step"><span>2 เลือกยอดฝาก/ถอน</span><select id="reconcileFlowFilter" title="เลือกยอดฝากหรือถอนสำหรับไฟล์หลังบ้าน"><option value="">เลือกยอดฝาก/ถอน</option><option value="withdraw">ยอดถอน</option><option value="deposit">ยอดฝาก/เติมมือ</option></select></label><label class="reconcile-step reconcile-upload"><span>3 อัปโหลด Excel ของบริษัทนี้</span><input id="backendExcelFile" type="file" accept=".xlsx,.xlsm" /></label><label class="reconcile-step reconcile-upload" data-admin-only="true"><span>หรือ path ไฟล์บน server</span><input id="backendExcel" placeholder="path หรือเว้นว่างเพื่อใช้ไฟล์ล่าสุด" /></label><div id="reconcileScopePreview" class="reconcile-preview">ไฟล์นี้จะถูกเทียบเฉพาะบริษัทและฝาก/ถอนที่เลือก</div><div class="reconcile-actions"><button onclick="runReconcile()">เทียบยอดตามบริษัท/ฝากถอนที่เลือก</button></div></div><div id="reconcile"></div></div>
+      <div class="card"><h3>เทียบ Excel หลังบ้าน</h3><div class="mini">ขั้นตอน: เลือกบริษัท → เลือกยอดฝาก/ถอน → เลือกวันที่เทียบ → อัปโหลด Excel ของบริษัทนั้น ระบบจะเทียบเฉพาะ scope ที่เลือก ไม่ปนบริษัทอื่น</div><div class="reconcile-controls"><label class="reconcile-step"><span>1 เลือกบริษัทก่อน</span><select id="reconcileCompanyFilter" title="เลือกบริษัทสำหรับเทียบหลังบ้าน"></select></label><label class="reconcile-step"><span>2 เลือกยอดฝาก/ถอน</span><select id="reconcileFlowFilter" title="เลือกยอดฝากหรือถอนสำหรับไฟล์หลังบ้าน"><option value="">เลือกยอดฝาก/ถอน</option><option value="withdraw">ยอดถอน</option><option value="deposit">ยอดฝาก/เติมมือ</option></select></label><label class="reconcile-step"><span>3 เลือกวันที่เทียบ</span><input id="reconcileDateScope" type="date" title="เลือกวันที่ของไฟล์หลังบ้าน ถ้าเว้นว่างจะใช้ช่วงวันที่หลักของ dashboard" /></label><label class="reconcile-step reconcile-upload"><span>4 อัปโหลด Excel ของบริษัทนี้</span><input id="backendExcelFile" type="file" accept=".xlsx,.xlsm" /></label><label class="reconcile-step reconcile-upload" data-admin-only="true"><span>หรือ path ไฟล์บน server</span><input id="backendExcel" placeholder="path หรือเว้นว่างเพื่อใช้ไฟล์ล่าสุด" /></label><div id="reconcileScopePreview" class="reconcile-preview">ไฟล์นี้จะถูกเทียบเฉพาะบริษัทและฝาก/ถอนที่เลือก และวันที่เลือก</div><div class="reconcile-actions"><button onclick="runReconcile()">เทียบยอดตามบริษัท/ฝากถอน/วันที่เลือก</button></div></div><div id="reconcile"></div></div>
       <div class="card"><h3>สถานะข้อมูล</h3><div class="muted">ยอดรวมทุกแผงนับเฉพาะ success ที่ไม่ซ้ำ ยกเว้นการ์ดสลิปซ้ำที่แสดงเพื่อเช็กซ้ำโดยเฉพาะ</div></div>
     </section>
     <section id="section-duplicates" class="sections menu-section" hidden>
@@ -5187,18 +5364,22 @@ function flowChipName(value) {{ return value === 'deposit' ? 'กลุ่มฝ
 function renderCompanyAccountDaily(rows) {{
   if (!rows || !rows.length) return '<div class="muted">ไม่มีรายการรายบัญชีตามวันที่</div>';
   return '<div class="responsive-table"><table><thead><tr><th>บริษัท</th><th>วันที่</th><th>กลุ่ม</th><th>บทบาทบัญชี</th><th>ธนาคาร</th><th>เลขบัญชี</th><th>สลิป</th><th>ยอด</th><th>กลุ่ม Telegram</th><th class="action-col">ดูรายการ</th></tr></thead><tbody>'+
-    rows.map(r => '<tr>'+[
-      '<td>'+esc(r.company_name || r.bot_key || '-')+'</td>',
-      '<td>'+esc(r.date || r.date_key || '-')+'</td>',
-      '<td>['+esc(flowChipName(r.flow_type))+']</td>',
-      '<td>'+esc(r.account_role || '-')+'</td>',
-      '<td>'+esc(r.bank || '-')+'</td>',
-      '<td>'+esc(r.account || '-')+'</td>',
-      '<td>'+esc(r.count || 0)+'</td>',
-      '<td>'+money(r.amount)+'</td>',
-      '<td>'+esc((r.chat_titles || []).join(', '))+'</td>',
-      '<td class="action-cell"><button type="button" data-account-search="'+esc(String(r.account || ''))+'">ดูสลิปบัญชีนี้</button></td>'
-    ].join('')+'</tr>').join('')+'</tbody></table></div>';
+    rows.map(r => {{
+      const accountAliases = (r.account_aliases || []).filter(a => a && a !== r.account);
+      const accountCell = esc(r.account || '-') + (accountAliases.length ? '<div class="mini">รวมรูปแบบ: '+esc(accountAliases.join(', '))+'</div>' : '');
+      return '<tr>'+[
+        '<td>'+esc(r.company_name || r.bot_key || '-')+'</td>',
+        '<td>'+esc(r.date || r.date_key || '-')+'</td>',
+        '<td>['+esc(flowChipName(r.flow_type))+']</td>',
+        '<td>'+esc(r.account_role || '-')+'</td>',
+        '<td>'+esc(r.bank || '-')+'</td>',
+        '<td>'+accountCell+'</td>',
+        '<td>'+esc(r.count || 0)+'</td>',
+        '<td>'+money(r.amount)+'</td>',
+        '<td>'+esc((r.chat_titles || []).join(', '))+'</td>',
+        '<td class="action-cell"><button type="button" data-account-search="'+esc(String(r.account || ''))+'">ดูสลิปบัญชีนี้</button></td>'
+      ].join('')+'</tr>';
+    }}).join('')+'</tbody></table></div>';
 }}
 function pickAccountSearch(queryText, crossCompany=false) {{
   const input = document.getElementById('slipSearch');
@@ -5654,10 +5835,15 @@ function reconcileSummary(data) {{
   const daily = table(dailyRows, [['แหล่ง','source'], ['วันที่','date'], ['รายการ','count'], ['ยอด', r => money(r.amount)]]);
   return cards + '<h4>สรุปรายวัน</h4>' + daily + '<h4>รายการที่ตรงกัน</h4>' + matched + '<h4>หลังบ้านมี แต่ไม่พบในสลิป</h4>' + missing + '<h4>สลิปมี แต่ไม่พบในหลังบ้าน</h4>' + extra;
 }}
+function reconcileScopeValue() {{
+  const dateEl = document.getElementById('reconcileDateScope');
+  if (dateEl && dateEl.value) return dateEl.value;
+  const scopeEl = document.getElementById('scope');
+  return scopeEl ? (scopeEl.value || 'all') : 'all';
+}}
 function updateReconcileScopePreview() {{
   const botEl = document.getElementById('reconcileCompanyFilter');
   const flowEl = document.getElementById('reconcileFlowFilter');
-  const scopeEl = document.getElementById('scope');
   const box = document.getElementById('reconcileScopePreview');
   if (!box || !botEl || !flowEl) return;
   const bot = botEl.value || '__all__';
@@ -5668,13 +5854,13 @@ function updateReconcileScopePreview() {{
     box.innerHTML = '<b>เลือกบริษัทและฝาก/ถอนก่อนอัปโหลดไฟล์หลังบ้าน</b><div class="mini">ป้องกันการเอาไฟล์บริษัทหนึ่งไปเทียบกับยอดอีกบริษัทหรืออีกฝั่ง</div>';
     return;
   }}
-  box.innerHTML = 'ไฟล์นี้จะถูกเทียบเฉพาะ <b>'+esc(botLabel)+'</b> · <b>'+esc(flowName(flow))+'</b> · '+esc(scopeName(scopeEl ? scopeEl.value : 'all'));
+  box.innerHTML = 'ไฟล์นี้จะถูกเทียบเฉพาะ <b>'+esc(botLabel)+'</b> · <b>'+esc(flowName(flow))+'</b> · '+esc(scopeName(reconcileScopeValue()));
 }}
 async function runReconcile() {{
   const guardScopeMsg = 'เลือกบริษัทและฝาก/ถอนก่อนอัปโหลดไฟล์หลังบ้าน';
   const bot = document.getElementById('reconcileCompanyFilter').value || '__all__';
   const flow = document.getElementById('reconcileFlowFilter').value || '';
-  const scope = document.getElementById('scope').value || 'all';
+  const scope = reconcileScopeValue();
   const excel_path = document.getElementById('backendExcel').value || '';
   const file = document.getElementById('backendExcelFile').files[0];
   const box = document.getElementById('reconcile');
@@ -6226,6 +6412,7 @@ summaryEndDateEl.addEventListener('change', () => {{ if (summaryStartDateEl.valu
 document.getElementById('slipFilter').addEventListener('change', () => load({{scrollTop:true}}));
 document.getElementById('reconcileCompanyFilter').addEventListener('change', updateReconcileScopePreview);
 document.getElementById('reconcileFlowFilter').addEventListener('change', updateReconcileScopePreview);
+document.getElementById('reconcileDateScope').addEventListener('change', updateReconcileScopePreview);
 document.getElementById('exportStartDate').addEventListener('change', updateExcel);
 document.getElementById('exportEndDate').addEventListener('change', updateExcel);
 document.getElementById('slipSearch').addEventListener('keydown', (event) => {{ if (event.key === 'Enter') {{ window.__accountSearchMode = 'scoped'; load({{scrollTop:true}}); }} }});

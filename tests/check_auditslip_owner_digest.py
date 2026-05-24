@@ -117,11 +117,18 @@ def make_db(path: Path) -> None:
         (now, now),
     )
 
-    # Build a 3-row valid hash chain.
+    # Build a 3-row valid hash chain inside the digest's 24h window.
+    # Keep this relative to the test runtime so the guard does not rot when
+    # the fixed fixture date gets older than the owner-digest lookback.
+    mutation_times = [
+        time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 3 * 3600)),
+        time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 2 * 3600)),
+        time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 1 * 3600)),
+    ]
     base_rows = [
-        {"ts_iso": "2026-05-23T01:00:00", "action": "delete", "actor": "owner", "chat_id": "C1", "bot_key": "default", "slip_id": "S1", "payload_json": "{}", "result_status": "ok", "result_summary": "row 1"},
-        {"ts_iso": "2026-05-23T02:00:00", "action": "reprocess", "actor": "owner", "chat_id": "C1", "bot_key": "default", "slip_id": "S2", "payload_json": "{}", "result_status": "ok", "result_summary": "row 2"},
-        {"ts_iso": "2026-05-23T03:00:00", "action": "reprocess", "actor": "owner", "chat_id": "C1", "bot_key": "default", "slip_id": "S3", "payload_json": "{}", "result_status": "ok", "result_summary": "row 3"},
+        {"ts_iso": mutation_times[0], "action": "delete", "actor": "owner", "chat_id": "C1", "bot_key": "default", "slip_id": "S1", "payload_json": "{}", "result_status": "ok", "result_summary": "row 1"},
+        {"ts_iso": mutation_times[1], "action": "reprocess", "actor": "owner", "chat_id": "C1", "bot_key": "default", "slip_id": "S2", "payload_json": "{}", "result_status": "ok", "result_summary": "row 2"},
+        {"ts_iso": mutation_times[2], "action": "reprocess", "actor": "owner", "chat_id": "C1", "bot_key": "default", "slip_id": "S3", "payload_json": "{}", "result_status": "ok", "result_summary": "row 3"},
     ]
     last_hash = ""
     for i, br in enumerate(base_rows, start=1):
