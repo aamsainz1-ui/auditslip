@@ -66,6 +66,7 @@ from auditslip_bot import (
     ocr_extract,
     openai_extract,
     parse_number,
+    provider_status,
     scope_to_date,
     telegram_bot_configs,
     unclear_reason,
@@ -252,6 +253,25 @@ def dashboard_operational_health(db_path: Path = DB_PATH) -> Dict[str, Any]:
             checks.setdefault("ocr_queue", {"ok": False, "error": "db_unreadable", "counts": {}})
             checks.setdefault("pending_actions", {"ok": False, "error": "db_unreadable"})
             criticals.append({"code": "db_unreadable", "message": "database could not be read", "error_type": type(exc).__name__})
+
+    try:
+        providers = provider_status()
+        active_count = sum(1 for item in providers if item.get("active"))
+        circuit_open_count = sum(1 for item in providers if item.get("circuit_open"))
+        checks["ocr_providers"] = {
+            "ok": bool(active_count),
+            "active_count": active_count,
+            "configured_count": len(providers),
+            "circuit_open_count": circuit_open_count,
+            "providers": providers,
+        }
+        if providers and not active_count:
+            warnings_list.append({"code": "ocr_providers_unavailable", "message": "no OCR provider is currently available"})
+        elif circuit_open_count:
+            warnings_list.append({"code": "ocr_provider_circuit_open", "message": "one or more OCR providers are in circuit-breaker cooldown", "count": circuit_open_count})
+    except Exception as exc:
+        checks["ocr_providers"] = {"ok": False, "error_type": type(exc).__name__, "providers": []}
+        warnings_list.append({"code": "ocr_provider_health_unavailable", "message": "OCR provider health could not be read"})
 
     watchdog_state = Path(os.environ.get("AUDITSLIP_WATCHDOG_STATE") or DATA_DIR / "watchdog-state.json")
     state_file = {"exists": watchdog_state.exists(), "age_seconds": _file_age_seconds(watchdog_state)}

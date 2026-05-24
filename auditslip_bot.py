@@ -49,6 +49,10 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 OCR_RETRY_ATTEMPTS = max(1, int(os.environ.get("OCR_RETRY_ATTEMPTS", "3")))
 OCR_RETRY_BASE_DELAY = float(os.environ.get("OCR_RETRY_BASE_DELAY", "2"))
+OCR_PROVIDER_BREAKER_ENABLED = os.environ.get("OCR_PROVIDER_BREAKER_ENABLED", "1").strip().lower() not in {"0", "false", "no", "n", "off"}
+OCR_PROVIDER_BREAKER_FAILURE_THRESHOLD = max(1, int(os.environ.get("OCR_PROVIDER_BREAKER_FAILURE_THRESHOLD", "3")))
+OCR_PROVIDER_BREAKER_COOLDOWN_SECONDS = max(1, int(os.environ.get("OCR_PROVIDER_BREAKER_COOLDOWN_SECONDS", "300")))
+OCR_PROVIDER_HEALTH_PATH = Path(os.environ.get("OCR_PROVIDER_HEALTH_PATH", DATA_DIR / "ocr-provider-health.json"))
 POLL_TIMEOUT = int(os.environ.get("AUDITSLIP_POLL_TIMEOUT", "30"))
 MAX_SLIPS_PER_POLL = max(1, int(os.environ.get("AUDITSLIP_MAX_SLIPS_PER_POLL", "100")))
 OCR_WORKERS = max(1, int(os.environ.get("AUDITSLIP_OCR_WORKERS", "4")))
@@ -367,6 +371,159 @@ def telegram_bot_configs() -> List[Dict[str, str]]:
     return configs
 
 
+_OCR_PROVIDER_HEALTH_LOCK = threading.Lock()
+_OCR_PROVIDER_HEALTH_LOADED = False
+_OCR_PROVIDER_HEALTH: Dict[str, Dict[str, Any]] = {}
+
+
+def _utc_iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_provider_name(provider: Any) -> str:
+    return re.sub(r"[^a-z0-9_-]+", "", str(provider or "").strip().lower())[:32]
+
+
+def _provider_health_defaults(provider: str) -> Dict[str, Any]:
+    return {
+        "provider": provider,
+        "success_count": 0,
+        "failure_count": 0,
+        "skipped_count": 0,
+        "consecutive_failures": 0,
+        "opened_until": 0.0,
+        "circuit_opened_at": "",
+        "last_success_at": "",
+        "last_failure_at": "",
+        "last_skipped_at": "",
+        "last_error_type": "",
+    }
+
+
+def _coerce_provider_health(provider: str, raw: Any) -> Dict[str, Any]:
+    state = _provider_health_defaults(provider)
+    if isinstance(raw, dict):
+        for key in ["success_count", "failure_count", "skipped_count", "consecutive_failures"]:
+            try:
+                state[key] = max(0, int(raw.get(key) or 0))
+            except Exception:
+                state[key] = 0
+        try:
+            state["opened_until"] = max(0.0, float(raw.get("opened_until") or 0.0))
+        except Exception:
+            state["opened_until"] = 0.0
+        for key in ["circuit_opened_at", "last_success_at", "last_failure_at", "last_skipped_at", "last_error_type"]:
+            state[key] = clean_text(raw.get(key))[:80]
+    return state
+
+
+def _load_ocr_provider_health_unlocked() -> None:
+    global _OCR_PROVIDER_HEALTH_LOADED
+    if _OCR_PROVIDER_HEALTH_LOADED:
+        return
+    try:
+        if OCR_PROVIDER_HEALTH_PATH.exists():
+            obj = json.loads(OCR_PROVIDER_HEALTH_PATH.read_text(encoding="utf-8"))
+            providers = obj.get("providers") if isinstance(obj, dict) else {}
+            if isinstance(providers, dict):
+                for provider, raw in providers.items():
+                    key = _safe_provider_name(provider)
+                    if key:
+                        _OCR_PROVIDER_HEALTH[key] = _coerce_provider_health(key, raw)
+    except Exception:
+        pass
+    _OCR_PROVIDER_HEALTH_LOADED = True
+
+
+def _persist_ocr_provider_health_unlocked() -> None:
+    try:
+        OCR_PROVIDER_HEALTH_PATH.parent.mkdir(parents=True, exist_ok=True)
+        safe_state = {
+            "updated_at": _utc_iso_now(),
+            "providers": {provider: _coerce_provider_health(provider, state) for provider, state in sorted(_OCR_PROVIDER_HEALTH.items())},
+        }
+        tmp = OCR_PROVIDER_HEALTH_PATH.with_suffix(OCR_PROVIDER_HEALTH_PATH.suffix + ".tmp")
+        tmp.write_text(json.dumps(safe_state, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        tmp.replace(OCR_PROVIDER_HEALTH_PATH)
+    except Exception:
+        pass
+
+
+def _provider_health_unlocked(provider: str) -> Dict[str, Any]:
+    _load_ocr_provider_health_unlocked()
+    key = _safe_provider_name(provider)
+    if key not in _OCR_PROVIDER_HEALTH:
+        _OCR_PROVIDER_HEALTH[key] = _provider_health_defaults(key)
+    return _OCR_PROVIDER_HEALTH[key]
+
+
+def ocr_provider_circuit_open(provider: str, *, now: float | None = None, record_skip: bool = False) -> bool:
+    if not OCR_PROVIDER_BREAKER_ENABLED:
+        return False
+    key = _safe_provider_name(provider)
+    if not key:
+        return False
+    ts = time.time() if now is None else float(now)
+    with _OCR_PROVIDER_HEALTH_LOCK:
+        state = _provider_health_unlocked(key)
+        opened_until = float(state.get("opened_until") or 0.0)
+        if opened_until <= ts:
+            if opened_until:
+                state["opened_until"] = 0.0
+                state["circuit_opened_at"] = ""
+                _persist_ocr_provider_health_unlocked()
+            return False
+        if record_skip:
+            state["skipped_count"] = int(state.get("skipped_count") or 0) + 1
+            state["last_skipped_at"] = _utc_iso_now()
+            _persist_ocr_provider_health_unlocked()
+        return True
+
+
+def record_ocr_provider_success(provider: str, model: str = "") -> None:
+    key = _safe_provider_name(provider)
+    if not key:
+        return
+    with _OCR_PROVIDER_HEALTH_LOCK:
+        state = _provider_health_unlocked(key)
+        state["success_count"] = int(state.get("success_count") or 0) + 1
+        state["consecutive_failures"] = 0
+        state["opened_until"] = 0.0
+        state["circuit_opened_at"] = ""
+        state["last_error_type"] = ""
+        state["last_success_at"] = _utc_iso_now()
+        _persist_ocr_provider_health_unlocked()
+
+
+def record_ocr_provider_failure(provider: str, exc: Exception) -> None:
+    key = _safe_provider_name(provider)
+    if not key:
+        return
+    with _OCR_PROVIDER_HEALTH_LOCK:
+        state = _provider_health_unlocked(key)
+        state["failure_count"] = int(state.get("failure_count") or 0) + 1
+        state["consecutive_failures"] = int(state.get("consecutive_failures") or 0) + 1
+        state["last_failure_at"] = _utc_iso_now()
+        state["last_error_type"] = type(exc).__name__[:80]
+        if OCR_PROVIDER_BREAKER_ENABLED and int(state["consecutive_failures"]) >= OCR_PROVIDER_BREAKER_FAILURE_THRESHOLD:
+            state["opened_until"] = time.time() + OCR_PROVIDER_BREAKER_COOLDOWN_SECONDS
+            state["circuit_opened_at"] = _utc_iso_now()
+        _persist_ocr_provider_health_unlocked()
+
+
+def provider_health_snapshot(provider: str, *, now: float | None = None) -> Dict[str, Any]:
+    key = _safe_provider_name(provider)
+    ts = time.time() if now is None else float(now)
+    with _OCR_PROVIDER_HEALTH_LOCK:
+        state = _coerce_provider_health(key, _provider_health_unlocked(key))
+    opened_until = float(state.get("opened_until") or 0.0)
+    circuit_open = OCR_PROVIDER_BREAKER_ENABLED and opened_until > ts
+    out = dict(state)
+    out["circuit_open"] = circuit_open
+    out["opened_seconds_remaining"] = max(0, int(opened_until - ts)) if circuit_open else 0
+    return out
+
+
 def ocr_provider_candidates(
     provider_string: Optional[str] = None,
     gemini_key: Optional[str] = None,
@@ -389,16 +546,34 @@ def ocr_provider_candidates(
 
 def provider_status() -> List[Dict[str, Any]]:
     configured = [p.strip().lower() for p in OCR_PROVIDERS.split(",") if p.strip()]
-    active = set(ocr_provider_candidates())
-    return [
-        {
+    configured_unique: List[str] = []
+    for provider in configured:
+        if provider not in configured_unique:
+            configured_unique.append(provider)
+    candidate_set = set(ocr_provider_candidates())
+    out: List[Dict[str, Any]] = []
+    for p in configured_unique:
+        has_key = bool(GEMINI_API_KEY if p == "gemini" else OPENAI_API_KEY if p == "openai" else "")
+        health = provider_health_snapshot(p)
+        circuit_open = bool(health.get("circuit_open"))
+        item = {
             "provider": p,
-            "active": p in active,
+            "active": p in candidate_set and not circuit_open,
+            "available": p in candidate_set and not circuit_open,
             "model": GEMINI_MODEL if p == "gemini" else OPENAI_MODEL if p == "openai" else "",
-            "has_key": bool(GEMINI_API_KEY if p == "gemini" else OPENAI_API_KEY if p == "openai" else ""),
+            "has_key": has_key,
+            "circuit_open": circuit_open,
+            "opened_seconds_remaining": int(health.get("opened_seconds_remaining") or 0),
+            "success_count": int(health.get("success_count") or 0),
+            "failure_count": int(health.get("failure_count") or 0),
+            "skipped_count": int(health.get("skipped_count") or 0),
+            "consecutive_failures": int(health.get("consecutive_failures") or 0),
+            "last_success_at": str(health.get("last_success_at") or ""),
+            "last_failure_at": str(health.get("last_failure_at") or ""),
+            "last_error_type": str(health.get("last_error_type") or ""),
         }
-        for p in configured
-    ]
+        out.append(item)
+    return out
 
 
 def gemini_model_candidates() -> List[str]:
@@ -750,16 +925,22 @@ def ocr_extract(image_path: Path, mime: Optional[str] = None) -> Tuple[str, Dict
     if not candidates:
         raise RuntimeError("No OCR provider is active. Configure GEMINI_API_KEY and/or OPENAI_API_KEY.")
     for provider in candidates:
+        if ocr_provider_circuit_open(provider, record_skip=True):
+            errors.append(f"{provider}: circuit open")
+            log("OCR provider skipped", provider, "circuit_open")
+            continue
         try:
             data, meta = extract_with_provider(provider, image_path, mime)
             normalized = normalize_record(data)
             normalized["ocr_provider"] = meta.get("provider", provider)
             normalized["ocr_model"] = meta.get("model", "")
             normalized["raw_json"] = json.dumps(data, ensure_ascii=False)
+            record_ocr_provider_success(provider, str(meta.get("model", "")))
             return provider, normalized
         except Exception as exc:
-            errors.append(f"{provider}: {exc}")
-            log("OCR provider failed", provider, str(exc)[:300])
+            record_ocr_provider_failure(provider, exc)
+            errors.append(f"{provider}: {type(exc).__name__}")
+            log("OCR provider failed", provider, type(exc).__name__)
     raise RuntimeError("; ".join(errors))
 
 
@@ -1549,9 +1730,13 @@ class AuditslipBot:
     def providers_text(self) -> str:
         lines = [f"<b>{h(APP_NAME)} OCR providers</b>"]
         for item in provider_status():
-            mark = "✅ active" if item["active"] else "⚠️ inactive"
+            if item.get("circuit_open"):
+                mark = f"⏸ circuit open {int(item.get('opened_seconds_remaining') or 0)}s"
+            else:
+                mark = "✅ active" if item["active"] else "⚠️ inactive"
             key = "key ok" if item["has_key"] else "missing key"
-            lines.append(f"• {h(item['provider'])}: {mark} — {h(item['model'])} — {key}")
+            health = f"success {int(item.get('success_count') or 0)} / fail {int(item.get('failure_count') or 0)}"
+            lines.append(f"• {h(item['provider'])}: {mark} — {h(item['model'])} — {key} — {health}")
         lines.append(f"คิว OCR ต่อรอบ: <b>{MAX_SLIPS_PER_POLL}</b> สลิป")
         return "\n".join(lines)
 
