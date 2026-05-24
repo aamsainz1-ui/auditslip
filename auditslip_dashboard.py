@@ -5162,6 +5162,8 @@ def render_dashboard_html(token: str = "") -> str:
     .modal-card {{ width:min(440px,100%); border:1px solid rgba(148,163,184,.24); border-radius:18px; background:linear-gradient(180deg,#121a2f,#0f172a); box-shadow:0 30px 80px rgba(0,0,0,.42); padding:18px; }}
     .modal-title {{ font-size:18px; font-weight:900; margin:0 0 8px; color:#f8fafc; }}
     .modal-message {{ color:#cbd5e1; line-height:1.55; white-space:pre-wrap; }}
+    .modal-input {{ width:100%; min-height:86px; margin-top:12px; resize:vertical; background:#0f172a; color:var(--text); border:1px solid var(--line); border-radius:12px; padding:10px; font:inherit; }}
+    .modal-input[hidden] {{ display:none !important; }}
     .modal-actions {{ display:flex; justify-content:flex-end; gap:8px; margin-top:16px; }}
     .modal-cancel {{ background:#334155; }}
     .modal-primary.danger {{ background:#dc2626; }}
@@ -5374,6 +5376,7 @@ def render_dashboard_html(token: str = "") -> str:
     <div class="modal-card">
       <div id="dashboardModalTitle" class="modal-title">แจ้งเตือน</div>
       <div id="dashboardModalMessage" class="modal-message"></div>
+      <textarea id="dashboardModalInput" class="modal-input" hidden></textarea>
       <div class="modal-actions">
         <button id="dashboardModalCancel" type="button" class="modal-cancel">ยกเลิก</button>
         <button id="dashboardModalOk" type="button" class="modal-primary">ตกลง</button>
@@ -5392,6 +5395,7 @@ function dashboardModalElements() {{
     root: document.getElementById('dashboardModal'),
     title: document.getElementById('dashboardModalTitle'),
     message: document.getElementById('dashboardModalMessage'),
+    input: document.getElementById('dashboardModalInput'),
     ok: document.getElementById('dashboardModalOk'),
     cancel: document.getElementById('dashboardModalCancel')
   }};
@@ -5406,27 +5410,45 @@ function closeDashboardModal(result=false) {{
 function showDashboardModal(options={{}}) {{
   return new Promise(resolve => {{
     const el = dashboardModalElements();
-    if (!el.root) {{ resolve(true); return; }}
+    if (!el.root) {{ resolve(options.input ? {{ok:true, value:''}} : true); return; }}
     dashboardModalResolver = resolve;
     if (el.title) el.title.textContent = options.title || 'แจ้งเตือน';
     if (el.message) el.message.textContent = options.message || '';
+    const wantsInput = Boolean(options.input);
+    if (el.input) {{
+      el.input.hidden = !wantsInput;
+      el.input.value = wantsInput ? String(options.inputValue ?? '') : '';
+      el.input.placeholder = wantsInput ? String(options.inputPlaceholder || '') : '';
+      el.input.onkeydown = (event) => {{
+        if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {{
+          event.preventDefault();
+          closeDashboardModal({{ok:true, value:el.input.value || ''}});
+        }}
+      }};
+    }}
     if (el.ok) {{
       el.ok.textContent = options.confirmText || 'ตกลง';
       el.ok.classList.toggle('danger', Boolean(options.danger));
-      el.ok.onclick = () => closeDashboardModal(true);
+      el.ok.onclick = () => closeDashboardModal(wantsInput ? {{ok:true, value:el.input ? (el.input.value || '') : ''}} : true);
     }}
     if (el.cancel) {{
       el.cancel.textContent = options.cancelText || 'ยกเลิก';
       el.cancel.style.display = options.showCancel === false ? 'none' : '';
-      el.cancel.onclick = () => closeDashboardModal(false);
+      el.cancel.onclick = () => closeDashboardModal(wantsInput ? {{ok:false, value:null}} : false);
     }}
     el.root.classList.add('open');
     el.root.setAttribute('aria-hidden', 'false');
-    if (el.ok) el.ok.focus();
+    if (wantsInput && el.input) el.input.focus();
+    else if (el.ok) el.ok.focus();
   }});
 }}
 function dashboardNotify(message, title='แจ้งเตือน') {{ return showDashboardModal({{title, message, showCancel:false, confirmText:'ตกลง'}}); }}
 function dashboardConfirm(message, title='ยืนยัน', danger=false) {{ return showDashboardModal({{title, message, showCancel:true, confirmText:'ยืนยัน', cancelText:'ยกเลิก', danger}}); }}
+async function dashboardInput(message, title='กรอกข้อมูล', defaultValue='', options={{}}) {{
+  const result = await showDashboardModal({{title, message, input:true, inputValue:defaultValue, inputPlaceholder:options.placeholder || '', showCancel:true, confirmText:options.confirmText || 'ตกลง', cancelText:options.cancelText || 'ยกเลิก', danger:Boolean(options.danger)}});
+  if (!result || result.ok !== true) return null;
+  return String(result.value || '');
+}}
 document.addEventListener('keydown', (event) => {{ if (event.key === 'Escape' && dashboardModalResolver) closeDashboardModal(false); }});
 if ('scrollRestoration' in window.history) window.history.scrollRestoration = 'manual';
 window.scrollTo(0, 0);
@@ -6381,8 +6403,7 @@ async function approvePending(pendingId) {{
   refreshPendingBadge();
 }}
 async function rejectPending(pendingId) {{
-  let reason = '';
-  try {{ reason = window.prompt('เหตุผลที่ปฏิเสธคำขอ #' + pendingId + ' (ระบุก็ได้)', '') || ''; }} catch (e) {{ reason = ''; }}
+  const reason = await dashboardInput('เหตุผลที่ปฏิเสธคำขอ #' + pendingId + ' (ระบุก็ได้)', 'ปฏิเสธคำขอ', '', {{placeholder:'เหตุผล (ไม่บังคับ)', confirmText:'ปฏิเสธ', danger:true}});
   if (reason === null) return;
   try {{
     const res = await fetch('/api/pending/reject', {{method:'POST', headers:postHeaders(), body: JSON.stringify({{pending_id: pendingId, reason: reason}})}});

@@ -25,20 +25,24 @@ spec.loader.exec_module(Dash)
 html = Dash.render_dashboard_html("test-token")
 for marker in [
     "id=\"dashboardModal\"",
+    "id=\"dashboardModalInput\"",
     "dashboardNotify",
     "dashboardConfirm",
+    "dashboardInput",
     "await dashboardConfirm",
     "await dashboardNotify",
+    "await dashboardInput",
     "modal-title",
     "modal-primary",
     "modal-cancel",
+    "modal-input",
 ]:
     assert marker in html, marker
 
 match = re.search(r"<script>\n(.*?)\n</script>", html, re.S)
 assert match, "rendered dashboard script not found"
 script = match.group(1)
-for forbidden in ["alert(", "confirm(", "window.alert", "window.confirm"]:
+for forbidden in ["alert(", "confirm(", "prompt(", "window.alert", "window.confirm", "window.prompt"]:
     assert forbidden not in script, f"native browser dialog still present: {forbidden}"
 
-print("ok: dashboard uses custom modal for alerts/confirms")
+print("ok: dashboard uses custom modal for alerts/confirms/input prompts")
