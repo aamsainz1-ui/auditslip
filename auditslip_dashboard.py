@@ -7230,10 +7230,32 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 record_mutation(DB_PATH, "bank_review_batch", actor=self.actor_fingerprint(), payload=payload, result_status="error", result_summary=safe_error(exc))
                 self.send_json({"ok": False, "error": safe_error(exc)}, 400)
             return
-        if parsed.path == "/api/reconcile":
+        if parsed.path in {"/api/reconcile", "/api/reconcile/preview"}:
             if not self.role_or_401("admin"):
                 return
             actor_fp = self.actor_fingerprint()
+            dry_run = parsed.path == "/api/reconcile/preview" or clean_display((parse_qs(parsed.query).get("dry_run") or parse_qs(parsed.query).get("preview") or [payload.get("dry_run") or payload.get("preview") or ""])[0]).lower() in {"1", "true", "yes", "y", "on"}
+            if dry_run:
+                try:
+                    req_payload = dict(payload) if isinstance(payload, dict) else {}
+                    if uploaded_excel_path and not req_payload.get("excel_path"):
+                        req_payload["excel_path"] = str(uploaded_excel_path)
+                    chat_id = str(req_payload.get("chat_id") or "")
+                    bot_key = str(req_payload.get("bot_key") or "")
+                    flow_type = str(req_payload.get("flow_type") or "all")
+                    scope = str(req_payload.get("scope") or "all")
+                    excel_path = safe_backend_excel_path(str(req_payload.get("excel_path") or ""))
+                    if not excel_path.exists():
+                        self.send_json({"ok": False, "error": f"excel not found: {excel_path}", "dry_run": True}, 404)
+                        return
+                    result = reconcile_backend_excel(DB_PATH, excel_path, chat_id=chat_id, scope=scope, bot_key=bot_key, flow_type=flow_type)
+                    result["dry_run"] = True
+                    result["approval_required"] = False
+                    self.send_json(result, 200 if result.get("ok") else 400)
+                except Exception as exc:
+                    logger.exception("api_reconcile_preview failed")
+                    self.send_json({"ok": False, "error": safe_error(exc), "dry_run": True}, 400)
+                return
             approval_mode = self.parse_approval_param()
             if approval_mode == "request":
                 request_id = uuid.uuid4().hex[:12]
