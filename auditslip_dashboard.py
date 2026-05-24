@@ -4530,6 +4530,100 @@ def export_cross_company_account_slips_excel(db_path: Path, flow_type: str = "al
     return out
 
 
+def export_preview_filename(company_name: str = "", bot_key: str = "", flow_type: str = "all", scope: str = "all", start_date: str = "", end_date: str = "", *, ext: str = "xlsx", prefix: str = "auditslip") -> str:
+    label_parts = [safe_export_name(company_name or bot_key or "all"), normalize_flow_type(flow_type), normalize_export_date(start_date) or clean_display(scope or "all")]
+    if end_date:
+        label_parts.append(normalize_export_date(end_date))
+    label = "-".join([p for p in label_parts if p]) or "all"
+    return f"{prefix}-{label}-preview.{ext}"
+
+
+def export_workbook_preview(rows: List[sqlite3.Row], *, bot_key: str = "", chat_id: str = "", flow_type: str = "all", scope: str = "all", start_date: str = "", end_date: str = "", company_name: str = "") -> Dict[str, Any]:
+    duplicate_rows = duplicate_export_rows_for_preview(rows)
+    counted_rows = counted_export_rows(rows)
+    sheets = {
+        "SummaryByCompany": len(export_group_summary(rows, "company_name", "company_name")),
+        "SummaryByTransferor": len(export_group_summary(rows, "transferor_name", "transferor_name")),
+        "DailySummary": len(export_daily_summary(rows)),
+        "Slips": len(dashboard_slip_export_rows(rows, "all")),
+        "DepositSlips": len(dashboard_slip_export_rows(rows, "deposit")),
+        "WithdrawSlips": len(dashboard_slip_export_rows(rows, "withdraw")),
+        "DuplicateSlips": len(duplicate_rows),
+    }
+    flow = normalize_flow_type(flow_type)
+    return {
+        "ok": True,
+        "dry_run": True,
+        "format": "xlsx",
+        "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "filename": export_preview_filename(company_name=company_name, bot_key=bot_key, flow_type=flow, scope=scope, start_date=start_date, end_date=end_date, ext="xlsx"),
+        "scope": {"bot_key": clean_display(bot_key) or "default", "chat_id": str(chat_id or ""), "flow_type": flow, "date_scope": clean_display(scope or "all"), "start_date": normalize_export_date(start_date), "end_date": normalize_export_date(end_date)},
+        "rows": {"selected": len(rows), "counted": len(counted_rows), "duplicates": len(duplicate_rows)},
+        "sheets": sheets,
+    }
+
+
+def duplicate_export_rows_for_preview(rows: List[sqlite3.Row]) -> List[sqlite3.Row]:
+    """Count duplicate evidence rows without reading linked originals or creating workbooks."""
+    return [row for row in rows if int(row["is_duplicate"] or 0)]
+
+
+def export_dashboard_preview(db_path: Path, bot_key: str = "", chat_id: str = "", flow_type: str = "all", scope: str = "all", start_date: str = "", end_date: str = "", cross_account_search: str = "", company_name: str = "") -> Dict[str, Any]:
+    """Read-only export smoke metadata. Does not create XLSX/ZIP files or mutation log rows."""
+    flow = normalize_flow_type(flow_type)
+    query = clean_display(cross_account_search)
+    if query:
+        with connect(db_path) as conn:
+            result = cross_company_account_slip_search_rows(conn, scope=scope, flow_type=flow, search=query, limit=0)
+        rows = list(result.get("rows") or [])
+        sheets = {
+            "SummaryByCompany": len(result.get("companies") or []),
+            "CrossCompanyAccountSlips": len(cross_company_account_slip_export_rows(rows, "all")),
+            "DepositSlips": len(cross_company_account_slip_export_rows(rows, "deposit")),
+            "WithdrawSlips": len(cross_company_account_slip_export_rows(rows, "withdraw")),
+        }
+        return {
+            "ok": True,
+            "dry_run": True,
+            "format": "xlsx",
+            "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "filename": f"auditslip-cross-company-account-{flow}-{safe_export_name(query)}-{safe_export_name(clean_display(scope or 'all'))}-preview.xlsx",
+            "scope": {"bot_key": "__all__", "chat_id": "", "flow_type": flow, "date_scope": clean_display(scope or "all"), "start_date": normalize_export_date(start_date), "end_date": normalize_export_date(end_date)},
+            "rows": {"selected": len(rows), "counted": len(cross_company_account_slip_export_rows(rows, "all")), "duplicates": sum(1 for row in rows if export_row_is_duplicate(row))},
+            "company_count": int(result.get("company_count") or 0),
+            "is_cross_company": bool(result.get("is_cross_company")),
+            "sheets": sheets,
+        }
+
+    requested_all = clean_display(bot_key) in {"__all__", "all"} and not chat_id
+    with connect(db_path) as conn:
+        rows = export_rows_for_selection(conn, bot_key="" if requested_all else bot_key, chat_id=chat_id, flow_type=flow, scope=scope, start_date=start_date, end_date=end_date)
+    if requested_all:
+        companies: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            row_bot = clean_display(row["bot_key"]) or "default"
+            company = clean_company_name(row["company_name"], row_bot) or row_bot
+            entry = companies.setdefault(row_bot, {"bot_key": row_bot, "company_name": company, "selected": 0, "counted": 0, "duplicates": 0})
+            entry["selected"] += 1
+            if int(row["is_duplicate"] or 0):
+                entry["duplicates"] += 1
+            elif str(row["status"] or "") == "success":
+                entry["counted"] += 1
+        return {
+            "ok": True,
+            "dry_run": True,
+            "format": "zip",
+            "mime": "application/zip",
+            "filename": export_preview_filename(company_name="by-company", bot_key=bot_key or "all", flow_type=flow, scope=scope, start_date=start_date, end_date=end_date, ext="zip", prefix="auditslip"),
+            "scope": {"bot_key": clean_display(bot_key) or "__all__", "chat_id": "", "flow_type": flow, "date_scope": clean_display(scope or "all"), "start_date": normalize_export_date(start_date), "end_date": normalize_export_date(end_date)},
+            "rows": {"selected": len(rows), "counted": len(counted_export_rows(rows)), "duplicates": len(duplicate_export_rows_for_preview(rows))},
+            "company_count": len(companies),
+            "companies": sorted(companies.values(), key=lambda r: company_sort_key(str(r.get("company_name") or ""), str(r.get("bot_key") or ""))),
+            "sheets": {"zip_members": len(companies), "per_workbook": ["SummaryByCompany", "SummaryByTransferor", "DailySummary", "Slips", "DepositSlips", "WithdrawSlips", "DuplicateSlips"]},
+        }
+    return export_workbook_preview(rows, bot_key=bot_key, chat_id=chat_id, flow_type=flow, scope=scope, start_date=start_date, end_date=end_date, company_name=company_name)
+
+
 def resolve_export_selection(db_path: Path, chat_id: str = "", bot_key: str = "", flow_type: str = "all") -> Dict[str, Any]:
     """Resolve an export request to a chat that belongs to the selected company/bot.
 
@@ -6649,7 +6743,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 logger.exception("api_slip_image failed slip_id=%s", slip_id)
                 self.send_json({"ok": False, "error": safe_error(exc)}, 404)
             return
-        if parsed.path == "/api/export":
+        if parsed.path in {"/api/export", "/api/export/preview"}:
             q = parse_qs(parsed.query)
             chat_id = (q.get("chat_id") or [""])[0]
             bot_key = (q.get("bot_key") or ["default"])[0] or "default"
@@ -6658,7 +6752,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
             start_date = (q.get("start_date") or [""])[0]
             end_date = (q.get("end_date") or [""])[0]
             cross_account_search = (q.get("cross_account_search") or [""])[0]
+            dry_run = parsed.path == "/api/export/preview" or clean_display((q.get("dry_run") or q.get("preview") or [""])[0]).lower() in {"1", "true", "yes", "y", "on"}
             try:
+                if dry_run:
+                    company_name = ""
+                    if chat_id and not clean_display(cross_account_search):
+                        selection = resolve_export_selection(DB_PATH, chat_id=chat_id, bot_key=bot_key, flow_type=flow_type)
+                        if not selection.get("ok"):
+                            self.send_json(selection, 404)
+                            return
+                        chat_id = str(selection["chat_id"])
+                        bot_key = str(selection["bot_key"])
+                        company_name = str(selection.get("company_name") or APP_NAME)
+                    self.send_json(export_dashboard_preview(DB_PATH, bot_key=bot_key, chat_id=chat_id, flow_type=flow_type, scope=scope, start_date=start_date, end_date=end_date, cross_account_search=cross_account_search, company_name=company_name))
+                    return
                 if clean_display(cross_account_search):
                     path = export_cross_company_account_slips_excel(DB_PATH, flow_type=flow_type, scope=scope, search=cross_account_search)
                     body = path.read_bytes()
