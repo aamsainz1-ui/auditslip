@@ -18,6 +18,7 @@ import mimetypes
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -86,6 +87,203 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+REQUIRED_HEALTH_TABLES = ("slips", "ocr_jobs", "processed_updates", "bot_state", "company_accounts")
+OPTIONAL_HEALTH_TABLES = ("pending_actions", "dashboard_mutation_log")
+
+
+def health_env_bool(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return clean_display(raw).lower() not in {"0", "false", "no", "n", "off", "skip"}
+
+
+def connect_readonly(db_path: Path) -> sqlite3.Connection:
+    """Open SQLite in read-only mode so health checks cannot create or mutate DB files."""
+    conn = sqlite3.connect(f"file:{Path(db_path)}?mode=ro", uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _status_counts(conn: sqlite3.Connection, table: str, column: str) -> Dict[str, int]:
+    rows = conn.execute(
+        f"SELECT COALESCE(NULLIF({column},''),'unknown') AS status, COUNT(*) AS count FROM {table} GROUP BY COALESCE(NULLIF({column},''),'unknown') ORDER BY status"
+    ).fetchall()
+    return {str(r["status"]): int(r["count"] or 0) for r in rows}
+
+
+def _file_age_seconds(path: Path, now: float | None = None) -> int | None:
+    if not path.exists():
+        return None
+    return max(0, int((time.time() if now is None else now) - path.stat().st_mtime))
+
+
+def _systemctl_state(unit: str) -> Dict[str, Any]:
+    unit = clean_display(unit)
+    if not unit:
+        return {"ok": False, "state": "missing", "unit": ""}
+    try:
+        proc = subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True, timeout=1.5)
+        state = clean_display(proc.stdout or proc.stderr) or "unknown"
+        return {"ok": proc.returncode == 0 and state == "active", "state": state, "unit": unit}
+    except Exception as exc:
+        return {"ok": False, "state": "unknown", "unit": unit, "error_type": type(exc).__name__}
+
+
+def dashboard_operational_health(db_path: Path = DB_PATH) -> Dict[str, Any]:
+    """Return public-safe operational health without writing to DB or exposing secrets."""
+    generated_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    now_ms_value = int(time.time() * 1000)
+    stale_minutes = int(os.environ.get("AUDITSLIP_HEALTH_STALE_MINUTES") or os.environ.get("AUDITSLIP_WATCHDOG_STALE_MINUTES") or "15")
+    stale_cutoff = now_ms_value - stale_minutes * 60_000
+    checks: Dict[str, Any] = {}
+    warnings_list: List[Dict[str, Any]] = []
+    criticals: List[Dict[str, Any]] = []
+    path = Path(db_path)
+
+    db_check: Dict[str, Any] = {"ok": False, "exists": path.exists(), "readable": False, "path": "configured"}
+    if path.exists():
+        try:
+            db_check["file_size_bytes"] = path.stat().st_size
+        except OSError:
+            pass
+    checks["db"] = db_check
+
+    if not path.exists():
+        criticals.append({"code": "db_missing", "message": "database file is missing"})
+    else:
+        try:
+            with connect_readonly(path) as conn:
+                conn.execute("SELECT 1").fetchone()
+                db_check["readable"] = True
+                db_check["ok"] = True
+
+                required = {name: sqlite_table_exists(conn, name) for name in REQUIRED_HEALTH_TABLES}
+                optional = {name: sqlite_table_exists(conn, name) for name in OPTIONAL_HEALTH_TABLES}
+                schema_ok = all(required.values())
+                checks["schema"] = {"ok": schema_ok, "required_tables": required, "optional_tables": optional}
+                if not schema_ok:
+                    missing = [name for name, exists in required.items() if not exists]
+                    criticals.append({"code": "schema_missing", "message": "required tables are missing", "tables": missing})
+
+                if required.get("slips"):
+                    totals = conn.execute(
+                        """
+                        SELECT COUNT(*) AS total_count,
+                               COALESCE(SUM(CASE WHEN COALESCE(status,'success')='success' AND COALESCE(is_duplicate,0)=0 THEN 1 ELSE 0 END),0) AS success_nonduplicate_count,
+                               COALESCE(SUM(CASE WHEN COALESCE(status,'success')='success' AND COALESCE(is_duplicate,0)=0 THEN COALESCE(amount,0) ELSE 0 END),0) AS success_nonduplicate_amount,
+                               MAX(created_at) AS newest_created_at
+                        FROM slips
+                        """
+                    ).fetchone()
+                    today = os.environ.get("AUDITSLIP_HEALTH_TODAY") or os.environ.get("AUDITSLIP_WATCHDOG_TODAY") or dt.datetime.now(dt.timezone(dt.timedelta(hours=7))).date().isoformat()
+                    today_row = conn.execute(
+                        """
+                        SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount
+                        FROM slips
+                        WHERE COALESCE(status,'success')='success' AND COALESCE(is_duplicate,0)=0 AND COALESCE(slip_date_iso,'')=?
+                        """,
+                        (today,),
+                    ).fetchone()
+                    checks["slips"] = {
+                        "ok": True,
+                        "total_count": int(totals["total_count"] or 0),
+                        "success_nonduplicate_count": int(totals["success_nonduplicate_count"] or 0),
+                        "success_nonduplicate_amount": float(totals["success_nonduplicate_amount"] or 0),
+                        "newest_created_age_seconds": max(0, int((now_ms_value - int(totals["newest_created_at"] or now_ms_value)) / 1000)) if totals else None,
+                        "today": {"date": today, "success_nonduplicate_count": int(today_row["count"] or 0), "success_nonduplicate_amount": float(today_row["amount"] or 0)},
+                    }
+                else:
+                    checks["slips"] = {"ok": False, "error": "missing_table"}
+
+                if required.get("ocr_jobs"):
+                    counts = _status_counts(conn, "ocr_jobs", "status")
+                    active_count = int(counts.get("queued", 0) + counts.get("processing", 0))
+                    stale_rows = conn.execute(
+                        """
+                        SELECT status, MIN(COALESCE(NULLIF(updated_at,0), created_at)) AS oldest_ts, COUNT(*) AS count
+                        FROM ocr_jobs
+                        WHERE status IN ('queued','processing') AND COALESCE(NULLIF(updated_at,0), created_at) < ?
+                        GROUP BY status
+                        ORDER BY status
+                        """,
+                        (stale_cutoff,),
+                    ).fetchall()
+                    stale_active_count = sum(int(r["count"] or 0) for r in stale_rows)
+                    oldest_active = conn.execute(
+                        "SELECT MIN(COALESCE(NULLIF(updated_at,0), created_at)) AS oldest_ts FROM ocr_jobs WHERE status IN ('queued','processing')"
+                    ).fetchone()
+                    oldest_ts = int(oldest_active["oldest_ts"] or 0) if oldest_active else 0
+                    queue_check = {
+                        "ok": stale_active_count == 0,
+                        "counts": counts,
+                        "active_count": active_count,
+                        "stale_active_count": stale_active_count,
+                        "stale_after_minutes": stale_minutes,
+                        "oldest_active_age_seconds": max(0, int((now_ms_value - oldest_ts) / 1000)) if oldest_ts else None,
+                        "stale_by_status": {str(r["status"]): int(r["count"] or 0) for r in stale_rows},
+                    }
+                    checks["ocr_queue"] = queue_check
+                    if stale_active_count:
+                        warnings_list.append({"code": "ocr_queue_stale", "message": "queued/processing OCR jobs are stale", "count": stale_active_count})
+                    failed_threshold = int(os.environ.get("AUDITSLIP_HEALTH_FAILED_THRESHOLD") or os.environ.get("AUDITSLIP_WATCHDOG_FAILED_THRESHOLD") or "1")
+                    failed_count = int(counts.get("failed", 0))
+                    if failed_threshold and failed_count >= failed_threshold:
+                        warnings_list.append({"code": "ocr_jobs_failed", "message": "OCR jobs are failed", "count": failed_count})
+                else:
+                    checks["ocr_queue"] = {"ok": False, "error": "missing_table", "counts": {}}
+
+                if optional.get("pending_actions"):
+                    pending_counts = _status_counts(conn, "pending_actions", "status")
+                    checks["pending_actions"] = {
+                        "ok": True,
+                        "counts": pending_counts,
+                        "pending_count": int(pending_counts.get("pending", 0)),
+                    }
+                else:
+                    checks["pending_actions"] = {"ok": True, "present": False, "pending_count": 0, "counts": {}}
+        except Exception as exc:
+            db_check["readable"] = False
+            db_check["ok"] = False
+            checks.setdefault("schema", {"ok": False, "required_tables": {}, "optional_tables": {}})
+            checks.setdefault("slips", {"ok": False, "error": "db_unreadable"})
+            checks.setdefault("ocr_queue", {"ok": False, "error": "db_unreadable", "counts": {}})
+            checks.setdefault("pending_actions", {"ok": False, "error": "db_unreadable"})
+            criticals.append({"code": "db_unreadable", "message": "database could not be read", "error_type": type(exc).__name__})
+
+    watchdog_state = Path(os.environ.get("AUDITSLIP_WATCHDOG_STATE") or DATA_DIR / "watchdog-state.json")
+    state_file = {"exists": watchdog_state.exists(), "age_seconds": _file_age_seconds(watchdog_state)}
+    watchdog_check: Dict[str, Any] = {"ok": True, "state_file": state_file}
+    if not state_file["exists"]:
+        watchdog_check["ok"] = False
+        warnings_list.append({"code": "watchdog_state_missing", "message": "watchdog state file is missing"})
+    if health_env_bool("AUDITSLIP_HEALTH_SYSTEMCTL", True):
+        watchdog_check["services"] = {
+            "dashboard": _systemctl_state(os.environ.get("AUDITSLIP_DASHBOARD_SERVICE", "auditslip-dashboard.service")),
+            "bot": _systemctl_state(os.environ.get("AUDITSLIP_BOT_SERVICE", "auditslip-bot.service")),
+            "watchdog_timer": _systemctl_state(os.environ.get("AUDITSLIP_WATCHDOG_TIMER", "auditslip-bot-watchdog.timer")),
+        }
+        if not all(item.get("ok") for item in watchdog_check["services"].values()):
+            watchdog_check["ok"] = False
+            warnings_list.append({"code": "service_state_warning", "message": "one or more service units are not active"})
+    else:
+        watchdog_check["services"] = {"skipped": True}
+    checks["watchdog"] = watchdog_check
+
+    status = "critical" if criticals else ("degraded" if warnings_list else "ok")
+    return {
+        "ok": not criticals,
+        "app": APP_NAME,
+        "status": status,
+        "generated_at": generated_at,
+        "checks": checks,
+        "warning_count": len(warnings_list),
+        "critical_count": len(criticals),
+        "warnings": warnings_list[:10],
+        "criticals": criticals[:10],
+    }
 
 
 def sqlite_table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
@@ -6671,7 +6869,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
-            self.send_json({"ok": True, "app": APP_NAME})
+            self.send_json(dashboard_operational_health(DB_PATH))
             return
         q = parse_qs(parsed.query)
         if q.get("token") and parsed.path in {"/", "/index.html"}:
