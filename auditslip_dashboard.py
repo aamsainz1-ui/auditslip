@@ -6914,6 +6914,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.send_json(dashboard_snapshot(DB_PATH, chat_id=chat_id, bot_key=bot_key, flow_type=flow_type, scope=scope, slip_filter=slip_filter, slip_search=slip_search, account_search_mode=account_search_mode, detail_level=detail_level))
             return
         if parsed.path == "/api/pending":
+            actor_role = self.actor_role()
+            if actor_role not in {"admin", "operator", "auditor"}:
+                # Public read-only dashboard polling must not reveal approval queue details.
+                self.send_json({"ok": True, "redacted": True, "items": [], "count": 0, "current_role": actor_role or "public", "simple_approval_enabled": False})
+                return
             try:
                 expire_old_pending_actions(DB_PATH)
             except Exception:
@@ -6926,7 +6931,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 limit = 200
             rows = list_pending_actions(DB_PATH, status=status_filter, limit=limit)
             actor_fp = self.actor_fingerprint()
-            actor_role = self.actor_role()
             self.send_json({"ok": True, "items": rows, "count": len(rows), "current_actor": actor_fp, "current_role": actor_role, "simple_approval_enabled": simple_approval_enabled(DB_PATH, actor_fp, actor_role)})
             return
         if parsed.path == "/api/slip-image":
