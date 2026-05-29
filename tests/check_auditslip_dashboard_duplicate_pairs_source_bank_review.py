@@ -117,6 +117,7 @@ assert by_dup["DUP"]["original_id"] == "ORIG", by_dup
 assert by_dup["DUP"]["duplicate_image_url"].startswith("/api/slip-image?id=DUP"), by_dup["DUP"]
 assert by_dup["DUP"]["original_image_url"].startswith("/api/slip-image?id=ORIG"), by_dup["DUP"]
 assert by_dup["DUP"]["duplicate_message_id"] == 2 and by_dup["DUP"]["original_message_id"] == 1, by_dup["DUP"]
+assert by_dup["DUP"]["duplicate_submitted_at_iso"] and by_dup["DUP"]["original_submitted_at_iso"], by_dup["DUP"]
 assert by_dup["DUP"]["amount"] == 100.0 and by_dup["DUP"]["transferor_name"] == "คุณเอ", by_dup["DUP"]
 assert by_dup["MISS_BANK_DUP"]["original_id"] == "MISS_BANK", by_dup
 
@@ -129,7 +130,7 @@ assert by_review_id["MISS_TRUE_SOURCE_BANK"]["image_url"].startswith("/api/slip-
 assert snapshot["totals"]["source_bank_review_count"] == 1, snapshot["totals"]
 
 html = Dash.render_dashboard_html("test-token")
-for marker in ["duplicatePairs", "คู่สลิปซ้ำ", "ซ้ำกับใบ", "renderDuplicatePairs", "sourceBankReview", "รีเช็คธนาคารต้นทาง", "sourceBankReviewCards", "ข้อมูลใบซ้ำ", "ข้อมูลต้นฉบับ", "original_reference_no", "ยกเลิกการนับซ้ำใบนี้"]:
+for marker in ["duplicatePairs", "คู่สลิปซ้ำ", "ซ้ำกับใบ", "renderDuplicatePairs", "sourceBankReview", "รีเช็คธนาคารต้นทาง", "sourceBankReviewCards", "ข้อมูลใบซ้ำ", "ข้อมูลต้นฉบับ", "เวลาส่งเข้ามา", "duplicate_submitted_at_iso", "original_reference_no", "ยกเลิกการนับซ้ำใบนี้"]:
     assert marker in html, marker
 for forbidden in ["id <code>", "ใบซ้ำ <code>", "ใบต้นฉบับ <code>"]:
     assert forbidden not in html, forbidden

@@ -45,8 +45,23 @@ GEMINI_FALLBACK_MODELS = [
     for item in os.environ.get("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash-lite,gemini-2.0-flash-lite").split(",")
     if item.strip()
 ]
+GEMINI_THINKING_BUDGET_RAW = os.environ.get("GEMINI_THINKING_BUDGET", "0").strip()
+GEMINI_THINKING_BUDGET: Optional[int]
+if GEMINI_THINKING_BUDGET_RAW == "":
+    GEMINI_THINKING_BUDGET = None
+else:
+    try:
+        GEMINI_THINKING_BUDGET = int(GEMINI_THINKING_BUDGET_RAW)
+    except ValueError:
+        GEMINI_THINKING_BUDGET = 0
+GEMINI_THINKING_FALLBACK_ENABLED = os.environ.get("GEMINI_THINKING_FALLBACK_ENABLED", "1").strip().lower() not in {"0", "false", "no", "n", "off"}
+try:
+    GEMINI_FALLBACK_THINKING_BUDGET = int(os.environ.get("GEMINI_FALLBACK_THINKING_BUDGET", "-1"))
+except ValueError:
+    GEMINI_FALLBACK_THINKING_BUDGET = -1
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+OCR_MODEL_PRICING_JSON = os.environ.get("OCR_MODEL_PRICING_JSON", "")
 OCR_RETRY_ATTEMPTS = max(1, int(os.environ.get("OCR_RETRY_ATTEMPTS", "3")))
 OCR_RETRY_BASE_DELAY = float(os.environ.get("OCR_RETRY_BASE_DELAY", "2"))
 OCR_PROVIDER_BREAKER_ENABLED = os.environ.get("OCR_PROVIDER_BREAKER_ENABLED", "1").strip().lower() not in {"0", "false", "no", "n", "off"}
@@ -126,6 +141,13 @@ CREATE TABLE IF NOT EXISTS slips (
   confidence REAL DEFAULT 0,
   ocr_provider TEXT,
   ocr_model TEXT,
+  ocr_input_tokens INTEGER DEFAULT 0,
+  ocr_output_tokens INTEGER DEFAULT 0,
+  ocr_thought_tokens INTEGER DEFAULT 0,
+  ocr_total_tokens INTEGER DEFAULT 0,
+  ocr_usage_json TEXT,
+  ocr_cost_usd REAL DEFAULT 0,
+  ocr_pricing_json TEXT,
   is_duplicate INTEGER DEFAULT 0,
   duplicate_of TEXT,
   settlement_id TEXT,
@@ -233,6 +255,19 @@ SLIP_FIELDS = [
     "ocr_model",
 ]
 
+OCR_USAGE_FIELDS = [
+    "ocr_input_tokens",
+    "ocr_output_tokens",
+    "ocr_thought_tokens",
+    "ocr_total_tokens",
+    "ocr_usage_json",
+]
+
+OCR_COST_FIELDS = [
+    "ocr_cost_usd",
+    "ocr_pricing_json",
+]
+
 
 def log(*args: Any) -> None:
     print(datetime.now(BKK).isoformat(), *args, flush=True)
@@ -262,6 +297,18 @@ def fmt_money(value: Any) -> str:
         return "0.00"
 
 
+def fmt_usd(value: Any) -> str:
+    try:
+        amount = max(0.0, float(value or 0))
+    except Exception:
+        amount = 0.0
+    if amount >= 1:
+        return f"${amount:,.2f}"
+    if amount >= 0.01:
+        return f"${amount:,.4f}"
+    return f"${amount:.6f}"
+
+
 def parse_number(value: Any) -> float:
     if value is None:
         return 0.0
@@ -274,6 +321,26 @@ def parse_number(value: Any) -> float:
 
 def clean_text(value: Any) -> str:
     return " ".join(str(value or "").strip().split())
+
+
+def bkk_iso_from_ms(value: Any) -> str:
+    try:
+        ms = int(float(value or 0))
+    except Exception:
+        return ""
+    if ms <= 0:
+        return ""
+    return datetime.fromtimestamp(ms / 1000, BKK).isoformat()
+
+
+def fmt_bkk_datetime(value: Any) -> str:
+    text = clean_text(value)
+    if not text:
+        return "-"
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(BKK).strftime("%d/%m/%y %H:%M:%S")
+    except Exception:
+        return text
 
 
 BANK_ALIASES = {
@@ -839,6 +906,202 @@ def _gemini_response_text(obj: Any) -> str:
     return "".join(texts)
 
 
+def _usage_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except Exception:
+        return 0
+
+
+def _usage_json(value: Any) -> str:
+    if not value:
+        return ""
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)[:4000]
+    except Exception:
+        return ""
+
+
+OCR_DEFAULT_PRICING_USD_PER_1M: Dict[str, Dict[str, Any]] = {
+    # Paid standard tier, text/image/video input. Gemini docs say output price includes thinking tokens.
+    "gemini/gemini-2.5-flash": {"input": 0.30, "output": 2.50, "source": "google-gemini-standard-paid"},
+    "gemini/gemini-2.5-flash-lite": {"input": 0.10, "output": 0.40, "source": "google-gemini-standard-paid"},
+    "gemini/gemini-2.0-flash-lite": {"input": 0.075, "output": 0.30, "source": "google-gemini-standard-paid"},
+    # OpenAI published per-token pricing: $0.15/M input, $0.60/M output.
+    "openai/gpt-4o-mini": {"input": 0.15, "output": 0.60, "source": "openai-paid"},
+    "openai/gpt-4o-mini-2024-07-18": {"input": 0.15, "output": 0.60, "source": "openai-paid"},
+}
+
+_OCR_PRICING_OVERRIDE_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+
+
+def _pricing_model_key(provider: Any, model: Any) -> str:
+    provider_key = clean_text(provider).lower() or "unknown"
+    model_key = clean_text(model).lower()
+    if model_key.startswith("models/"):
+        model_key = model_key.split("/", 1)[1]
+    return f"{provider_key}/{model_key}"
+
+
+def _pricing_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return max(0.0, float(value))
+    except Exception:
+        return default
+
+
+def _pricing_overrides() -> Dict[str, Dict[str, Any]]:
+    global _OCR_PRICING_OVERRIDE_CACHE
+    if _OCR_PRICING_OVERRIDE_CACHE is not None:
+        return _OCR_PRICING_OVERRIDE_CACHE
+    out: Dict[str, Dict[str, Any]] = {}
+    if OCR_MODEL_PRICING_JSON.strip():
+        try:
+            raw = json.loads(OCR_MODEL_PRICING_JSON)
+        except Exception:
+            raw = {}
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                if isinstance(value, dict):
+                    key_text = clean_text(key).lower()
+                    if "/" not in key_text:
+                        key_text = f"unknown/{key_text}"
+                    out[key_text] = value
+    _OCR_PRICING_OVERRIDE_CACHE = out
+    return out
+
+
+def _ocr_model_pricing(provider: Any, model: Any) -> Dict[str, Any]:
+    key = _pricing_model_key(provider, model)
+    model_only = key.split("/", 1)[1]
+    entry = OCR_DEFAULT_PRICING_USD_PER_1M.get(key) or OCR_DEFAULT_PRICING_USD_PER_1M.get(f"unknown/{model_only}")
+    source = "default" if entry else "unknown"
+    override = _pricing_overrides().get(key) or _pricing_overrides().get(f"unknown/{model_only}")
+    if override:
+        merged = dict(entry or {})
+        merged.update(override)
+        entry = merged
+        source = clean_text(entry.get("source")) or "env:OCR_MODEL_PRICING_JSON"
+    if not entry:
+        return {"known": False, "key": key, "input": 0.0, "output": 0.0, "source": source}
+    return {
+        "known": True,
+        "key": key,
+        "input": _pricing_float(entry.get("input_per_1m", entry.get("input"))),
+        "output": _pricing_float(entry.get("output_per_1m", entry.get("output"))),
+        "source": clean_text(entry.get("source")) or source,
+    }
+
+
+def _billable_output_tokens(provider: Any, output_tokens: Any, thought_tokens: Any) -> int:
+    output = _usage_int(output_tokens)
+    thought = _usage_int(thought_tokens)
+    provider_key = clean_text(provider).lower()
+    if provider_key == "gemini":
+        return output + thought
+    if provider_key == "openai":
+        return output or thought
+    return output + thought
+
+
+def ocr_pricing_meta(provider: Any, model: Any, input_tokens: Any, output_tokens: Any, thought_tokens: Any = 0) -> Dict[str, Any]:
+    input_count = _usage_int(input_tokens)
+    output_count = _usage_int(output_tokens)
+    thought_count = _usage_int(thought_tokens)
+    billable_output = _billable_output_tokens(provider, output_count, thought_count)
+    pricing = _ocr_model_pricing(provider, model)
+    input_rate = _pricing_float(pricing.get("input"))
+    output_rate = _pricing_float(pricing.get("output"))
+    cost = (input_count * input_rate + billable_output * output_rate) / 1_000_000
+    return {
+        "currency": "USD",
+        "provider": clean_text(provider).lower(),
+        "model": clean_text(model),
+        "pricing_known": bool(pricing.get("known")),
+        "pricing_key": pricing.get("key", _pricing_model_key(provider, model)),
+        "pricing_source": pricing.get("source", "unknown"),
+        "input_usd_per_1m": input_rate,
+        "output_usd_per_1m": output_rate,
+        "billable_input_tokens": input_count,
+        "billable_output_tokens": billable_output,
+        "recorded_output_tokens": output_count,
+        "recorded_thought_tokens": thought_count,
+        "cost_usd": round(cost, 12),
+    }
+
+
+def ocr_usage_cost_usd(provider: Any, model: Any, input_tokens: Any, output_tokens: Any, thought_tokens: Any = 0) -> float:
+    return float(ocr_pricing_meta(provider, model, input_tokens, output_tokens, thought_tokens).get("cost_usd") or 0.0)
+
+
+def _gemini_usage_meta(obj: Dict[str, Any], thinking_budget: Optional[int]) -> Dict[str, str]:
+    usage = obj.get("usageMetadata") if isinstance(obj, dict) else {}
+    if not isinstance(usage, dict):
+        usage = {}
+    return {
+        "ocr_input_tokens": str(_usage_int(usage.get("promptTokenCount"))),
+        "ocr_output_tokens": str(_usage_int(usage.get("candidatesTokenCount"))),
+        "ocr_thought_tokens": str(_usage_int(usage.get("thoughtsTokenCount"))),
+        "ocr_total_tokens": str(_usage_int(usage.get("totalTokenCount"))),
+        "ocr_usage_json": _usage_json({"thinking_budget": thinking_budget, "usageMetadata": usage}),
+    }
+
+
+def _openai_usage_meta(obj: Dict[str, Any]) -> Dict[str, str]:
+    usage = obj.get("usage") if isinstance(obj, dict) else {}
+    if not isinstance(usage, dict):
+        usage = {}
+    details_raw = usage.get("completion_tokens_details")
+    completion_details = details_raw if isinstance(details_raw, dict) else {}
+    return {
+        "ocr_input_tokens": str(_usage_int(usage.get("prompt_tokens") or usage.get("input_tokens"))),
+        "ocr_output_tokens": str(_usage_int(usage.get("completion_tokens") or usage.get("output_tokens"))),
+        "ocr_thought_tokens": str(_usage_int(completion_details.get("reasoning_tokens"))),
+        "ocr_total_tokens": str(_usage_int(usage.get("total_tokens"))),
+        "ocr_usage_json": _usage_json({"usage": usage}),
+    }
+
+
+def _gemini_thinking_budgets_for_model(model: str) -> List[Optional[int]]:
+    """Try no-thinking first, then dynamic thinking only as a rescue path."""
+    if "2.5" not in model:
+        return [None]
+    budgets: List[Optional[int]] = [GEMINI_THINKING_BUDGET]
+    if GEMINI_THINKING_FALLBACK_ENABLED and GEMINI_THINKING_BUDGET == 0 and GEMINI_FALLBACK_THINKING_BUDGET != 0:
+        budgets.append(GEMINI_FALLBACK_THINKING_BUDGET)
+    out: List[Optional[int]] = []
+    for budget in budgets:
+        if budget not in out:
+            out.append(budget)
+    return out
+
+
+def _gemini_payload_with_thinking(payload_base: Dict[str, Any], model: str, thinking_budget: Optional[int]) -> Dict[str, Any]:
+    payload = dict(payload_base)
+    generation_config = dict(payload_base.get("generationConfig") or {})
+    if thinking_budget is not None and "2.5" in model:
+        generation_config["thinkingConfig"] = {"thinkingBudget": thinking_budget}
+    payload["generationConfig"] = generation_config
+    return payload
+
+
+def _gemini_thinking_label(thinking_budget: Optional[int]) -> str:
+    if thinking_budget is None:
+        return "default"
+    if thinking_budget == 0:
+        return "off"
+    if thinking_budget < 0:
+        return "dynamic"
+    return str(thinking_budget)
+
+
+def _gemini_fallback_needed(data: Dict[str, Any]) -> str:
+    try:
+        return unclear_reason(normalize_record(data))
+    except Exception as exc:
+        return f"normalize failed: {type(exc).__name__}"
+
+
 def gemini_extract(image_path: Path, mime: Optional[str] = None) -> Tuple[Dict[str, Any], Dict[str, str]]:
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY missing")
@@ -856,19 +1119,46 @@ def gemini_extract(image_path: Path, mime: Optional[str] = None) -> Tuple[Dict[s
         "generationConfig": {"temperature": 0, "response_mime_type": "application/json"},
     }
     last_error = ""
+    fallback_result: Optional[Tuple[Dict[str, Any], Dict[str, str]]] = None
     for model in gemini_model_candidates():
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-        for attempt in range(1, OCR_RETRY_ATTEMPTS + 1):
-            resp = requests.post(url, json=payload_base, timeout=75)
-            if resp.status_code < 400:
-                obj = resp.json()
-                text = _gemini_response_text(obj)
-                return parse_json_from_text(text), {"provider": "gemini", "model": model}
-            last_error = f"gemini {model} HTTP {resp.status_code}: {resp.text[:300]}"
-            if not is_transient_status(resp.status_code, resp.text):
-                break
-            if attempt < OCR_RETRY_ATTEMPTS:
-                time.sleep(OCR_RETRY_BASE_DELAY * attempt)
+        for thinking_budget in _gemini_thinking_budgets_for_model(model):
+            payload = _gemini_payload_with_thinking(payload_base, model, thinking_budget)
+            thinking_label = _gemini_thinking_label(thinking_budget)
+            for attempt in range(1, OCR_RETRY_ATTEMPTS + 1):
+                try:
+                    resp = requests.post(url, json=payload, timeout=75)
+                except requests.RequestException as exc:
+                    last_error = f"gemini {model} thinking={thinking_label} network: {type(exc).__name__}"
+                    if attempt < OCR_RETRY_ATTEMPTS:
+                        time.sleep(OCR_RETRY_BASE_DELAY * attempt)
+                        continue
+                    break
+                if resp.status_code < 400:
+                    try:
+                        obj = resp.json()
+                        text = _gemini_response_text(obj)
+                        parsed = parse_json_from_text(text)
+                        if not isinstance(parsed, dict):
+                            raise ValueError("OCR response JSON root is not object")
+                    except Exception as exc:
+                        last_error = f"gemini {model} thinking={thinking_label} parse: {type(exc).__name__}"
+                        break
+                    meta = {"provider": "gemini", "model": model, "thinking_budget": str(thinking_budget if thinking_budget is not None else ""), **_gemini_usage_meta(obj, thinking_budget)}
+                    reason = _gemini_fallback_needed(parsed)
+                    if reason and thinking_budget == 0 and GEMINI_THINKING_FALLBACK_ENABLED:
+                        fallback_result = (parsed, meta)
+                        last_error = f"gemini {model} thinking=off unclear: {reason}"
+                        log("Gemini OCR unclear with thinking off; retrying fallback", model, reason)
+                        break
+                    return parsed, meta
+                last_error = f"gemini {model} thinking={thinking_label} HTTP {resp.status_code}: {resp.text[:300]}"
+                if not is_transient_status(resp.status_code, resp.text):
+                    break
+                if attempt < OCR_RETRY_ATTEMPTS:
+                    time.sleep(OCR_RETRY_BASE_DELAY * attempt)
+    if fallback_result is not None:
+        return fallback_result
     raise RuntimeError(last_error or "Gemini OCR failed")
 
 
@@ -901,7 +1191,10 @@ def openai_extract(image_path: Path, mime: Optional[str] = None) -> Tuple[Dict[s
         if resp.status_code < 400:
             obj = resp.json()
             text = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
-            return parse_json_from_text(text), {"provider": "openai", "model": OPENAI_MODEL}
+            parsed = parse_json_from_text(text)
+            if not isinstance(parsed, dict):
+                raise ValueError("OCR response JSON root is not object")
+            return parsed, {"provider": "openai", "model": OPENAI_MODEL, **_openai_usage_meta(obj)}
         last_error = f"openai {OPENAI_MODEL} HTTP {resp.status_code}: {resp.text[:300]}"
         if not is_transient_status(resp.status_code, resp.text):
             break
@@ -934,6 +1227,8 @@ def ocr_extract(image_path: Path, mime: Optional[str] = None) -> Tuple[str, Dict
             normalized = normalize_record(data)
             normalized["ocr_provider"] = meta.get("provider", provider)
             normalized["ocr_model"] = meta.get("model", "")
+            for field in OCR_USAGE_FIELDS:
+                normalized[field] = meta.get(field, 0 if field != "ocr_usage_json" else "")
             normalized["raw_json"] = json.dumps(data, ensure_ascii=False)
             record_ocr_provider_success(provider, str(meta.get("model", "")))
             return provider, normalized
@@ -989,6 +1284,17 @@ class AuditslipBot:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN bot_key TEXT NOT NULL DEFAULT 'default'")
             if "company_name" not in cols:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN company_name TEXT")
+        slip_cols = self.table_columns(conn, "slips")
+        for col in ["ocr_input_tokens", "ocr_output_tokens", "ocr_thought_tokens", "ocr_total_tokens"]:
+            if col not in slip_cols:
+                conn.execute(f"ALTER TABLE slips ADD COLUMN {col} INTEGER DEFAULT 0")
+        if "ocr_usage_json" not in slip_cols:
+            conn.execute("ALTER TABLE slips ADD COLUMN ocr_usage_json TEXT")
+        if "ocr_cost_usd" not in slip_cols:
+            conn.execute("ALTER TABLE slips ADD COLUMN ocr_cost_usd REAL DEFAULT 0")
+        if "ocr_pricing_json" not in slip_cols:
+            conn.execute("ALTER TABLE slips ADD COLUMN ocr_pricing_json TEXT")
+        self.backfill_ocr_costs(conn)
         cols = self.table_columns(conn, "processed_updates")
         if "bot_key" not in cols:
             legacy = f"processed_updates_legacy_{int(time.time())}"
@@ -1004,6 +1310,31 @@ class AuditslipBot:
             conn.execute(f"INSERT OR IGNORE INTO processed_updates(bot_key, update_id, processed_at) SELECT 'default', update_id, processed_at FROM {legacy}")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_slips_bot_chat_date ON slips(bot_key, chat_id, slip_date_iso, slip_date_display)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ocr_jobs_bot_status_next ON ocr_jobs(bot_key, status, next_run_at, created_at)")
+
+    def backfill_ocr_costs(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT id, ocr_provider, ocr_model, ocr_input_tokens, ocr_output_tokens, ocr_thought_tokens
+            FROM slips
+            WHERE COALESCE(ocr_total_tokens,0) > 0
+              AND COALESCE(ocr_pricing_json,'') = ''
+            LIMIT 20000
+            """
+        ).fetchall()
+        for r in rows:
+            meta = ocr_pricing_meta(
+                r["ocr_provider"],
+                r["ocr_model"],
+                r["ocr_input_tokens"],
+                r["ocr_output_tokens"],
+                r["ocr_thought_tokens"],
+            )
+            if not meta.get("pricing_known"):
+                continue
+            conn.execute(
+                "UPDATE slips SET ocr_cost_usd=?, ocr_pricing_json=? WHERE id=?",
+                (float(meta["cost_usd"]), _usage_json(meta), r["id"]),
+            )
 
     def telegram_call(self, method: str, data: Optional[Dict[str, Any]] = None, files: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if self.dry_run:
@@ -1090,9 +1421,23 @@ class AuditslipBot:
             merged["company_name"] = self.company_name
         merged.setdefault("id", stable_id(merged.get("bot_key"), merged.get("chat_id"), merged.get("message_id"), merged.get("file_id")))
         merged.setdefault("created_at", ts)
-        merged.setdefault("created_at_iso", datetime.fromtimestamp(ts / 1000, BKK).isoformat())
+        merged.setdefault("created_at_iso", bkk_iso_from_ms(merged.get("created_at") or ts))
         merged.setdefault("status", "success")
         merged.setdefault("raw_json", json.dumps(row, ensure_ascii=False))
+        for field in ["ocr_input_tokens", "ocr_output_tokens", "ocr_thought_tokens", "ocr_total_tokens"]:
+            merged[field] = _usage_int(merged.get(field))
+        merged["ocr_usage_json"] = clean_text(merged.get("ocr_usage_json"))
+        pricing_meta = ocr_pricing_meta(
+            merged.get("ocr_provider"),
+            merged.get("ocr_model"),
+            merged.get("ocr_input_tokens"),
+            merged.get("ocr_output_tokens"),
+            merged.get("ocr_thought_tokens"),
+        )
+        merged["ocr_cost_usd"] = _pricing_float(merged.get("ocr_cost_usd"), float(pricing_meta["cost_usd"]))
+        if not merged["ocr_cost_usd"] and pricing_meta.get("pricing_known"):
+            merged["ocr_cost_usd"] = float(pricing_meta["cost_usd"])
+        merged["ocr_pricing_json"] = clean_text(merged.get("ocr_pricing_json")) or (_usage_json(pricing_meta) if pricing_meta.get("pricing_known") else "")
         if merged.get("status") == "success" and not merged.get("is_duplicate"):
             duplicate_of = self.find_duplicate(merged)
             if duplicate_of:
@@ -1114,6 +1459,8 @@ class AuditslipBot:
             "status",
             "error",
             *SLIP_FIELDS,
+            *OCR_USAGE_FIELDS,
+            *OCR_COST_FIELDS,
             "is_duplicate",
             "duplicate_of",
             "settlement_id",
@@ -1123,7 +1470,17 @@ class AuditslipBot:
         ]
         values = [merged.get(col) for col in columns]
         placeholders = ",".join("?" for _ in columns)
-        updates = ",".join(f"{col}=excluded.{col}" for col in columns if col != "id")
+        update_parts = []
+        for col in columns:
+            if col == "id":
+                continue
+            if col == "created_at":
+                update_parts.append("created_at=COALESCE(slips.created_at, excluded.created_at)")
+            elif col == "created_at_iso":
+                update_parts.append("created_at_iso=COALESCE(NULLIF(slips.created_at_iso,''), excluded.created_at_iso)")
+            else:
+                update_parts.append(f"{col}=excluded.{col}")
+        updates = ",".join(update_parts)
         with self.connect() as conn:
             conn.execute(
                 f"INSERT INTO slips({','.join(columns)}) VALUES ({placeholders}) ON CONFLICT(id) DO UPDATE SET {updates}",
@@ -1144,7 +1501,7 @@ class AuditslipBot:
             "status": "queued",
             "error": "waiting for OCR worker",
             "created_at": ts,
-            "created_at_iso": datetime.fromtimestamp(ts / 1000, BKK).isoformat(),
+            "created_at_iso": bkk_iso_from_ms(ts),
         }
         self.save_slip(queued_row)
         with self.connect() as conn:
@@ -1257,17 +1614,27 @@ class AuditslipBot:
         ts = now_ms()
         attempts = int(job["attempts"] or 0)
         max_attempts = int(job["max_attempts"] or OCR_JOB_MAX_ATTEMPTS)
-        final = attempts >= max_attempts
-        status = "failed" if final else "queued"
-        next_run_at = ts + min(300_000, 30_000 * max(1, attempts))
+        provider_circuit_wait = "circuit open" in (error or "").lower()
+        if provider_circuit_wait:
+            # Provider cooldown is not a bad slip.  Do not burn OCR attempts or
+            # create failed slip rows while both providers are temporarily gated.
+            status = "queued"
+            final = False
+            next_run_at = ts + max(60_000, min(300_000, OCR_PROVIDER_BREAKER_COOLDOWN_SECONDS * 1000))
+            update_attempts = max(0, attempts - 1)
+        else:
+            final = attempts >= max_attempts
+            status = "failed" if final else "queued"
+            next_run_at = ts + min(300_000, 30_000 * max(1, attempts))
+            update_attempts = attempts
         with self.connect() as conn:
             conn.execute(
                 """
                 UPDATE ocr_jobs
-                SET status=?, locked_by=NULL, locked_at=NULL, next_run_at=?, updated_at=?, error=?
+                SET status=?, locked_by=NULL, locked_at=NULL, attempts=?, next_run_at=?, updated_at=?, error=?
                 WHERE job_id=?
                 """,
-                (status, next_run_at if not final else ts, ts, error[:500], job["job_id"]),
+                (status, update_attempts, next_run_at if not final else ts, ts, error[:500], job["job_id"]),
             )
             conn.commit()
         if final:
@@ -1462,7 +1829,18 @@ class AuditslipBot:
     def duplicate_rows(self, chat_id: Any, limit: int = 10) -> List[sqlite3.Row]:
         with self.connect() as conn:
             return conn.execute(
-                "SELECT * FROM slips WHERE chat_id=? AND COALESCE(bot_key,'default')=? AND is_duplicate=1 ORDER BY created_at DESC LIMIT ?",
+                """
+                SELECT d.*,
+                       o.message_id AS original_message_id,
+                       o.created_at_iso AS original_created_at_iso,
+                       (SELECT MIN(j.created_at) FROM ocr_jobs j WHERE j.slip_id=d.id AND COALESCE(j.bot_key,'default')=COALESCE(d.bot_key,'default')) AS duplicate_submitted_at,
+                       (SELECT MIN(j.created_at) FROM ocr_jobs j WHERE j.slip_id=o.id AND COALESCE(j.bot_key,'default')=COALESCE(o.bot_key,'default')) AS original_submitted_at
+                FROM slips d
+                LEFT JOIN slips o ON o.id=d.duplicate_of AND COALESCE(o.bot_key,'default')=COALESCE(d.bot_key,'default')
+                WHERE d.chat_id=? AND COALESCE(d.bot_key,'default')=? AND d.is_duplicate=1
+                ORDER BY d.created_at DESC
+                LIMIT ?
+                """,
                 (str(chat_id), self.bot_key, limit),
             ).fetchall()
 
@@ -1534,6 +1912,15 @@ class AuditslipBot:
                 placeholders = ",".join("?" for _ in duplicate_ids)
                 original_rows = conn.execute(f"SELECT * FROM slips WHERE id IN ({placeholders})", duplicate_ids).fetchall()
                 original_by_id = {str(r["id"]): r for r in original_rows}
+            submitted_by_id: Dict[str, str] = {}
+            submitted_ids = [str(r["id"]) for r in rows if int(r["is_duplicate"] or 0)] + duplicate_ids
+            if submitted_ids:
+                placeholders = ",".join("?" for _ in submitted_ids)
+                job_rows = conn.execute(
+                    f"SELECT slip_id, MIN(created_at) AS submitted_at FROM ocr_jobs WHERE slip_id IN ({placeholders}) GROUP BY slip_id",
+                    submitted_ids,
+                ).fetchall()
+                submitted_by_id = {str(r["slip_id"]): bkk_iso_from_ms(r["submitted_at"]) for r in job_rows}
         for row in rows:
             if int(row["is_duplicate"] or 0):
                 continue
@@ -1556,6 +1943,8 @@ class AuditslipBot:
             "matched_reference_no",
             "sender_name",
             "matched_sender_name",
+            "duplicate_created_at_iso",
+            "matched_created_at_iso",
             "created_at_iso",
         ]
         self.write_sheet(dup_ws, dup_headers, [])
@@ -1580,6 +1969,8 @@ class AuditslipBot:
                     original["reference_no"] if original else "",
                     row["sender_name"],
                     original["sender_name"] if original else "",
+                    submitted_by_id.get(str(row["id"])) or row["created_at_iso"],
+                    submitted_by_id.get(str(row["duplicate_of"] or "")) or (original["created_at_iso"] if original else ""),
                     row["created_at_iso"],
                 ]
             )
@@ -1765,7 +2156,12 @@ class AuditslipBot:
                 SELECT COALESCE(NULLIF(ocr_provider,''), '(unknown)') AS provider,
                        COALESCE(NULLIF(ocr_model,''), '') AS model,
                        status,
-                       COUNT(*) AS count
+                       COUNT(*) AS count,
+                       COALESCE(SUM(ocr_input_tokens),0) AS input_tokens,
+                       COALESCE(SUM(ocr_output_tokens),0) AS output_tokens,
+                       COALESCE(SUM(ocr_thought_tokens),0) AS thought_tokens,
+                       COALESCE(SUM(ocr_total_tokens),0) AS total_tokens,
+                       COALESCE(SUM(ocr_cost_usd),0) AS cost_usd
                 FROM slips
                 WHERE {clause}
                 GROUP BY provider, model, status
@@ -1774,22 +2170,36 @@ class AuditslipBot:
                 [str(chat_id), *params],
             ).fetchall()
         totals: Dict[str, int] = defaultdict(int)
+        token_totals: Dict[str, int] = defaultdict(int)
+        cost_totals: Dict[str, float] = defaultdict(float)
         status_totals: Dict[str, int] = defaultdict(int)
-        lines = [f"<b>{h(APP_NAME)} API usage: {h(label)}</b>", "นับจากรายการที่บอทบันทึกไว้ ไม่ใช่ billing dashboard ของ provider"]
+        lines = [
+            f"<b>{h(APP_NAME)} API usage: {h(label)}</b>",
+            "นับจากรายการที่บอทบันทึกไว้ ไม่ใช่ billing dashboard ของ provider",
+            "ราคาโดยประมาณคำนวณจาก token จริง × ราคา model ในระบบ (USD)",
+        ]
         if not rows:
             lines.append("ยังไม่มีรายการ OCR ในช่วงนี้ค่ะ")
         for r in rows:
             provider = str(r["provider"] or "(unknown)")
             count = int(r["count"] or 0)
+            total_tokens = int(r["total_tokens"] or 0)
+            cost_usd = float(r["cost_usd"] or 0)
             totals[provider] += count
+            token_totals[provider] += total_tokens
+            cost_totals[provider] += cost_usd
             status_totals[str(r["status"])] += count
             model = f" / {r['model']}" if r["model"] else ""
-            lines.append(f"• {h(provider)}{h(model)} — {h(r['status'])}: <b>{count}</b>")
+            token_text = f" — token <b>{total_tokens:,}</b>" if total_tokens else ""
+            cost_text = f" — ราคาโดยประมาณ <b>{fmt_usd(cost_usd)}</b>" if cost_usd else ""
+            lines.append(f"• {h(provider)}{h(model)} — {h(r['status'])}: <b>{count}</b>{token_text}{cost_text}")
         if rows:
             lines.append("")
             lines.append("<b>รวมตาม provider</b>")
             for provider, count in sorted(totals.items()):
-                lines.append(f"• {h(provider)}: <b>{count}</b> calls/สลิป")
+                token_text = f" — token <b>{token_totals[provider]:,}</b>" if token_totals[provider] else ""
+                cost_text = f" — ราคาโดยประมาณ <b>{fmt_usd(cost_totals[provider])}</b>" if cost_totals[provider] else ""
+                lines.append(f"• {h(provider)}: <b>{count}</b> calls/สลิป{token_text}{cost_text}")
             lines.append("<b>รวมตามสถานะ</b>")
             for status, count in sorted(status_totals.items()):
                 lines.append(f"• {h(status)}: <b>{count}</b>")
@@ -1945,7 +2355,10 @@ class AuditslipBot:
             return "ยังไม่พบรายการซ้ำค่ะ"
         lines = ["<b>รายการซ้ำ</b>"]
         for r in rows:
+            duplicate_sent = fmt_bkk_datetime(bkk_iso_from_ms(r["duplicate_submitted_at"]) or r["created_at_iso"])
+            original_sent = fmt_bkk_datetime(bkk_iso_from_ms(r["original_submitted_at"]) or r["original_created_at_iso"])
             lines.append(f"• {h(r['slip_date_display'])} {h(r['slip_time'])} — {h(r['transferor_name'])} — {fmt_money(r['amount'])} duplicate_of <code>{h(r['duplicate_of'])}</code>")
+            lines.append(f"  ส่งเข้ามา: ต้นฉบับ {h(original_sent)} · ใบซ้ำ {h(duplicate_sent)}")
         return "\n".join(lines)
 
     def reprocess_latest(self, chat_id: Any, target_id: str = "") -> str:

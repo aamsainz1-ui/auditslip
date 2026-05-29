@@ -10,6 +10,7 @@ import warnings
 
 warnings.filterwarnings("ignore", "'cgi' is deprecated", DeprecationWarning)
 import cgi
+import csv
 import datetime as dt
 import hashlib
 import json
@@ -59,6 +60,7 @@ from auditslip_bot import (
     EXPORT_DIR,
     TELEGRAM_API,
     AuditslipBot,
+    bkk_iso_from_ms,
     fmt_money,
     h,
     normalize_date_parts,
@@ -1546,6 +1548,7 @@ def parse_backend_excel(path: Path) -> List[Dict[str, Any]]:
 
     wb = load_workbook(path, data_only=True, read_only=True)
     ws = wb.active
+    assert ws is not None
     rows = list(ws.iter_rows(values_only=True))
     if not rows:
         return []
@@ -1661,6 +1664,194 @@ def filter_backend_reconcile_rows(rows: List[Dict[str, Any]], scope: str, flow_t
         else:
             filtered.append(row)
     return kept, filtered
+
+
+def statement_flow_type_for(*values: Any) -> str:
+    text = clean_display(" ".join(clean_display(v) for v in values)).lower()
+    if not text:
+        return ""
+    if any(token in text for token in ["โอนออก", "เงินออก", "ถอน", "withdraw", "withdrawal", "debit", "จ่าย", "paid", "payment"]):
+        return "withdraw"
+    if any(token in text for token in ["รับเงินคืน", "เงินคืน", "รับเงิน", "เงินเข้า", "โอนเข้า", "ฝาก", "deposit", "credit", "refund", "received"]):
+        return "deposit"
+    return ""
+
+
+def statement_default_flow_for_headers(headers: List[str]) -> str:
+    """Infer source-level flow for statement exports that contain only one direction.
+
+    True Wallet Dashboard exports are receive-only CSV files, so rows without an
+    explicit debit/credit column should still be treated as deposit rows.
+    """
+    if (
+        detect_column(headers, ["sender_mobile", "เบอร์ผู้โอน", "ผู้โอน", "sender mobile", "sender"]) >= 0
+        and detect_column(headers, ["receiver_mobile", "เบอร์ผู้รับ", "ผู้รับ", "receiver mobile", "receiver"]) >= 0
+        and detect_column(headers, ["amount_baht", "จำนวน (บาท)", "amount", "จำนวน"]) >= 0
+    ):
+        return "deposit"
+    if detect_column(headers, ["received_time", "received time"]) >= 0 and detect_column(headers, ["amount_baht"]) >= 0:
+        return "deposit"
+    return ""
+
+
+def parse_statement_rows(rows: List[Any], source_name: str) -> List[Dict[str, Any]]:
+    """Parse statement-like rows from XLSX/CSV into amount/time/date reconciliation rows."""
+    if not rows:
+        return []
+    header_idx = 0
+    for i, row in enumerate(rows[:10]):
+        texts = [clean_display(c) for c in row]
+        if any(t for t in texts) and (
+            detect_column(texts, ["โอนออก", "เงินออก", "debit", "withdraw", "ถอน"]) >= 0
+            or detect_column(texts, ["รับเงินคืน", "เงินเข้า", "credit", "deposit", "ฝาก"]) >= 0
+            or detect_column(texts, ["amount", "amount_baht", "ยอด", "จำนวน", "จำนวนเงิน", "เงิน", "total"]) >= 0
+        ):
+            header_idx = i
+            break
+    headers = [clean_display(c) for c in rows[header_idx]]
+    date_i = detect_column(headers, ["date", "วันที่", "วันเวลา", "วันที่เวลา", "วันที่/เวลา", "วันทำรายการ", "transaction date", "created at", "received_time", "received time"])
+    time_i = detect_column(headers, ["time", "เวลา", "transaction time", "เวลาทำรายการ", "received_time", "received time"])
+    desc_i = detect_column(headers, ["รายการ", "รายละเอียด", "description", "memo", "message", "note", "หมายเหตุ", "ประเภท", "type", "transaction type"])
+    debit_i = detect_column(headers, ["โอนออก", "เงินออก", "ยอดถอน", "ถอน", "debit", "withdraw", "withdrawal", "paid out", "payment"])
+    credit_i = detect_column(headers, ["รับเงินคืน", "เงินเข้า", "ยอดฝาก", "ฝาก", "credit", "deposit", "received", "refund"])
+    amount_i = detect_column(headers, ["amount_baht", "amount", "ยอด", "ยอดเงิน", "จำนวน", "จำนวนเงิน", "เงิน", "total"])
+    ref_i = detect_column(headers, ["ref", "reference", "เลขอ้างอิง", "รหัสรายการ", "transaction id", "transaction_id", "เลขที่รายการ"])
+    sender_i = detect_column(headers, ["sender_mobile", "เบอร์ผู้โอน", "ผู้โอน", "sender mobile", "sender"])
+    receiver_i = detect_column(headers, ["receiver_mobile", "เบอร์ผู้รับ", "ผู้รับ", "receiver mobile", "receiver"])
+    default_flow = statement_default_flow_for_headers(headers)
+    if amount_i < 0 and debit_i < 0 and credit_i < 0:
+        raise ValueError("ไม่พบคอลัมน์ยอดเงินในรายการเดินบัญชี")
+    parsed: List[Dict[str, Any]] = []
+    for row_no, row in enumerate(rows[header_idx + 1 :], start=header_idx + 2):
+        values = list(row)
+        date_raw = values[date_i] if 0 <= date_i < len(values) else ""
+        time_raw = values[time_i] if 0 <= time_i < len(values) else ""
+        desc = clean_display(values[desc_i]) if 0 <= desc_i < len(values) else ""
+        reference = clean_display(values[ref_i]) if 0 <= ref_i < len(values) else ""
+        sender = clean_display(values[sender_i]) if 0 <= sender_i < len(values) else ""
+        receiver = clean_display(values[receiver_i]) if 0 <= receiver_i < len(values) else ""
+        debit = abs(parse_number(values[debit_i] if 0 <= debit_i < len(values) else 0))
+        credit = abs(parse_number(values[credit_i] if 0 <= credit_i < len(values) else 0))
+        raw_amount = parse_number(values[amount_i] if 0 <= amount_i < len(values) else 0)
+        flow = ""
+        amount = 0.0
+        if debit:
+            flow = "withdraw"
+            amount = debit
+        elif credit:
+            flow = "deposit"
+            amount = credit
+        elif raw_amount:
+            flow = statement_flow_type_for(desc)
+            if not flow and raw_amount < 0:
+                flow = "withdraw"
+            if not flow and raw_amount > 0:
+                flow = default_flow
+            amount = abs(raw_amount)
+        if not amount:
+            continue
+        if not flow:
+            flow = statement_flow_type_for(desc, headers[amount_i] if 0 <= amount_i < len(headers) else "") or default_flow
+        date_label, date_iso = normalize_date_parts(date_raw)
+        parsed.append(
+            {
+                "row": row_no,
+                "date": date_label or clean_display(date_raw),
+                "date_key": date_iso or normalize_match_date(date_raw),
+                "time": extract_time_text(time_raw, date_raw),
+                "description": desc,
+                "flow_type": flow,
+                "flow_label": flow_label(flow) if flow else "",
+                "amount": float(amount),
+                "reference": reference,
+                "reference_key": normalize_match_text(reference),
+                "sender": sender,
+                "receiver": receiver,
+                "source": source_name,
+            }
+        )
+    return parsed
+
+
+def parse_statement_excel(path: Path) -> List[Dict[str, Any]]:
+    """Parse bank statement XLSX rows. Direction mapping: โอนออก=withdraw, รับเงินคืน/เงินเข้า=deposit."""
+    from openpyxl import load_workbook
+
+    wb = load_workbook(path, data_only=True, read_only=True)
+    ws = wb.active
+    assert ws is not None
+    return parse_statement_rows(list(ws.iter_rows(values_only=True)), Path(path).name)
+
+
+def parse_statement_csv(path: Path) -> List[Dict[str, Any]]:
+    """Parse statement CSV rows, including True Wallet Dashboard receive-history exports."""
+    last_exc: Exception | None = None
+    text = ""
+    for encoding in ("utf-8-sig", "utf-8", "cp874"):
+        try:
+            text = Path(path).read_text(encoding=encoding)
+            break
+        except UnicodeDecodeError as exc:
+            last_exc = exc
+    if not text and last_exc:
+        raise last_exc
+    sample = text[:4096]
+    try:
+        dialect = csv.Sniffer().sniff(sample)
+    except csv.Error:
+        dialect = csv.excel
+    return parse_statement_rows(list(csv.reader(text.splitlines(), dialect)), Path(path).name)
+
+
+def parse_statement_file(path: Path) -> List[Dict[str, Any]]:
+    suffix = Path(path).suffix.lower()
+    if suffix == ".csv":
+        return parse_statement_csv(path)
+    return parse_statement_excel(path)
+
+
+def statement_flow_matches(row: Dict[str, Any], flow_type: str) -> bool:
+    flow = normalize_flow_type(flow_type)
+    row_flow = clean_display(row.get("flow_type"))
+    if flow in {"deposit", "withdraw"}:
+        return row_flow == flow
+    if flow == "other":
+        return row_flow == "other"
+    return row_flow in {"deposit", "withdraw", ""}
+
+
+def filter_statement_reconcile_rows(rows: List[Dict[str, Any]], scope: str, flow_type: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    kept: List[Dict[str, Any]] = []
+    filtered: List[Dict[str, Any]] = []
+    for row in rows:
+        if backend_date_matches_scope(row, scope) and statement_flow_matches(row, flow_type):
+            kept.append(row)
+        else:
+            filtered.append(row)
+    return kept, filtered
+
+
+def amount_time_date_match(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+    if abs(float(left.get("amount") or 0) - float(right.get("amount") or 0)) > 0.009:
+        return False
+    left_date = normalize_match_date(left.get("date_key") or left.get("date"))
+    right_date = normalize_match_date(right.get("date_key") or right.get("date"))
+    if left_date and right_date and left_date != right_date:
+        return False
+    left_time = clean_display(left.get("time"))
+    right_time = clean_display(right.get("time"))
+    if left_time and right_time and left_time != right_time:
+        return False
+    return True
+
+
+def find_amount_time_match(target: Dict[str, Any], rows: List[Dict[str, Any]], used: set[int]) -> int:
+    for idx, row in enumerate(rows):
+        if idx in used:
+            continue
+        if amount_time_date_match(target, row):
+            return idx
+    return -1
 
 
 def reconcile_daily_summary(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1790,6 +1981,72 @@ def reconcile_backend_excel(db_path: Path, excel_path: Path, chat_id: str = "", 
         "extra": {"count": len(extra), "amount": sum(float(r["amount"] or 0) for r in extra)},
         "daily": {"backend": reconcile_daily_summary(backend_rows), "slips": reconcile_daily_summary(slip_rows)},
         "diff_amount": backend_amount - slip_amount,
+    }
+
+
+def reconcile_backend_slips_statement(db_path: Path, excel_path: Path, statement_path: Path, chat_id: str = "", scope: str = "all", bot_key: str = "", flow_type: str = "all") -> Dict[str, Any]:
+    """Compare three sources by amount/time/date: backend Excel, OCR slips, and bank statement."""
+    all_backend_rows = parse_backend_excel(excel_path)
+    all_statement_rows = parse_statement_file(statement_path)
+    flow = normalize_flow_type(flow_type)
+    bot = clean_display(bot_key)
+    backend_rows, backend_filtered_out = filter_backend_reconcile_rows(all_backend_rows, scope, flow)
+    statement_rows, statement_filtered_out = filter_statement_reconcile_rows(all_statement_rows, scope, flow)
+    with connect(db_path) as conn:
+        slip_rows = slip_reconcile_rows(conn, chat_id=chat_id, scope=scope, bot_key=bot, flow_type=flow)
+
+    used_slips: set[int] = set()
+    used_statements: set[int] = set()
+    matched: List[Dict[str, Any]] = []
+    backend_slip_matched: List[Dict[str, Any]] = []
+    backend_statement_matched: List[Dict[str, Any]] = []
+    backend_missing_slip: List[Dict[str, Any]] = []
+    backend_missing_statement: List[Dict[str, Any]] = []
+
+    for backend in backend_rows:
+        slip_idx = find_amount_time_match(backend, slip_rows, used_slips)
+        statement_idx = find_amount_time_match(backend, statement_rows, used_statements)
+        slip = slip_rows[slip_idx] if slip_idx >= 0 else None
+        statement = statement_rows[statement_idx] if statement_idx >= 0 else None
+        if slip_idx >= 0:
+            used_slips.add(slip_idx)
+            backend_slip_matched.append({"backend": backend, "slip": slip})
+        else:
+            backend_missing_slip.append(backend)
+        if statement_idx >= 0:
+            used_statements.add(statement_idx)
+            backend_statement_matched.append({"backend": backend, "statement": statement})
+        else:
+            backend_missing_statement.append(backend)
+        if slip is not None and statement is not None:
+            matched.append({"backend": backend, "slip": slip, "statement": statement})
+
+    slip_extra = [slip for idx, slip in enumerate(slip_rows) if idx not in used_slips]
+    statement_extra = [row for idx, row in enumerate(statement_rows) if idx not in used_statements]
+    backend_amount = sum(float(r["amount"] or 0) for r in backend_rows)
+    slip_amount = sum(float(r["amount"] or 0) for r in slip_rows)
+    statement_amount = sum(float(r["amount"] or 0) for r in statement_rows)
+    matched_amount = sum(float(m["backend"]["amount"] or 0) for m in matched)
+    return {
+        "ok": True,
+        "mode": "backend_slips_statement",
+        "excel_path": str(excel_path),
+        "statement_path": str(statement_path),
+        "scope": {"chat_id": clean_display(chat_id), "bot_key": bot or "__all__", "flow_type": flow, "flow_label": flow_label(flow), "date_scope": clean_display(scope)},
+        "backend": {"count": len(backend_rows), "amount": backend_amount},
+        "backend_filtered_out": {"count": len(backend_filtered_out), "amount": sum(float(r["amount"] or 0) for r in backend_filtered_out)},
+        "slips": {"count": len(slip_rows), "amount": slip_amount},
+        "statement": {"count": len(statement_rows), "amount": statement_amount},
+        "statement_filtered_out": {"count": len(statement_filtered_out), "amount": sum(float(r["amount"] or 0) for r in statement_filtered_out)},
+        "matched": {"count": len(matched), "amount": matched_amount, "rows": matched[:100]},
+        "backend_slip_matched": {"count": len(backend_slip_matched), "amount": sum(float(m["backend"]["amount"] or 0) for m in backend_slip_matched)},
+        "backend_statement_matched": {"count": len(backend_statement_matched), "amount": sum(float(m["backend"]["amount"] or 0) for m in backend_statement_matched)},
+        "backend_missing_slip": {"count": len(backend_missing_slip), "amount": sum(float(r["amount"] or 0) for r in backend_missing_slip), "rows": backend_missing_slip[:100]},
+        "backend_missing_statement": {"count": len(backend_missing_statement), "amount": sum(float(r["amount"] or 0) for r in backend_missing_statement), "rows": backend_missing_statement[:100]},
+        "slip_extra": {"count": len(slip_extra), "amount": sum(float(r["amount"] or 0) for r in slip_extra), "rows": slip_extra[:100]},
+        "statement_extra": {"count": len(statement_extra), "amount": sum(float(r["amount"] or 0) for r in statement_extra), "rows": statement_extra[:100]},
+        "daily": {"backend": reconcile_daily_summary(backend_rows), "slips": reconcile_daily_summary(slip_rows), "statement": reconcile_daily_summary(statement_rows)},
+        "diff_amounts": {"backend_minus_slips": backend_amount - slip_amount, "backend_minus_statement": backend_amount - statement_amount, "slips_minus_statement": slip_amount - statement_amount},
     }
 
 
@@ -2225,6 +2482,7 @@ def duplicate_pair_rows(conn: sqlite3.Connection, chat_id: str, scope: str = "op
                d.seq AS seq,
                d.aid AS aid,
                d.created_at_iso AS duplicate_created_at_iso,
+               (SELECT MIN(j.created_at) FROM ocr_jobs j WHERE j.slip_id=d.id AND COALESCE(j.bot_key,'default')=COALESCE(d.bot_key,'default')) AS duplicate_submitted_at,
                d.duplicate_of AS original_id,
                d.slip_date_display AS slip_date_display,
                d.slip_date_iso AS slip_date_iso,
@@ -2246,6 +2504,7 @@ def duplicate_pair_rows(conn: sqlite3.Connection, chat_id: str, scope: str = "op
                o.seq AS original_seq,
                o.aid AS original_aid,
                o.created_at_iso AS original_created_at_iso,
+               (SELECT MIN(j.created_at) FROM ocr_jobs j WHERE j.slip_id=o.id AND COALESCE(j.bot_key,'default')=COALESCE(o.bot_key,'default')) AS original_submitted_at,
                o.slip_date_display AS original_slip_date_display,
                o.slip_date_iso AS original_slip_date_iso,
                o.slip_time AS original_slip_time,
@@ -2275,6 +2534,8 @@ def duplicate_pair_rows(conn: sqlite3.Connection, chat_id: str, scope: str = "op
         row["original_flow_type"] = flow_type_for_title(row.get("original_chat_title"), orig_bot, row.get("original_chat_id"))
         row["duplicate_flow_label"] = flow_label(row["duplicate_flow_type"])
         row["original_flow_label"] = flow_label(row["original_flow_type"])
+        row["duplicate_submitted_at_iso"] = bkk_iso_from_ms(row.get("duplicate_submitted_at")) or clean_display(row.get("duplicate_created_at_iso"))
+        row["original_submitted_at_iso"] = bkk_iso_from_ms(row.get("original_submitted_at")) or clean_display(row.get("original_created_at_iso"))
         row["from_bank"] = display_bank(row.get("from_bank"))
         row["to_bank"] = display_bank(row.get("to_bank"))
         row["issuer_bank"] = display_bank(row.get("issuer_bank"))
@@ -4138,7 +4399,12 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
             SELECT COALESCE(NULLIF(ocr_provider,''), '(pending)') AS provider,
                    COALESCE(NULLIF(ocr_model,''), '') AS model,
                    status,
-                   COUNT(*) AS count
+                   COUNT(*) AS count,
+                   COALESCE(SUM(ocr_input_tokens),0) AS input_tokens,
+                   COALESCE(SUM(ocr_output_tokens),0) AS output_tokens,
+                   COALESCE(SUM(ocr_thought_tokens),0) AS thought_tokens,
+                   COALESCE(SUM(ocr_total_tokens),0) AS total_tokens,
+                   COALESCE(SUM(ocr_cost_usd),0) AS cost_usd
             FROM slips
             {status_where}
             GROUP BY provider, model, status
@@ -4352,6 +4618,33 @@ def safe_backend_excel_path(path_text: str = "") -> Path:
     return files[0]
 
 
+def safe_statement_file_path(path_text: str = "") -> Path:
+    base = Path(os.environ.get("AUDITSLIP_BACKEND_IMPORT_DIR", "/root/projects/auditslip/imports/backend"))
+    base.mkdir(parents=True, exist_ok=True)
+    base_resolved = base.resolve()
+    allowed = {".xlsx", ".xlsm", ".csv"}
+    if path_text:
+        path = Path(path_text).expanduser()
+        if not path.is_absolute():
+            path = base / path
+        resolved = path.resolve()
+        try:
+            resolved.relative_to(base_resolved)
+        except ValueError:
+            raise PermissionError("statement path outside backend import dir")
+        if resolved.suffix.lower() not in allowed:
+            raise PermissionError("statement path must be .xlsx, .xlsm, or .csv")
+        return resolved
+    files = sorted(
+        [p for suffix in allowed for p in base.glob(f"*{suffix}") if p.is_file()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not files:
+        raise FileNotFoundError(f"ไม่พบไฟล์ statement .xlsx/.xlsm/.csv ใน {base}")
+    return files[0]
+
+
 DASHBOARD_EXPORT_HEADERS = [
     "company_name",
     "chat_title",
@@ -4402,6 +4695,8 @@ DASHBOARD_DUPLICATE_HEADERS = [
     "matched_reference_no",
     "sender_name",
     "matched_sender_name",
+    "duplicate_created_at_iso",
+    "matched_created_at_iso",
     "created_at_iso",
 ]
 
@@ -4630,6 +4925,15 @@ def duplicate_export_rows(conn: sqlite3.Connection, rows: List[sqlite3.Row]) -> 
         placeholders = ",".join("?" for _ in original_ids)
         originals = conn.execute(f"SELECT * FROM slips WHERE id IN ({placeholders})", original_ids).fetchall()
         original_by_id = {str(row["id"]): row for row in originals}
+    submitted_by_id: Dict[str, str] = {}
+    submitted_ids = [str(row["id"]) for row in duplicate_rows] + original_ids
+    if submitted_ids:
+        placeholders = ",".join("?" for _ in submitted_ids)
+        submitted_rows = conn.execute(
+            f"SELECT slip_id, MIN(created_at) AS submitted_at FROM ocr_jobs WHERE slip_id IN ({placeholders}) GROUP BY slip_id",
+            submitted_ids,
+        ).fetchall()
+        submitted_by_id = {str(row["slip_id"]): bkk_iso_from_ms(row["submitted_at"]) for row in submitted_rows}
     out = []
     for row in duplicate_rows:
         original = original_by_id.get(str(row["duplicate_of"] or ""))
@@ -4648,6 +4952,8 @@ def duplicate_export_rows(conn: sqlite3.Connection, rows: List[sqlite3.Row]) -> 
             original["reference_no"] if original else "",
             row["sender_name"],
             original["sender_name"] if original else "",
+            submitted_by_id.get(str(row["id"])) or row["created_at_iso"],
+            submitted_by_id.get(str(row["duplicate_of"] or "")) or (original["created_at_iso"] if original else ""),
             row["created_at_iso"],
         ])
     return out
@@ -5334,6 +5640,7 @@ def render_dashboard_html(token: str = "") -> str:
     </section>
     <section id="section-reconcile" class="sections menu-section" hidden>
       <div class="card"><h3>เทียบ Excel หลังบ้าน</h3><div class="mini">ขั้นตอน: เลือกบริษัท → เลือกยอดฝาก/ถอน → เลือกวันที่เทียบ → อัปโหลด Excel ของบริษัทนั้น ระบบจะเทียบเฉพาะ scope ที่เลือก ไม่ปนบริษัทอื่น</div><div class="reconcile-controls"><label class="reconcile-step"><span>1 เลือกบริษัทก่อน</span><select id="reconcileCompanyFilter" title="เลือกบริษัทสำหรับเทียบหลังบ้าน"></select></label><label class="reconcile-step"><span>2 เลือกยอดฝาก/ถอน</span><select id="reconcileFlowFilter" title="เลือกยอดฝากหรือถอนสำหรับไฟล์หลังบ้าน"><option value="">เลือกยอดฝาก/ถอน</option><option value="withdraw">ยอดถอน</option><option value="deposit">ยอดฝาก/เติมมือ</option></select></label><label class="reconcile-step"><span>3 เลือกวันที่เทียบ</span><input id="reconcileDateScope" type="date" title="เลือกวันที่ของไฟล์หลังบ้าน ถ้าเว้นว่างจะใช้ช่วงวันที่หลักของ dashboard" /></label><label class="reconcile-step reconcile-upload"><span>4 อัปโหลด Excel ของบริษัทนี้</span><input id="backendExcelFile" type="file" accept=".xlsx,.xlsm" /></label><label class="reconcile-step reconcile-upload" data-admin-only="true"><span>หรือ path ไฟล์บน server</span><input id="backendExcel" placeholder="path หรือเว้นว่างเพื่อใช้ไฟล์ล่าสุด" /></label><div id="reconcileScopePreview" class="reconcile-preview">ไฟล์นี้จะถูกเทียบเฉพาะบริษัทและฝาก/ถอนที่เลือก และวันที่เลือก</div><div class="reconcile-actions"><button onclick="runReconcile()">เทียบยอดตามบริษัท/ฝากถอน/วันที่เลือก</button></div></div><div id="reconcile"></div></div>
+      <div class="card"><h3>เทียบ 3 ฝั่ง: หลังบ้าน + สลิป + รายการเดินบัญชี</h3><div class="mini">ใช้เมื่อไฟล์หลังบ้านและสลิปมีแค่ยอด/เวลา แล้วอัปโหลดรายการเดินบัญชีมาเป็นตัวกลาง เทียบด้วยยอด+เวลา+วันที่ใน scope เดียวกัน · รองรับ Excel และ CSV จาก True Wallet Dashboard · รายการเดินบัญชี: โอนออก=ถอน, รับเงินคืน/เงินเข้า=ฝาก</div><div class="reconcile-controls"><label class="reconcile-step reconcile-upload"><span>รายการเดินบัญชี Excel/CSV</span><input id="statementExcelFile" type="file" accept=".xlsx,.xlsm,.csv" /></label><label class="reconcile-step reconcile-upload" data-admin-only="true"><span>หรือ path รายการเดินบัญชีบน server</span><input id="statementExcel" placeholder="statement_path หรือไฟล์รายการเดินบัญชี" /></label><div class="reconcile-actions"><button onclick="runStatementReconcile()">เทียบ 3 ฝั่งตามบริษัท/ฝากถอน/วันที่เลือก</button></div></div><div id="statementReconcile"></div></div>
       <div class="card"><h3>สถานะข้อมูล</h3><div class="muted">ยอดรวมทุกแผงนับเฉพาะ success ที่ไม่ซ้ำ ยกเว้นการ์ดสลิปซ้ำที่แสดงเพื่อเช็กซ้ำโดยเฉพาะ</div></div>
     </section>
     <section id="section-duplicates" class="sections menu-section" hidden>
@@ -5602,6 +5909,13 @@ function toggleAdminMode() {{
   applyAdminMode();
 }}
 function money(n) {{ return Number(n || 0).toLocaleString('th-TH', {{minimumFractionDigits:2, maximumFractionDigits:2}}); }}
+function formatIsoTime(value) {{
+  const raw = String(value ?? '').trim();
+  if (!raw) return '-';
+  const d = new Date(raw);
+  if (!Number.isNaN(d.getTime())) return d.toLocaleString('th-TH', {{year:'2-digit', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false}});
+  return raw;
+}}
 function limitMoney(n) {{ return Number(n || 0) > 0 ? money(n) : '-'; }}
 function nameWithCompany(r) {{
   const name = r.name || r.display_name || '-';
@@ -5961,11 +6275,14 @@ function renderDuplicatePairs(rows) {{
     const originalBanks = [r.original_from_bank, r.original_to_bank].filter(Boolean).join(' → ') || r.original_issuer_bank || banks || '-';
     const ref = r.reference_no || r.seq || r.aid || '-';
     const originalRef = r.original_reference_no || r.original_seq || r.original_aid || '-';
+    const duplicateSubmitted = formatIsoTime(r.duplicate_submitted_at_iso || r.duplicate_created_at_iso);
+    const originalSubmitted = formatIsoTime(r.original_submitted_at_iso || r.original_created_at_iso);
     return '<div class="slip-card dupe-card">'
       + '<div class="dupe-thumbs">'+dupImg+origImg+'</div>'
       + '<div class="slip-body"><div class="top"><b>สลิปซ้ำ</b><span class="pill">ซ้ำกับใบต้นฉบับ</span></div>'
       + duplicateContextLine('ใบซ้ำ', r.duplicate_company_name, r.duplicate_bot_key, r.duplicate_chat_title, r.duplicate_flow_label || flowName(r.duplicate_flow_type))
       + duplicateContextLine('ต้นฉบับ', r.original_company_name, r.original_bot_key, r.original_chat_title, r.original_flow_label || flowName(r.original_flow_type))
+      + '<div class="mini dupe-submitted"><b>เวลาส่งเข้ามา</b>: ต้นฉบับ '+esc(originalSubmitted)+' · ใบซ้ำ '+esc(duplicateSubmitted)+'</div>'
       + '<div><b>ข้อมูลใบซ้ำ</b>: '+esc((r.slip_date_display || r.slip_date_iso || '')+' '+(r.slip_time || ''))+' · '+esc(r.transferor_name || '(ไม่ทราบผู้โอน)')+' → '+esc(r.recipient_name || '-')+'</div>'
       + '<div class="mini">'+esc(banks)+' · ref '+esc(ref)+' · msg '+esc(r.duplicate_message_id || '-')+'</div>'
       + '<div><b>ข้อมูลต้นฉบับ</b>: '+esc((r.original_slip_date_display || r.original_slip_date_iso || '')+' '+(r.original_slip_time || ''))+' · '+esc(r.original_transferor_name || r.transferor_name || '(ไม่ทราบผู้โอน)')+' → '+esc(r.original_recipient_name || r.recipient_name || '-')+'</div>'
@@ -6169,6 +6486,24 @@ function reconcileSummary(data) {{
   const daily = table(dailyRows, [['แหล่ง','source'], ['วันที่','date'], ['รายการ','count'], ['ยอด', r => money(r.amount)]]);
   return cards + '<h4>สรุปรายวัน</h4>' + daily + '<h4>รายการที่ตรงกัน</h4>' + matched + '<h4>หลังบ้านมี แต่ไม่พบในสลิป</h4>' + missing + '<h4>สลิปมี แต่ไม่พบในหลังบ้าน</h4>' + extra;
 }}
+function statementReconcileSummary(data) {{
+  if (!data) return '<div class="muted">ยังไม่ได้เทียบ 3 ฝั่ง</div>';
+  if (!data.ok) return '<div class="bad">'+esc(data.error || 'statement reconcile failed')+'</div>';
+  const complete = (data.backend_missing_slip.count||0) === 0 && (data.backend_missing_statement.count||0) === 0 && (data.slip_extra.count||0) === 0 && (data.statement_extra.count||0) === 0;
+  const verdict = complete ? 'ผลเทียบ 3 ฝั่ง: ครบ' : 'ผลเทียบ 3 ฝั่ง: ไม่ครบ';
+  const scope = data.scope || {{}};
+  const diff = data.diff_amounts || {{}};
+  const cards = '<div class="'+(complete?'good':'warn')+'"><b>'+verdict+'</b></div>'
+    + '<div class="mini">บริษัท/Bot: '+esc(scope.bot_key || '__all__')+' · กลุ่ม: '+esc(scope.flow_label || scope.flow_type || '-')+' · ช่วง: '+esc(scope.date_scope || '-')+'</div>'
+    + '<div class="muted">หลังบ้าน '+(data.backend.count||0)+' รายการ · '+money(data.backend.amount)+' | สลิป '+(data.slips.count||0)+' รายการ · '+money(data.slips.amount)+' | เดินบัญชี '+(data.statement.count||0)+' รายการ · '+money(data.statement.amount)+' | match 3 ฝั่ง '+(data.matched.count||0)+' | diff หลังบ้าน-สลิป '+money(diff.backend_minus_slips||0)+' | diff หลังบ้าน-เดินบัญชี '+money(diff.backend_minus_statement||0)+'</div>';
+  const matchedRows = (data.matched.rows || []).map(m => ({{...m.backend, status:'ตรง 3 ฝั่ง', slip_time:(m.slip||{{}}).time || '', statement_time:(m.statement||{{}}).time || '', statement_desc:(m.statement||{{}}).description || ''}}));
+  const matched = table(matchedRows, [['สถานะ','status'], ['วันที่','date'], ['เวลาหลังบ้าน','time'], ['เวลาสลิป','slip_time'], ['เวลาเดินบัญชี','statement_time'], ['รายการเดินบัญชี','statement_desc'], ['ยอด', r => money(r.amount)]]);
+  const missingSlip = table((data.backend_missing_slip || {{}}).rows || [], [['สถานะ', r => 'หลังบ้านมี แต่ไม่พบในสลิป'], ['วันที่','date'], ['เวลา','time'], ['ยอด', r => money(r.amount)], ['แหล่ง','source']]);
+  const missingStatement = table((data.backend_missing_statement || {{}}).rows || [], [['สถานะ', r => 'หลังบ้านมี แต่ไม่พบในเดินบัญชี'], ['วันที่','date'], ['เวลา','time'], ['ยอด', r => money(r.amount)], ['แหล่ง','source']]);
+  const slipExtra = table((data.slip_extra || {{}}).rows || [], [['สถานะ', r => 'สลิปมี แต่ไม่พบในหลังบ้าน'], ['วันที่','date'], ['เวลา','time'], ['ยอด', r => money(r.amount)], ['แหล่ง','source']]);
+  const statementExtra = table((data.statement_extra || {{}}).rows || [], [['สถานะ', r => 'เดินบัญชีมี แต่ไม่พบในหลังบ้าน'], ['วันที่','date'], ['เวลา','time'], ['รายการ','description'], ['ยอด', r => money(r.amount)], ['flow','flow_label']]);
+  return cards + '<h4>ตรง 3 ฝั่ง</h4>' + matched + '<h4>หลังบ้านมี แต่ไม่พบในสลิป</h4>' + missingSlip + '<h4>หลังบ้านมี แต่ไม่พบในรายการเดินบัญชี</h4>' + missingStatement + '<h4>สลิปเกินจากหลังบ้าน</h4>' + slipExtra + '<h4>รายการเดินบัญชีเกินจากหลังบ้าน</h4>' + statementExtra;
+}}
 function reconcileScopeValue() {{
   const dateEl = document.getElementById('reconcileDateScope');
   if (dateEl && dateEl.value) return dateEl.value;
@@ -6231,6 +6566,59 @@ async function runReconcile() {{
   }}
   const data = await res.json();
   box.innerHTML = reconcileSummary(data);
+  enhanceResponsiveTables(box);
+}}
+async function runStatementReconcile() {{
+  const bot = document.getElementById('reconcileCompanyFilter').value || '__all__';
+  const flow = document.getElementById('reconcileFlowFilter').value || '';
+  const scope = reconcileScopeValue();
+  const excel_path = document.getElementById('backendExcel').value || '';
+  const file = document.getElementById('backendExcelFile').files[0];
+  const statement_path = document.getElementById('statementExcel').value || '';
+  const statementFile = document.getElementById('statementExcelFile').files[0];
+  const box = document.getElementById('statementReconcile');
+  if (bot === '__all__' || !bot) {{
+    const msg = 'เลือกบริษัทก่อนเทียบ 3 ฝั่ง';
+    box.innerHTML = '<div class="bad">'+esc(msg)+'</div>';
+    await dashboardNotify(msg);
+    return;
+  }}
+  if (flow !== 'deposit' && flow !== 'withdraw') {{
+    const msg = 'เลือกยอดฝาก/ถอนก่อนเทียบ 3 ฝั่ง';
+    box.innerHTML = '<div class="bad">'+esc(msg)+'</div>';
+    await dashboardNotify(msg);
+    return;
+  }}
+  if (!file && !excel_path) {{
+    const msg = 'อัปโหลด Excel หลังบ้าน หรือใส่ path ไฟล์หลังบ้านก่อน';
+    box.innerHTML = '<div class="bad">'+esc(msg)+'</div>';
+    await dashboardNotify(msg);
+    return;
+  }}
+  if (!statementFile && !statement_path) {{
+    const msg = 'อัปโหลดรายการเดินบัญชี หรือใส่ statement_path ก่อน';
+    box.innerHTML = '<div class="bad">'+esc(msg)+'</div>';
+    await dashboardNotify(msg);
+    return;
+  }}
+  box.innerHTML = '<div class="muted">กำลังเทียบ 3 ฝั่งด้วยยอด/เวลา...</div>';
+  let res;
+  if (file || statementFile) {{
+    const form = new FormData();
+    form.append('chat_id', '');
+    form.append('bot_key', bot);
+    form.append('flow_type', flow);
+    form.append('scope', scope);
+    if (excel_path) form.append('excel_path', excel_path);
+    if (statement_path) form.append('statement_path', statement_path);
+    if (file) form.append('excel', file);
+    if (statementFile) form.append('statement', statementFile);
+    res = await fetch('/api/reconcile/statement'+query(), {{method:'POST', headers:ACTION_HEADER, body: form}});
+  }} else {{
+    res = await fetch('/api/reconcile/statement'+query(), {{method:'POST', headers:postHeaders(), body: JSON.stringify({{chat_id:'', bot_key:bot, flow_type:flow, scope, excel_path, statement_path}})}});
+  }}
+  const data = await res.json();
+  box.innerHTML = statementReconcileSummary(data);
   enhanceResponsiveTables(box);
 }}
 function showToast(msg, type='info') {{
@@ -6515,9 +6903,11 @@ async function load(options={{}}) {{
     exportCompanyEl.value = selectedBot || '__all__';
   }}
   const reconcileCompanyFilter = document.getElementById('reconcileCompanyFilter');
+  const previousReconcileBot = reconcileCompanyFilter ? (reconcileCompanyFilter.value || '') : '';
   if (reconcileCompanyFilter) {{
     reconcileCompanyFilter.innerHTML = companyOptions;
-    reconcileCompanyFilter.value = selectedBot && selectedBot !== '__all__' ? selectedBot : (reconcileCompanyFilter.value || '__all__');
+    const hasPreviousReconcileBot = previousReconcileBot && Array.from(reconcileCompanyFilter.options || []).some(opt => opt.value === previousReconcileBot);
+    reconcileCompanyFilter.value = hasPreviousReconcileBot ? previousReconcileBot : (selectedBot && selectedBot !== '__all__' ? selectedBot : '__all__');
   }}
   flowEl.value = data.flow_type || currentFlow || 'all';
   const activeFlow = flowEl.value || 'all';
@@ -6637,7 +7027,7 @@ async function load(options={{}}) {{
     document.getElementById('sourceBankReview').innerHTML = sourceBankReviewCards(data.source_bank_review);
     document.getElementById('recent').innerHTML = recentCards(data.recent);
     document.getElementById('issues').innerHTML = renderQueueIssues(data.jobs_recent || [], data.issues || []);
-    document.getElementById('usage').innerHTML = table(data.provider_usage, [['provider','provider'], ['model','model'], ['status','status'], ['count','count']]);
+    document.getElementById('usage').innerHTML = table(data.provider_usage, [['provider','provider'], ['model','model'], ['status','status'], ['calls','count'], ['input','input_tokens'], ['output','output_tokens'], ['thought','thought_tokens'], ['total token','total_tokens'], ['cost $','cost_usd']]);
   }}
   enhanceResponsiveTables();
   updateReconcileScopePreview();
@@ -7105,9 +7495,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         content_type = self.headers.get("Content-Type", "")
         payload: Dict[str, Any] = {}
         uploaded_excel_path = ""
+        uploaded_statement_path = ""
         if "multipart/form-data" in content_type:
             form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type})
-            for key in ["chat_id", "bot_key", "company_name", "flow_type", "scope", "excel_path", "note", "bank", "account_no", "account_name", "daily_limit"]:
+            for key in ["chat_id", "bot_key", "company_name", "flow_type", "scope", "excel_path", "statement_path", "note", "bank", "account_no", "account_name", "daily_limit"]:
                 if key in form and not getattr(form[key], "filename", None):
                     payload[key] = form.getfirst(key, "")
             if "excel" in form and getattr(form["excel"], "filename", None):
@@ -7117,6 +7508,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 uploaded_excel_path = str(base / f"upload-{int(time.time())}-{filename}")
                 with open(uploaded_excel_path, "wb") as out:
                     out.write(form["excel"].file.read())
+            if "statement" in form and getattr(form["statement"], "filename", None):
+                base = Path(os.environ.get("AUDITSLIP_BACKEND_IMPORT_DIR", "/root/projects/auditslip/imports/backend"))
+                base.mkdir(parents=True, exist_ok=True)
+                filename = re.sub(r"[^A-Za-z0-9_.-]+", "-", Path(form["statement"].filename).name) or "statement.xlsx"
+                uploaded_statement_path = str(base / f"statement-{int(time.time())}-{filename}")
+                with open(uploaded_statement_path, "wb") as out:
+                    out.write(form["statement"].file.read())
         else:
             length = int(self.headers.get("Content-Length", "0") or 0)
             raw = self.rfile.read(length).decode("utf-8") if length else ""
@@ -7471,6 +7869,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 logger.exception("api_bank_review_openai_all failed")
                 record_mutation(DB_PATH, "bank_review_batch", actor=self.actor_fingerprint(), payload=payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+            return
+        if parsed.path == "/api/reconcile/statement":
+            if not self.role_or_401("admin"):
+                return
+            try:
+                req_payload = dict(payload) if isinstance(payload, dict) else {}
+                if uploaded_excel_path and not req_payload.get("excel_path"):
+                    req_payload["excel_path"] = str(uploaded_excel_path)
+                if uploaded_statement_path and not req_payload.get("statement_path"):
+                    req_payload["statement_path"] = str(uploaded_statement_path)
+                chat_id = str(req_payload.get("chat_id") or "")
+                bot_key = str(req_payload.get("bot_key") or "")
+                flow_type = str(req_payload.get("flow_type") or "all")
+                scope = str(req_payload.get("scope") or "all")
+                excel_path = safe_backend_excel_path(str(req_payload.get("excel_path") or ""))
+                statement_path = safe_statement_file_path(str(req_payload.get("statement_path") or ""))
+                if not excel_path.exists():
+                    self.send_json({"ok": False, "error": f"excel not found: {excel_path}"}, 404)
+                    return
+                if not statement_path.exists():
+                    self.send_json({"ok": False, "error": f"statement not found: {statement_path}"}, 404)
+                    return
+                result = reconcile_backend_slips_statement(DB_PATH, excel_path, statement_path, chat_id=chat_id, scope=scope, bot_key=bot_key, flow_type=flow_type)
+                result["approval_required"] = False
+                self.send_json(result, 200 if result.get("ok") else 400)
+            except Exception as exc:
+                logger.exception("api_reconcile_statement failed")
                 self.send_json({"ok": False, "error": safe_error(exc)}, 400)
             return
         if parsed.path in {"/api/reconcile", "/api/reconcile/preview"}:

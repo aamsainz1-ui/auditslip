@@ -196,6 +196,8 @@ assert dup_rows[0]["duplicate_message_id"] == 5, dup_rows
 assert dup_rows[0]["matched_message_id"] == 1, dup_rows
 assert dup_rows[0]["duplicate_of"] == "S1", dup_rows
 assert dup_rows[0]["matched_reference_no"] == "REF1", dup_rows
+assert "duplicate_created_at_iso" in dup_headers and "matched_created_at_iso" in dup_headers, dup_headers
+assert dup_rows[0]["duplicate_created_at_iso"] and dup_rows[0]["matched_created_at_iso"], dup_rows
 
 settlement = bot.close_period("CHAT1", closed_by="U1", note="test close")
 assert settlement["closed_count"] == 3, settlement
