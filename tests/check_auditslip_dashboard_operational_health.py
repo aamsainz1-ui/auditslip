@@ -93,8 +93,13 @@ thread = threading.Thread(target=server.serve_forever, daemon=True)
 thread.start()
 try:
     before = table_counts()
+    quick_conn = HTTPConnection(host, port, timeout=5)
+    quick_conn.request("GET", "/api/health?quick=1")  # watchdog reachability probe: cheap and public
+    quick_resp = quick_conn.getresponse()
+    quick_raw = quick_resp.read().decode("utf-8")
+    quick_conn.close()
     conn = HTTPConnection(host, port, timeout=5)
-    conn.request("GET", "/api/health")  # public health endpoint; no auth cookie required
+    conn.request("GET", "/api/health")  # public full operational endpoint; no auth cookie required
     resp = conn.getresponse()
     raw = resp.read().decode("utf-8")
     conn.close()
@@ -105,9 +110,13 @@ finally:
 
 assert resp.status == 200, (resp.status, raw)
 body = json.loads(raw)
+quick_body = json.loads(quick_raw)
+assert quick_resp.status == 200, (quick_resp.status, quick_raw)
+assert quick_body["ok"] is True and quick_body["quick"] is True, quick_body
+assert "ocr_queue" not in quick_body["checks"], quick_body  # watchdog quick probe avoids aggregate queue scans
+assert before == after, (before, after, body, quick_body)  # health must be read-only
 assert body["ok"] is True, body
 assert body["app"] == Dash.APP_NAME, body
-assert before == after, (before, after, body)  # health must be read-only
 checks = body["checks"]
 for key in ["db", "schema", "slips", "ocr_queue", "pending_actions", "watchdog"]:
     assert key in checks, (key, body)

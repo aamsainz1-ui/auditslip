@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Guard: dashboard delete button is an approval request, not immediate removal.
+"""Guard: source-bank-review delete requests hide the card from the review queue.
 
 When an operator clicks a red delete button on a source-bank-review card, Phase B
-governance intentionally creates a pending two-person approval. The row must stay
-visible until approved/executed, but the UI must not claim it was already deleted
-or create a new pending request on every tap.
+governance still creates a pending two-person approval before the slip is actually
+soft-deleted. But the card should disappear from the recheck queue immediately
+while the delete is pending, so switching dates or waiting for refresh does not
+make an already-requested item look like it came back.
 """
 from __future__ import annotations
 
@@ -98,10 +99,11 @@ with sqlite3.connect(db_path) as conn:
 assert pending_count == 1, pending_count
 assert slip_status == "success", slip_status
 
-# Pending request explains why the card should not disappear yet.
+# Pending request hides it from the recheck queue, even though the slip is not
+# actually soft-deleted until approval/execution.
 after_request = Dash.dashboard_snapshot(db_path, bot_key="bot3", scope="2026-05-23", flow_type="deposit")
-assert after_request["totals"]["source_bank_review_count"] == 1, after_request["totals"]
-assert [r["id"] for r in after_request["source_bank_review"]] == ["SLIP_REVIEW_DELETE"], after_request["source_bank_review"]
+assert after_request["totals"]["source_bank_review_count"] == 0, after_request["totals"]
+assert after_request["source_bank_review"] == [], after_request["source_bank_review"]
 
 # After a second person approves and execution runs, soft-delete removes it from review/totals.
 approved = Dash.approve_pending_action(db_path, first_request["pending_id"], "actor-approver")
@@ -118,7 +120,8 @@ scripts = "\n".join(re.findall(r"<script>(.*?)</script>", html, re.S))
 assert "ขอลบรายการนี้" in html, "button copy must say request-delete, not immediate delete"
 assert "approval:'request'" in scripts, "delete button should explicitly request approval"
 assert "data.status === 'pending'" in scripts, "pending response must be handled separately"
-assert "ส่งคำขอลบแล้ว" in scripts and "รออนุมัติ" in scripts, "pending UX must explain why it did not disappear"
+assert "ส่งคำขอลบแล้ว" in scripts and "รออนุมัติ" in scripts, "pending UX must explain approval state"
+assert "await load({scrollTop:false});" in scripts, "pending approve/execute/reject/cancel must refresh dashboard detail panels"
 assert "already_pending" in scripts, "duplicate taps should be explained as existing pending request"
 
-print("ok: delete button creates one pending approval and UI explains item stays until approved")
+print("ok: delete request hides source-bank-review card while approval stays pending")

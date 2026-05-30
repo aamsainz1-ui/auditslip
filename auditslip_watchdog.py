@@ -196,7 +196,7 @@ def check_dashboard(args: argparse.Namespace, alerts: list[Alert], report: dict[
     if args.skip_dashboard:
         report["dashboard_health"] = {"skipped": True}
         return
-    url = os.environ.get("AUDITSLIP_WATCHDOG_HEALTH_URL") or f"http://127.0.0.1:{os.environ.get('AUDITSLIP_DASHBOARD_PORT', '8095')}/api/health"
+    url = os.environ.get("AUDITSLIP_WATCHDOG_HEALTH_URL") or f"http://127.0.0.1:{os.environ.get('AUDITSLIP_DASHBOARD_PORT', '8095')}/api/health?quick=1"
     status: dict[str, Any] = {"url": re.sub(r"token=[^&]+", "token=[REDACTED]", url)}
     try:
         with urllib.request.urlopen(url, timeout=5) as resp:

@@ -53,6 +53,8 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import auditslip_bank_ledger as bank_ledger_component
+
 from auditslip_bot import (
     APP_NAME,
     DATA_DIR,
@@ -133,6 +135,56 @@ def _systemctl_state(unit: str) -> Dict[str, Any]:
         return {"ok": proc.returncode == 0 and state == "active", "state": state, "unit": unit}
     except Exception as exc:
         return {"ok": False, "state": "unknown", "unit": unit, "error_type": type(exc).__name__}
+
+
+def dashboard_quick_health(db_path: Path = DB_PATH) -> Dict[str, Any]:
+    """Cheap health check for watchdog reachability probes.
+
+    The full operational health intentionally includes dashboard/queue/provider
+    aggregates. Under production load those aggregate scans can exceed the
+    watchdog's short HTTP timeout, causing a false "dashboard down" alert even
+    while the dashboard is alive. The watchdog already performs queue/service
+    checks separately, so this quick mode only verifies the dashboard process can
+    open the DB read-only and see the required tables.
+    """
+    generated_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    checks: Dict[str, Any] = {}
+    criticals: List[Dict[str, Any]] = []
+    path = Path(db_path)
+    db_check: Dict[str, Any] = {"ok": False, "exists": path.exists(), "readable": False, "path": "configured"}
+    checks["db"] = db_check
+    if not path.exists():
+        criticals.append({"code": "db_missing", "message": "database file is missing"})
+    else:
+        try:
+            with connect_readonly(path) as conn:
+                conn.execute("SELECT 1").fetchone()
+                db_check["readable"] = True
+                db_check["ok"] = True
+                required = {name: sqlite_table_exists(conn, name) for name in REQUIRED_HEALTH_TABLES}
+                schema_ok = all(required.values())
+                checks["schema"] = {"ok": schema_ok, "required_tables": required}
+                if not schema_ok:
+                    missing = [name for name, exists in required.items() if not exists]
+                    criticals.append({"code": "schema_missing", "message": "required tables are missing", "tables": missing})
+        except Exception as exc:
+            db_check["readable"] = False
+            db_check["ok"] = False
+            checks.setdefault("schema", {"ok": False, "required_tables": {}})
+            criticals.append({"code": "db_unreadable", "message": "database could not be read", "error_type": type(exc).__name__})
+    status = "critical" if criticals else "ok"
+    return {
+        "ok": not criticals,
+        "app": APP_NAME,
+        "status": status,
+        "quick": True,
+        "generated_at": generated_at,
+        "checks": checks,
+        "warning_count": 0,
+        "critical_count": len(criticals),
+        "warnings": [],
+        "criticals": criticals[:10],
+    }
 
 
 def dashboard_operational_health(db_path: Path = DB_PATH) -> Dict[str, Any]:
@@ -642,7 +694,31 @@ def ensure_company_account_table(conn: sqlite3.Connection) -> None:
           daily_limit REAL DEFAULT 0,
           active INTEGER DEFAULT 1,
           updated_at INTEGER NOT NULL,
+          opening_balance REAL DEFAULT 0,
+          opening_balance_date TEXT,
           PRIMARY KEY(bot_key, chat_id, account_key)
+        )
+        """
+    )
+    # migration: add columns if older schema
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(company_accounts)").fetchall()}
+        if "opening_balance" not in cols:
+            conn.execute("ALTER TABLE company_accounts ADD COLUMN opening_balance REAL DEFAULT 0")
+        if "opening_balance_date" not in cols:
+            conn.execute("ALTER TABLE company_accounts ADD COLUMN opening_balance_date TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+
+def ensure_slip_reviews_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS slip_reviews (
+          slip_id TEXT PRIMARY KEY,
+          reviewed_by TEXT,
+          reviewed_at INTEGER NOT NULL,
+          note TEXT
         )
         """
     )
@@ -1810,6 +1886,23 @@ def parse_statement_file(path: Path) -> List[Dict[str, Any]]:
     return parse_statement_excel(path)
 
 
+BANK_LEDGER_TABLES = bank_ledger_component.BANK_LEDGER_TABLES
+bank_ledger_account_identity = bank_ledger_component.bank_ledger_account_identity
+ensure_bank_ledger_tables = bank_ledger_component.ensure_bank_ledger_tables
+bank_ledger_tables_exist = bank_ledger_component.bank_ledger_tables_exist
+bank_ledger_source_hash = bank_ledger_component.bank_ledger_source_hash
+bank_ledger_entry_id = bank_ledger_component.bank_ledger_entry_id
+bank_ledger_entries_from_statement = bank_ledger_component.bank_ledger_entries_from_statement
+account_no_matches = bank_ledger_component.account_no_matches
+slip_matches_bank_ledger_account = bank_ledger_component.slip_matches_bank_ledger_account
+filter_slips_for_bank_ledger_account = bank_ledger_component.filter_slips_for_bank_ledger_account
+match_ledger_entries_to_slips = bank_ledger_component.match_ledger_entries_to_slips
+existing_bank_ledger_hashes = bank_ledger_component.existing_bank_ledger_hashes
+bank_ledger_query_rows = bank_ledger_component.bank_ledger_query_rows
+import_bank_ledger_statement = bank_ledger_component.import_bank_ledger_statement
+preview_bank_ledger_import = bank_ledger_component.preview_bank_ledger_import
+bank_ledger_snapshot = bank_ledger_component.bank_ledger_snapshot
+
 def statement_flow_matches(row: Dict[str, Any], flow_type: str) -> bool:
     flow = normalize_flow_type(flow_type)
     row_flow = clean_display(row.get("flow_type"))
@@ -2321,9 +2414,6 @@ def first_chat_selection(conn: sqlite3.Connection) -> Tuple[str, str]:
     return (str(row["bot_key"]), str(row["chat_id"])) if row else ("", "")
 
 
-def first_chat_id(conn: sqlite3.Connection) -> str:
-    return first_chat_selection(conn)[1]
-
 
 def grouped_totals(conn: sqlite3.Connection, where_clause: str, params: List[Any], name_expr: str, limit: int = 50) -> List[sqlite3.Row]:
     return conn.execute(
@@ -2563,33 +2653,81 @@ def source_bank_review_condition() -> str:
     return f"({missing_from_bank} AND {missing_issuer_bank})"
 
 
-def source_bank_review_count(conn: sqlite3.Connection, where_clause: str, params: List[Any], search: str = "") -> int:
+def pending_delete_slip_ids(conn: sqlite3.Connection) -> List[str]:
+    """Slip ids that already have a live delete request.
+
+    These rows are still `success` until approval/execution, so financial totals remain
+    unchanged. But they should not keep showing in the source-bank-review queue as if
+    the operator had never requested deletion.
+    """
+    try:
+        rows = conn.execute(
+            """
+            SELECT payload_json
+            FROM pending_actions
+            WHERE action='slip.delete' AND status IN ('pending','approved')
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    out: List[str] = []
+    seen = set()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except Exception:
+            payload = {}
+        slip_id = clean_display(payload.get("id") or payload.get("slip_id") or "") if isinstance(payload, dict) else ""
+        if slip_id and slip_id not in seen:
+            seen.add(slip_id)
+            out.append(slip_id)
+    return out
+
+
+def _exclude_slip_ids_clause(exclude_ids: List[str] | None, column: str = "id") -> Tuple[str, List[Any]]:
+    ids: List[str] = []
+    seen = set()
+    for value in exclude_ids or []:
+        slip_id = clean_display(value)
+        if slip_id and slip_id not in seen:
+            seen.add(slip_id)
+            ids.append(slip_id)
+    if not ids:
+        return "", []
+    placeholders = ",".join("?" for _ in ids)
+    return f" AND {column} NOT IN ({placeholders})", ids
+
+
+def source_bank_review_count(conn: sqlite3.Connection, where_clause: str, params: List[Any], search: str = "", exclude_ids: List[str] | None = None) -> int:
     search_clause, search_params = slip_search_clause("slips", search)
+    exclude_clause, exclude_params = _exclude_slip_ids_clause(exclude_ids)
     row = conn.execute(
-        f"SELECT COUNT(*) AS count FROM slips WHERE {where_clause} AND {source_bank_review_condition()}{search_clause}",
-        [*params, *search_params],
+        f"SELECT COUNT(*) AS count FROM slips WHERE {where_clause} AND {source_bank_review_condition()}{search_clause}{exclude_clause}",
+        [*params, *search_params, *exclude_params],
     ).fetchone()
     return int(row["count"] or 0)
 
 
-def source_bank_review_ids(conn: sqlite3.Connection, where_clause: str, params: List[Any], search: str = "") -> List[str]:
+def source_bank_review_ids(conn: sqlite3.Connection, where_clause: str, params: List[Any], search: str = "", exclude_ids: List[str] | None = None) -> List[str]:
     search_clause, search_params = slip_search_clause("slips", search)
+    exclude_clause, exclude_params = _exclude_slip_ids_clause(exclude_ids)
     rows = conn.execute(
         f"""
         SELECT id
         FROM slips
-        WHERE {where_clause} AND {source_bank_review_condition()}{search_clause}
+        WHERE {where_clause} AND {source_bank_review_condition()}{search_clause}{exclude_clause}
         ORDER BY created_at DESC
         """,
-        [*params, *search_params],
+        [*params, *search_params, *exclude_params],
     ).fetchall()
     return [str(r["id"]) for r in rows]
 
 
-def source_bank_review_rows(conn: sqlite3.Connection, where_clause: str, params: List[Any], search: str = "", limit: int = 40) -> List[Dict[str, Any]]:
+def source_bank_review_rows(conn: sqlite3.Connection, where_clause: str, params: List[Any], search: str = "", limit: int = 40, exclude_ids: List[str] | None = None) -> List[Dict[str, Any]]:
     search_clause, search_params = slip_search_clause("slips", search)
+    exclude_clause, exclude_params = _exclude_slip_ids_clause(exclude_ids)
     limit_clause = "LIMIT ?" if limit and limit > 0 else ""
-    query_params: List[Any] = [*params, *search_params]
+    query_params: List[Any] = [*params, *search_params, *exclude_params]
     if limit_clause:
         query_params.append(limit)
     rows = conn.execute(
@@ -2601,7 +2739,7 @@ def source_bank_review_rows(conn: sqlite3.Connection, where_clause: str, params:
                transferor_name, recipient_name, issuer_bank, from_bank, from_account, to_bank, to_account,
                amount, confidence, created_at_iso
         FROM slips
-        WHERE {where_clause} AND {source_bank_review_condition()}{search_clause}
+        WHERE {where_clause} AND {source_bank_review_condition()}{search_clause}{exclude_clause}
         ORDER BY created_at DESC
         {limit_clause}
         """,
@@ -3967,6 +4105,147 @@ def dashboard_success_scope(chat_id: str = "", bot_key: str = "", scope: str = "
     return where_clause, params, label
 
 
+def account_ledger_rows(
+    db_path: Path,
+    bot_key: str,
+    chat_id: str,
+    account_key: str,
+    date_from: str = "",
+    date_to: str = "",
+    flow_type: str = "all",
+    limit: int = 500,
+) -> Dict[str, Any]:
+    """Per-account ledger with running balance.
+
+    Returns rows from `slips` matching the selected account, ordered by date+id,
+    with running_balance calculated in Python (so duplicates don't double-count).
+    """
+    bot_key = clean_display(bot_key) or "default"
+    chat_id = str(chat_id or "")
+    account_key = clean_display(account_key)
+    flow_type = normalize_flow_type(flow_type)
+    if not account_key:
+        return {"ok": False, "error": "missing account_key", "rows": []}
+
+    with connect(db_path) as conn:
+        ensure_company_account_table(conn)
+        ensure_slip_reviews_table(conn)
+        acc_row = conn.execute(
+            "SELECT * FROM company_accounts WHERE bot_key=? AND chat_id=? AND account_key=?",
+            (bot_key, chat_id, account_key),
+        ).fetchone()
+        if not acc_row:
+            return {"ok": False, "error": "account not found", "rows": []}
+        account = clean_company_fields(dict(acc_row))
+        opening_balance = float(acc_row["opening_balance"] or 0) if "opening_balance" in acc_row.keys() else 0.0
+
+        clauses = ["bot_key = ?", "chat_id = ?"]
+        params: List[Any] = [bot_key, chat_id]
+        bank = clean_display(acc_row["bank"])
+        account_no = clean_display(acc_row["account_no"])
+        if account_no:
+            clauses.append("(COALESCE(to_account,'') LIKE ? OR COALESCE(to_bank,'') LIKE ? OR COALESCE(issuer_bank,'') LIKE ?)")
+            params.extend([f"%{account_no}%", f"%{account_no}%", f"%{account_no}%"])
+        elif bank:
+            clauses.append("(COALESCE(to_bank,'') LIKE ? OR COALESCE(issuer_bank,'') LIKE ?)")
+            params.extend([f"%{bank}%", f"%{bank}%"])
+        if date_from:
+            clauses.append("slip_date_text >= ?")
+            params.append(date_from)
+        if date_to:
+            clauses.append("slip_date_text <= ?")
+            params.append(date_to)
+        clauses.append("status = 'success'")
+        where = " AND ".join(clauses)
+        where, params = apply_flow_sql(where, params, flow_type)
+
+        rows = conn.execute(
+            f"""
+            SELECT s.*, sr.reviewed_at, sr.reviewed_by, sr.note AS review_note,
+                   EXISTS(SELECT 1 FROM pending_actions pa
+                          WHERE pa.action='slip.delete' AND pa.status IN ('pending','approved')
+                          AND json_extract(pa.payload_json,'$.id')=s.id) AS pending_delete,
+                   CASE WHEN s.is_duplicate=1 OR s.duplicate_of IS NOT NULL THEN 1 ELSE 0 END AS has_dup
+            FROM slips s
+            LEFT JOIN slip_reviews sr ON sr.slip_id = s.id
+            WHERE {where}
+            ORDER BY COALESCE(s.slip_date_iso, s.created_at_iso, ''), s.id
+            LIMIT ?
+            """,
+            (*params, int(limit)),
+        ).fetchall()
+
+    running = opening_balance
+    out_rows: List[Dict[str, Any]] = []
+    total_in = 0.0
+    total_out = 0.0
+    issue_count = 0
+    for r in rows:
+        rec = dict(r)
+        amount = float(rec.get("amount") or 0)
+        flow = flow_type_for_title(rec.get("chat_title",""), rec.get("bot_key",""), rec.get("chat_id",""))
+        is_dup = bool(rec.get("is_duplicate")) or bool(rec.get("duplicate_of")) or bool(rec.get("has_dup"))
+        pending_del = bool(rec.get("pending_delete"))
+        counted = not (is_dup or pending_del)
+        delta = 0.0
+        if counted and flow == "deposit":
+            delta = amount
+            total_in += amount
+        elif counted and flow == "withdraw":
+            delta = -amount
+            total_out += amount
+        running += delta
+        flags: List[str] = []
+        if is_dup:
+            flags.append("duplicate")
+        if pending_del:
+            flags.append("pending_delete")
+        if bank_needs_review(rec.get("from_bank")) and not is_dup:
+            flags.append("bank_unclear")
+        if float(rec.get("confidence") or 0) < 0.7 and float(rec.get("amount") or 0) > 0:
+            flags.append("low_confidence")
+        if rec.get("reviewed_at"):
+            flags.append("reviewed")
+        if any(f for f in flags if f not in ("reviewed",)):
+            issue_count += 1
+        rec["image_url"] = "/api/slip-image?" + urlencode({"id": rec.get("id", "")}) if rec.get("file_id") else ""
+        rec["delta"] = delta
+        rec["running_balance"] = running
+        rec["counted"] = counted
+        rec["flags"] = flags
+        out_rows.append(clean_company_fields(rec))
+
+    return {
+        "ok": True,
+        "account": account,
+        "opening_balance": opening_balance,
+        "rows": out_rows,
+        "totals": {
+            "in": total_in,
+            "out": total_out,
+            "net": total_in - total_out,
+            "ending_balance": running,
+            "row_count": len(out_rows),
+            "issue_count": issue_count,
+        },
+    }
+
+
+def mark_slip_reviewed(db_path: Path, slip_id: str, reviewed_by: str = "", note: str = "") -> Dict[str, Any]:
+    slip_id = clean_display(slip_id)
+    if not slip_id:
+        return {"ok": False, "error": "missing slip id"}
+    with connect(db_path) as conn:
+        ensure_slip_reviews_table(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO slip_reviews(slip_id, reviewed_by, reviewed_at, note) VALUES (?,?,?,?)",
+            (slip_id, clean_display(reviewed_by) or "owner", int(time.time()), clean_display(note)),
+        )
+        conn.commit()
+    return {"ok": True, "id": slip_id}
+
+
+
 def openai_bank_recheck_scope(
     db_path: Path,
     chat_id: str = "",
@@ -3979,7 +4258,7 @@ def openai_bank_recheck_scope(
     """Run bank recheck for every matching slip in the selected scope, not only visible cards."""
     where_clause, params, label = dashboard_success_scope(chat_id=chat_id, bot_key=bot_key, scope=scope, flow_type=flow_type)
     with connect(db_path) as conn:
-        ids = source_bank_review_ids(conn, where_clause, params, search)
+        ids = source_bank_review_ids(conn, where_clause, params, search, exclude_ids=pending_delete_slip_ids(conn))
     ok_count = 0
     fail_count = 0
     errors: List[Dict[str, Any]] = []
@@ -4148,6 +4427,8 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
             selected_bot_key = "__all__"
             selected_chat_id = ""
 
+        pending_delete_ids = pending_delete_slip_ids(conn)
+
         if selected_bot_key == "__all__":
             selected_where, selected_params, scope_label = global_scope_where(scope, success_only=True)
             selected_where, selected_params = apply_flow_sql(selected_where, selected_params, flow_type_key)
@@ -4194,8 +4475,8 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
                 conn, selected_where, selected_params, flow_type_key, account_limits, slip_search_key
             )
             duplicate_pairs = duplicate_pair_rows(conn, "", scope, "", slip_search_key, flow_type=flow_type_key)
-            source_bank_review = source_bank_review_rows(conn, selected_where, selected_params, slip_search_key)
-            source_bank_review_total = source_bank_review_count(conn, selected_where, selected_params, slip_search_key)
+            source_bank_review = source_bank_review_rows(conn, selected_where, selected_params, slip_search_key, exclude_ids=pending_delete_ids)
+            source_bank_review_total = source_bank_review_count(conn, selected_where, selected_params, slip_search_key, exclude_ids=pending_delete_ids)
             by_date = date_totals(conn, selected_where, selected_params)
             daily_flow_summary = daily_flow_totals(conn, selected_where, selected_params)
             by_from_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(from_bank,''), '(ไม่ทราบธนาคารต้นทาง)')", "(ไม่ทราบธนาคารต้นทาง)")
@@ -4252,8 +4533,8 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
                 conn, selected_where, selected_params, flow_type_key, account_limits, slip_search_key
             )
             duplicate_pairs = duplicate_pair_rows(conn, selected_chat_id, scope, selected_bot_key, slip_search_key, flow_type=flow_type_key)
-            source_bank_review = source_bank_review_rows(conn, selected_where, selected_params, slip_search_key)
-            source_bank_review_total = source_bank_review_count(conn, selected_where, selected_params, slip_search_key)
+            source_bank_review = source_bank_review_rows(conn, selected_where, selected_params, slip_search_key, exclude_ids=pending_delete_ids)
+            source_bank_review_total = source_bank_review_count(conn, selected_where, selected_params, slip_search_key, exclude_ids=pending_delete_ids)
             by_date = date_totals(conn, selected_where, selected_params)
             daily_flow_summary = daily_flow_totals(conn, selected_where, selected_params)
             by_from_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(from_bank,''), '(ไม่ทราบธนาคารต้นทาง)')", "(ไม่ทราบธนาคารต้นทาง)")
@@ -4310,8 +4591,8 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
                     conn, selected_where, selected_params, flow_type_key, account_limits, slip_search_key
                 )
                 duplicate_pairs = duplicate_pair_rows(conn, "", scope, selected_bot_key, slip_search_key, flow_type=flow_type_key)
-                source_bank_review = source_bank_review_rows(conn, selected_where, selected_params, slip_search_key)
-                source_bank_review_total = source_bank_review_count(conn, selected_where, selected_params, slip_search_key)
+                source_bank_review = source_bank_review_rows(conn, selected_where, selected_params, slip_search_key, exclude_ids=pending_delete_ids)
+                source_bank_review_total = source_bank_review_count(conn, selected_where, selected_params, slip_search_key, exclude_ids=pending_delete_ids)
                 by_date = date_totals(conn, selected_where, selected_params)
                 daily_flow_summary = daily_flow_totals(conn, selected_where, selected_params)
                 by_from_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(from_bank,''), '(ไม่ทราบธนาคารต้นทาง)')", "(ไม่ทราบธนาคารต้นทาง)")
@@ -4523,12 +4804,14 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
     issue_count_total = int(issue_queue_count_total or 0)
     queue_attention_count = int(jobs.get("queued", 0) or 0) + int(jobs.get("processing", 0) or 0) + int(jobs.get("failed", 0) or 0)
     over_limit_count = sum(1 for row in (by_account_day or []) if row.get("over_limit")) if limit_check_enabled else 0
+    bank_ledger_summary = bank_ledger_snapshot(db_path, bot_key=selected_bot_key, scope=scope or "open", flow_type=flow_type_key)
     exception_summary = {
         "over_limit_count": int(over_limit_count),
         "issue_count": int(issue_count_total),
         "bank_review_count": int(source_bank_review_total or 0),
         "duplicate_count": int(duplicate_count_total),
         "queue_attention_count": int(queue_attention_count),
+        "ledger_unmatched_count": int((bank_ledger_summary.get("unmatched_ledger") or {}).get("count") or 0),
     }
     exception_summary["total_count"] = sum(int(v or 0) for v in exception_summary.values())
     twallet_summary = fetch_twallet_summary()
@@ -4565,6 +4848,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
             "source_bank_review_count": int(source_bank_review_total or 0),
         },
         "exception_summary": exception_summary,
+        "bank_ledger_summary": bank_ledger_summary,
         "twallet_summary": twallet_summary,
         "slip_statuses": dict(slip_statuses),
         "jobs": dict(jobs),
@@ -5550,21 +5834,32 @@ def render_dashboard_html(token: str = "") -> str:
         </details>
 
         <section class="side-panel side-nav-panel" data-legacy-label="เมนูฟังก์ชั่น">
-          <div class="side-heading"><span>เมนูหลัก</span><small>แยกฟังก์ชัน</small></div>
+          <div class="side-heading"><span>เมนูหลัก</span><small>จัดหมวดตามงาน</small></div>
           <div class="side-nav">
             <button class="side-menu-item active" type="button" data-menu-target="section-operator-home" onclick="showMenuSection('section-operator-home')"><span class="side-menu-icon">★</span><span class="side-menu-text"><span class="side-menu-title">งานวันนี้</span><span class="side-menu-desc">ภาพรวม operator และรายการที่ต้องจัดการ</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="all" onclick="showAllMenuSections()"><span class="side-menu-icon">⌘</span><span class="side-menu-text"><span class="side-menu-title">แสดงทั้งหมด</span><span class="side-menu-desc">ทุกการ์ดและทุกตาราง</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-overview" onclick="showMenuSection('section-overview')"><span class="side-menu-icon">▦</span><span class="side-menu-text"><span class="side-menu-title">ภาพรวม</span><span class="side-menu-desc">ยอดรวมแยกบริษัท</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="section-company-accounts" onclick="showMenuSection('section-company-accounts')"><span class="side-menu-icon">🏦</span><span class="side-menu-text"><span class="side-menu-title">บัญชี/ค้นสลิป</span><span class="side-menu-desc">บัญชีรับเงินและดูรูปสลิปต่อบัญชี</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="section-pending" onclick="showMenuSection('section-pending')"><span class="side-menu-icon">⏳</span><span class="side-menu-text"><span class="side-menu-title">รออนุมัติ <span id="pendingBadge" class="pending-badge" hidden>0</span></span><span class="side-menu-desc">two-person approval · ยังไม่ได้อนุมัติ</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="section-date-sender" onclick="showMenuSection('section-date-sender')"><span class="side-menu-icon">◷</span><span class="side-menu-text"><span class="side-menu-title">วันที่/ผู้ส่งรูป</span><span class="side-menu-desc">ยอดรายวันและคนส่งรูป</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="limitSection" onclick="showMenuSection('limitSection')"><span class="side-menu-icon">↯</span><span class="side-menu-text"><span class="side-menu-title">ฝั่งถอน/วงเงิน</span><span class="side-menu-desc">วงเงินรายวัน/ผู้โอนถอน</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="section-deposit-slips" onclick="showMenuSection('section-deposit-slips')"><span class="side-menu-icon">＋</span><span class="side-menu-text"><span class="side-menu-title">ฝาก/เติมมือ</span><span class="side-menu-desc">สลิปลูกค้า ไม่มีวงเงิน</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="all" onclick="showAllMenuSections()"><span class="side-menu-icon">⌘</span><span class="side-menu-text"><span class="side-menu-title">แสดงทั้งหมด</span><span class="side-menu-desc">ทุกการ์ดและทุกตาราง</span></span></button>
+          </div>
+          <div class="side-heading" style="margin-top:14px"><span>ตรวจเงิน</span><small>ledger · ธนาคาร · กระทบยอด</small></div>
+          <div class="side-nav">
+            <button class="side-menu-item" type="button" data-menu-target="section-account-ledger" onclick="showMenuSection('section-account-ledger')"><span class="side-menu-icon">≡</span><span class="side-menu-text"><span class="side-menu-title">เดินบัญชีรายบัญชี</span><span class="side-menu-desc">timeline + running balance</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-bank-ledger" onclick="showMenuSection('section-bank-ledger')"><span class="side-menu-icon">▤</span><span class="side-menu-text"><span class="side-menu-title">Preview Statement</span><span class="side-menu-desc">อัปโหลด statement เทียบสลิป</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-banks" onclick="showMenuSection('section-banks')"><span class="side-menu-icon">⇄</span><span class="side-menu-text"><span class="side-menu-title">ยอดธนาคาร</span><span class="side-menu-desc">ยอดแยกต้นทาง/ปลายทาง</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-reconcile" onclick="showMenuSection('section-reconcile')"><span class="side-menu-icon">✓</span><span class="side-menu-text"><span class="side-menu-title">กระทบยอด Statement</span><span class="side-menu-desc">หลังบ้าน vs สลิป</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-bank-review" onclick="showMenuSection('section-bank-review')"><span class="side-menu-icon">◎</span><span class="side-menu-text"><span class="side-menu-title">รีเช็คธนาคาร</span><span class="side-menu-desc">OpenAI เช็กต้นทางที่ไม่ชัด</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="section-reconcile" onclick="showMenuSection('section-reconcile')"><span class="side-menu-icon">✓</span><span class="side-menu-text"><span class="side-menu-title">เทียบ Excel</span><span class="side-menu-desc">หลังบ้าน vs สลิป</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="section-duplicates" onclick="showMenuSection('section-duplicates')"><span class="side-menu-icon">⧉</span><span class="side-menu-text"><span class="side-menu-title">สลิปซ้ำ</span><span class="side-menu-desc">ตรวจคู่ซ้ำ/ยกเลิกซ้ำ</span></span></button>
+          </div>
+          <div class="side-heading" style="margin-top:14px"><span>จัดการสลิป</span><small>สลิปล่าสุด · ฝาก/ถอน · ซ้ำ</small></div>
+          <div class="side-nav">
             <button class="side-menu-item" type="button" data-menu-target="section-recent" onclick="showMenuSection('section-recent')"><span class="side-menu-icon">●</span><span class="side-menu-text"><span class="side-menu-title">Recent / Queue</span><span class="side-menu-desc">รายการล่าสุดและคิว OCR</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-deposit-slips" onclick="showMenuSection('section-deposit-slips')"><span class="side-menu-icon">＋</span><span class="side-menu-text"><span class="side-menu-title">ฝาก/เติมมือ</span><span class="side-menu-desc">สลิปลูกค้า ไม่มีวงเงิน</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="limitSection" onclick="showMenuSection('limitSection')"><span class="side-menu-icon">↯</span><span class="side-menu-text"><span class="side-menu-title">ฝั่งถอน/วงเงิน</span><span class="side-menu-desc">วงเงินรายวัน/ผู้โอนถอน</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-date-sender" onclick="showMenuSection('section-date-sender')"><span class="side-menu-icon">◷</span><span class="side-menu-text"><span class="side-menu-title">วันที่/ผู้ส่งรูป</span><span class="side-menu-desc">ยอดรายวันและคนส่งรูป</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-duplicates" onclick="showMenuSection('section-duplicates')"><span class="side-menu-icon">⧉</span><span class="side-menu-text"><span class="side-menu-title">สลิปซ้ำ</span><span class="side-menu-desc">ตรวจคู่ซ้ำ/ยกเลิกซ้ำ</span></span></button>
+          </div>
+          <div class="side-heading" style="margin-top:14px"><span>ระบบ</span><small>บัญชี · พิจารณา</small></div>
+          <div class="side-nav">
+            <button class="side-menu-item" type="button" data-menu-target="section-pending" onclick="showMenuSection('section-pending')"><span class="side-menu-icon">⏳</span><span class="side-menu-text"><span class="side-menu-title">รออนุมัติ <span id="pendingBadge" class="pending-badge" hidden>0</span></span><span class="side-menu-desc">two-person approval · ยังไม่ได้อนุมัติ</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-company-accounts" onclick="showMenuSection('section-company-accounts')"><span class="side-menu-icon">🏦</span><span class="side-menu-text"><span class="side-menu-title">บัญชี/ค้นสลิป</span><span class="side-menu-desc">บัญชีรับเงินและดูรูปสลิปต่อบัญชี</span></span></button>
           </div>
         </section>
 
@@ -5634,10 +5929,46 @@ def render_dashboard_html(token: str = "") -> str:
     <section id="section-deposit-slips" class="sections menu-section" hidden>
       <div class="card"><h3>ฝั่งฝาก/เติมมือ · สลิปลูกค้าฝาก/เติมมือ</h3><div id="depositCustomerSummary" class="mini">สลิปลูกค้า ไม่มีวงเงิน และไม่เอาไปรวมกับถอน/วงเงิน</div><div id="depositCustomerSlips"></div></div>
     </section>
+    <section id="section-account-ledger" class="sections menu-section" hidden>
+      <div class="card">
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+          <b>เดินบัญชีรายบัญชี</b>
+          <select id="ledgerAccountKey" style="flex:1;min-width:180px" onchange="loadLedger()"><option value="">— เลือกบัญชี —</option></select>
+          <select id="ledgerFlow" onchange="loadLedger()"><option value="all">ทั้งหมด</option><option value="deposit">ฝาก</option><option value="withdraw">ถอน</option></select>
+          <input type="date" id="ledgerDateFrom" onchange="loadLedger()" style="width:130px">
+          <input type="date" id="ledgerDateTo" onchange="loadLedger()" style="width:130px">
+          <button type="button" onclick="loadLedger()" style="white-space:nowrap">🔄 โหลด</button>
+          <button type="button" id="ledgerExportBtn" onclick="exportLedgerExcel()" style="white-space:nowrap" disabled>⬇ Excel</button>
+        </div>
+        <div id="ledgerKpi" class="mini muted" style="margin-bottom:8px"></div>
+      </div>
+      <div class="card">
+        <div id="ledgerBody"><div class="muted mini">เลือกบัญชีและกด "โหลด"</div></div>
+      </div>
+    </section>
     <section id="section-banks" class="sections menu-section" hidden>
       <div class="card"><h3>ยอดแยกตามธนาคารต้นทาง/ผู้โอน</h3><div id="byFromBank"></div><h3>ธนาคารปลายทาง</h3><div id="byToBank"></div></div>
       <div class="card"><h3>หมายเหตุธนาคาร</h3><div class="muted">ตัดตารางยอดแยกตาม issuer ออกแล้ว เหลือเฉพาะต้นทางและปลายทางที่ใช้ตรวจยอดจริง</div></div>
     </section>
+    <section id="section-bank-ledger" class="sections menu-section" hidden>
+      <div class="card">
+        <h3>เดินบัญชีรายบัญชี <span class="pill good">preview-only</span></h3>
+        <div class="mini">อัปโหลด statement รายบัญชีเพื่อดู preview ก่อน import · match กับสลิปตามบัญชี/ยอด/เวลา/วันที่ โดยไม่สร้าง pending หรือ mutation log</div>
+        <div class="reconcile-controls">
+          <label class="reconcile-step"><span>บริษัท</span><select id="ledgerCompanyFilter" title="เลือกบริษัทของ ledger"></select></label>
+          <label class="reconcile-step"><span>ฝาก/ถอน</span><select id="ledgerFlowFilter" title="เลือกทิศทาง statement"><option value="deposit">ฝาก/เงินเข้า</option><option value="withdraw">ถอน/เงินออก</option><option value="all">ทุกทิศทาง</option></select></label>
+          <label class="reconcile-step"><span>วันที่</span><input id="ledgerDateScope" type="date" title="วันที่ของรายการเดินบัญชี ถ้าเว้นว่างจะใช้ scope หลัก" /></label>
+          <label class="reconcile-step"><span>ธนาคาร</span><input id="statementBank" placeholder="เช่น KBANK" /></label>
+          <label class="reconcile-step"><span>เลขบัญชี</span><input id="statementAccountNo" placeholder="เลขบัญชีที่ต้องการออดิต" /></label>
+          <label class="reconcile-step"><span>ชื่อบัญชี</span><input id="statementAccountName" placeholder="ชื่อบัญชี" /></label>
+          <label class="reconcile-step reconcile-upload"><span>statement Excel/CSV</span><input id="ledgerStatementFile" type="file" accept=".xlsx,.xlsm,.csv" /></label>
+          <label class="reconcile-step reconcile-upload" data-admin-only="true"><span>หรือ path บน server</span><input id="ledgerStatementPath" placeholder="statement_path" /></label>
+          <div class="reconcile-actions"><button onclick="runBankLedgerPreview()">Preview เดินบัญชีรายบัญชี</button></div>
+        </div>
+        <div id="bankLedgerSummary" style="margin-top:12px"></div>
+      </div>
+    </section>
+
     <section id="section-reconcile" class="sections menu-section" hidden>
       <div class="card"><h3>เทียบ Excel หลังบ้าน</h3><div class="mini">ขั้นตอน: เลือกบริษัท → เลือกยอดฝาก/ถอน → เลือกวันที่เทียบ → อัปโหลด Excel ของบริษัทนั้น ระบบจะเทียบเฉพาะ scope ที่เลือก ไม่ปนบริษัทอื่น</div><div class="reconcile-controls"><label class="reconcile-step"><span>1 เลือกบริษัทก่อน</span><select id="reconcileCompanyFilter" title="เลือกบริษัทสำหรับเทียบหลังบ้าน"></select></label><label class="reconcile-step"><span>2 เลือกยอดฝาก/ถอน</span><select id="reconcileFlowFilter" title="เลือกยอดฝากหรือถอนสำหรับไฟล์หลังบ้าน"><option value="">เลือกยอดฝาก/ถอน</option><option value="withdraw">ยอดถอน</option><option value="deposit">ยอดฝาก/เติมมือ</option></select></label><label class="reconcile-step"><span>3 เลือกวันที่เทียบ</span><input id="reconcileDateScope" type="date" title="เลือกวันที่ของไฟล์หลังบ้าน ถ้าเว้นว่างจะใช้ช่วงวันที่หลักของ dashboard" /></label><label class="reconcile-step reconcile-upload"><span>4 อัปโหลด Excel ของบริษัทนี้</span><input id="backendExcelFile" type="file" accept=".xlsx,.xlsm" /></label><label class="reconcile-step reconcile-upload" data-admin-only="true"><span>หรือ path ไฟล์บน server</span><input id="backendExcel" placeholder="path หรือเว้นว่างเพื่อใช้ไฟล์ล่าสุด" /></label><div id="reconcileScopePreview" class="reconcile-preview">ไฟล์นี้จะถูกเทียบเฉพาะบริษัทและฝาก/ถอนที่เลือก และวันที่เลือก</div><div class="reconcile-actions"><button onclick="runReconcile()">เทียบยอดตามบริษัท/ฝากถอน/วันที่เลือก</button></div></div><div id="reconcile"></div></div>
       <div class="card"><h3>เทียบ 3 ฝั่ง: หลังบ้าน + สลิป + รายการเดินบัญชี</h3><div class="mini">ใช้เมื่อไฟล์หลังบ้านและสลิปมีแค่ยอด/เวลา แล้วอัปโหลดรายการเดินบัญชีมาเป็นตัวกลาง เทียบด้วยยอด+เวลา+วันที่ใน scope เดียวกัน · รองรับ Excel และ CSV จาก True Wallet Dashboard · รายการเดินบัญชี: โอนออก=ถอน, รับเงินคืน/เงินเข้า=ฝาก</div><div class="reconcile-controls"><label class="reconcile-step reconcile-upload"><span>รายการเดินบัญชี Excel/CSV</span><input id="statementExcelFile" type="file" accept=".xlsx,.xlsm,.csv" /></label><label class="reconcile-step reconcile-upload" data-admin-only="true"><span>หรือ path รายการเดินบัญชีบน server</span><input id="statementExcel" placeholder="statement_path หรือไฟล์รายการเดินบัญชี" /></label><div class="reconcile-actions"><button onclick="runStatementReconcile()">เทียบ 3 ฝั่งตามบริษัท/ฝากถอน/วันที่เลือก</button></div></div><div id="statementReconcile"></div></div>
@@ -5697,6 +6028,7 @@ const SIDE_MENU_KEY = 'auditslip.sideMenuCollapsed';
 const ADMIN_MODE_KEY = 'auditslip.adminMode';
 const ACTION_HEADER = {{'X-Auditslip-Action':'dashboard'}};
 let dashboardModalResolver = null;
+function hdr() {{ return ACTION_HEADER; }}
 function dashboardModalElements() {{
   return {{
     root: document.getElementById('dashboardModal'),
@@ -5829,6 +6161,7 @@ function showMenuSection(target, options={{}}) {{
   setActiveMenu(target);
   const section = document.getElementById(target);
   if (options.scroll !== false && section) section.scrollIntoView({{behavior:'smooth', block:'start'}});
+  if (target === 'section-account-ledger') populateLedgerAccounts();
   closeSideMenuIfMobile();
 }}
 applySideMenuState();
@@ -5867,6 +6200,7 @@ async function adminLogin() {{
   if (status) status.textContent = 'Login แล้ว · สิทธิ '+(data.role || 'admin');
   await loadPendingActions({{scrollTop:false}});
   refreshPendingBadge();
+  await load({{scrollTop:false}});
 }}
 async function adminLogout() {{
   const status = document.getElementById('adminLoginStatus');
@@ -5903,6 +6237,7 @@ function applyAdminMode() {{
   const btn = document.getElementById('adminModeToggle');
   if (btn) btn.textContent = enabled ? 'ปิด Admin' : 'ตั้งค่า/Admin';
 }}
+function applyAdminVisibility() {{ applyAdminMode(); }}
 function toggleAdminMode() {{
   const enabled = safeStorageGet(ADMIN_MODE_KEY) === '1';
   safeStorageSet(ADMIN_MODE_KEY, enabled ? '0' : '1');
@@ -6170,6 +6505,9 @@ function renderExceptionQueue(data) {{
   if (dupeCount) items.push({{title:'สลิปซ้ำ', count:dupeCount, target:'section-duplicates', detail:dupeRows.slice(0,3).map(r => (r.company_name || r.bot_key || '-')+' '+money(r.amount || r.original_amount || 0)).join(' · ') || 'มีสลิปซ้ำใน scope นี้'}});
   const queueCount = Number(summary.queue_attention_count || 0);
   if (queueCount) items.push({{title:'คิว OCR / processing / failed', count:queueCount, target:'section-recent', detail:'รอ '+(data.jobs.queued || 0)+' · processing '+(data.jobs.processing || 0)+' · failed '+(data.jobs.failed || 0)}});
+  const ledgerSummary = data.bank_ledger_summary || {{}};
+  const ledgerUnmatched = Number(summary.ledger_unmatched_count || ((ledgerSummary.unmatched_ledger || {{}}).count) || 0);
+  if (ledgerUnmatched) items.push({{title:'เดินบัญชียังไม่ match สลิป', count:ledgerUnmatched, target:'section-bank-ledger', detail:'เปิดดู statement รายบัญชีและรายการที่ยังค้างตรวจ'}});
   if (!items.length) return '<div class="good"><b>ไม่มีรายการที่ต้องจัดการใน scope นี้</b></div><div class="mini">ถ้าต้องการดูรายละเอียดทั้งหมด เปิดเมนูแสดงทั้งหมด</div>';
   return '<div class="exception-list">'+items.map(item => '<button type="button" class="exception-item" data-menu-jump="'+esc(item.target)+'"><span><strong>'+esc(item.title)+'</strong><div class="mini">'+esc(item.detail || '-')+'</div></span><span class="pill warn">'+esc(item.count)+'</span></button>').join('')+'</div>';
 }}
@@ -6389,7 +6727,7 @@ async function deleteSlip(slipId) {{
   if (data.status === 'pending') {{
     const pendingMessage = (data.already_pending ? 'มีคำขอลบค้างอยู่แล้ว' : 'ส่งคำขอลบแล้ว') + ' · รออนุมัติ #' + (data.pending_id || '-');
     if (status) status.textContent = pendingMessage;
-    await dashboardNotify(pendingMessage + ' รายการจะยังอยู่ในหน้านี้จนกว่าจะอนุมัติและ execute');
+    await dashboardNotify(pendingMessage + ' ซ่อนจากคิวรีเช็คแล้ว แต่ยอดจะถูกหักหลังอนุมัติและ execute');
     await load();
     return;
   }}
@@ -6503,6 +6841,78 @@ function statementReconcileSummary(data) {{
   const slipExtra = table((data.slip_extra || {{}}).rows || [], [['สถานะ', r => 'สลิปมี แต่ไม่พบในหลังบ้าน'], ['วันที่','date'], ['เวลา','time'], ['ยอด', r => money(r.amount)], ['แหล่ง','source']]);
   const statementExtra = table((data.statement_extra || {{}}).rows || [], [['สถานะ', r => 'เดินบัญชีมี แต่ไม่พบในหลังบ้าน'], ['วันที่','date'], ['เวลา','time'], ['รายการ','description'], ['ยอด', r => money(r.amount)], ['flow','flow_label']]);
   return cards + '<h4>ตรง 3 ฝั่ง</h4>' + matched + '<h4>หลังบ้านมี แต่ไม่พบในสลิป</h4>' + missingSlip + '<h4>หลังบ้านมี แต่ไม่พบในรายการเดินบัญชี</h4>' + missingStatement + '<h4>สลิปเกินจากหลังบ้าน</h4>' + slipExtra + '<h4>รายการเดินบัญชีเกินจากหลังบ้าน</h4>' + statementExtra;
+}}
+function renderBankLedgerSnapshot(data) {{
+  data = data || {{}};
+  const entries = data.entries || {{}};
+  const matched = data.matched || {{}};
+  const unmatchedLedger = data.unmatched_ledger || data.ledger_extra || {{}};
+  const unmatchedSlips = data.unmatched_slips || data.slip_extra || {{}};
+  const account = data.account || {{}};
+  const accountLine = account.account_no ? ('บัญชี '+esc(account.account_no)+' · '+esc(account.bank || '-')+' · '+esc(account.account_name || '')) : 'ยังไม่มี ledger ใน scope นี้';
+  const cards = '<div class="muted">'+accountLine+'</div>'
+    + '<div class="mini">รายการเดินบัญชี '+esc(entries.count || 0)+' · '+money(entries.amount || 0)+' | match '+esc(matched.count || 0)+' | เดินบัญชีเกิน '+esc(unmatchedLedger.count || 0)+' | สลิปเกิน '+esc(unmatchedSlips.count || 0)+'</div>';
+  const ledgerRows = (unmatchedLedger.rows || []).slice(0,50);
+  const slipRows = (unmatchedSlips.rows || []).slice(0,50);
+  return cards
+    + '<h4>เดินบัญชีที่ยังไม่ match สลิป</h4>' + table(ledgerRows, [['วันที่','date'], ['เวลา','time'], ['รายการ','description'], ['flow','flow_label'], ['ref','reference'], ['ยอด', r => money(r.amount)]])
+    + '<h4>สลิปที่ยังไม่ match เดินบัญชี</h4>' + table(slipRows, [['วันที่','date'], ['เวลา','time'], ['บัญชีต้นทาง','from_account'], ['บัญชีปลายทาง','to_account'], ['ref','reference'], ['ยอด', r => money(r.amount)]]);
+}}
+function bankLedgerPreviewSummary(data) {{
+  if (!data) return '<div class="muted">ยังไม่ได้ preview</div>';
+  if (!data.ok) return '<div class="bad">'+esc(data.error || 'ledger preview failed')+'</div>';
+  const complete = (data.ledger_extra.count||0) === 0 && (data.slip_extra.count||0) === 0;
+  const account = data.account || {{}};
+  const cards = '<div class="'+(complete?'good':'warn')+'"><b>'+(complete?'Preview เดินบัญชี: ครบ':'Preview เดินบัญชี: มีรายการค้างตรวจ')+'</b></div>'
+    + '<div class="mini">บริษัท/Bot: '+esc(account.bot_key || '-')+' · บัญชี '+esc(account.account_no || '-')+' · '+esc(account.bank || '-')+' · dry-run '+esc(data.dry_run ? 'yes' : 'no')+'</div>'
+    + '<div class="muted">statement '+(data.incoming.count||0)+' รายการ · '+money(data.incoming.amount)+' | สลิป '+(data.slips.count||0)+' รายการ · '+money(data.slips.amount)+' | match '+(data.matched.count||0)+' | ledger เกิน '+(data.ledger_extra.count||0)+' | สลิปเกิน '+(data.slip_extra.count||0)+'</div>';
+  const matchedRows = (data.matched.rows || []).map(m => ({{...(m.ledger || {{}}), status:'match', slip_source:(m.slip||{{}}).source || ''}}));
+  const matched = table(matchedRows, [['สถานะ','status'], ['วันที่','date'], ['เวลา','time'], ['รายการ','description'], ['ref','reference'], ['ยอด', r => money(r.amount)], ['สลิป','slip_source']]);
+  const ledgerExtra = table((data.ledger_extra || {{}}).rows || [], [['สถานะ', r => 'เดินบัญชีมี แต่ไม่พบสลิป'], ['วันที่','date'], ['เวลา','time'], ['รายการ','description'], ['ref','reference'], ['ยอด', r => money(r.amount)]]);
+  const slipExtra = table((data.slip_extra || {{}}).rows || [], [['สถานะ', r => 'สลิปมี แต่ไม่พบเดินบัญชี'], ['วันที่','date'], ['เวลา','time'], ['ต้นทาง','from_account'], ['ปลายทาง','to_account'], ['ref','reference'], ['ยอด', r => money(r.amount)]]);
+  return cards + '<h4>รายการที่ match</h4>' + matched + '<h4>เดินบัญชีเกิน</h4>' + ledgerExtra + '<h4>สลิปเกิน</h4>' + slipExtra;
+}}
+async function runBankLedgerPreview() {{
+  const bot = document.getElementById('ledgerCompanyFilter').value || selectedBotKey() || '__all__';
+  const flow = document.getElementById('ledgerFlowFilter').value || document.getElementById('flowFilter').value || 'all';
+  const scope = document.getElementById('ledgerDateScope').value || selectedDashboardScope();
+  const bank = document.getElementById('statementBank').value || '';
+  const account_no = document.getElementById('statementAccountNo').value || '';
+  const account_name = document.getElementById('statementAccountName').value || '';
+  const statement_path = document.getElementById('ledgerStatementPath').value || '';
+  const statementFile = document.getElementById('ledgerStatementFile').files[0];
+  const box = document.getElementById('bankLedgerSummary');
+  if (!account_no) {{
+    const msg = 'ใส่เลขบัญชีของ statement ก่อน preview';
+    box.innerHTML = '<div class="bad">'+esc(msg)+'</div>';
+    await dashboardNotify(msg);
+    return;
+  }}
+  if (!statementFile && !statement_path) {{
+    const msg = 'อัปโหลด statement หรือใส่ path statement ก่อน';
+    box.innerHTML = '<div class="bad">'+esc(msg)+'</div>';
+    await dashboardNotify(msg);
+    return;
+  }}
+  box.innerHTML = '<div class="muted">กำลัง preview ledger รายบัญชี...</div>';
+  let res;
+  if (statementFile) {{
+    const form = new FormData();
+    form.append('bot_key', bot);
+    form.append('flow_type', flow);
+    form.append('scope', scope);
+    form.append('bank', bank);
+    form.append('account_no', account_no);
+    form.append('account_name', account_name);
+    if (statement_path) form.append('statement_path', statement_path);
+    form.append('statement', statementFile);
+    res = await fetch('/api/ledger/preview'+query(), {{method:'POST', headers:ACTION_HEADER, body: form}});
+  }} else {{
+    res = await fetch('/api/ledger/preview'+query(), {{method:'POST', headers:postHeaders(), body: JSON.stringify({{bot_key:bot, flow_type:flow, scope, bank, account_no, account_name, statement_path}})}});
+  }}
+  const data = await res.json();
+  box.innerHTML = bankLedgerPreviewSummary(data);
+  enhanceResponsiveTables(box);
 }}
 function reconcileScopeValue() {{
   const dateEl = document.getElementById('reconcileDateScope');
@@ -6728,6 +7138,148 @@ function pendingRowsTable(rows, currentActor, simpleApproval=false) {{
   }}).join('');
   return '<div class="responsive-table"><table>'+head+'<tbody>'+body+'</tbody></table></div>';
 }}
+
+// ========== Per-Account Ledger ===========
+let _ledgerSnapshot = null;
+async function populateLedgerAccounts() {{
+  const parts = selectedChatParts();
+  const chat_id = parts.chat_id || '';
+  const bot_key = parts.bot_key || '';
+  const url = '/api/summary?' + new URLSearchParams({{chat_id, bot_key, scope:'all', detail:'light'}}).toString();
+  try {{
+    const r = await fetch(url, {{headers: hdr()}});
+    const data = await r.json();
+    const accounts = (data.company_accounts || []);
+    const sel = document.getElementById('ledgerAccountKey');
+    if (!sel) return;
+    const prev = sel.value;
+    sel.innerHTML = '<option value="">— เลือกบัญชี —</option>';
+    accounts.forEach(a => {{
+      const key = a.account_key || '';
+      const label = [a.company_name, a.bank, a.account_no, a.account_name].filter(Boolean).join(' · ');
+      const opt = document.createElement('option');
+      opt.value = key; opt.textContent = label || key;
+      sel.appendChild(opt);
+    }});
+    if (prev) sel.value = prev;
+  }} catch(e) {{ console.warn('populateLedgerAccounts', e); }}
+}}
+function ledgerFlag(flags) {{
+  if (!flags || !flags.length) return '';
+  const map = {{duplicate:'ซ้ำ', pending_delete:'รอลบ', bank_unclear:'ธนาคารไม่ชัด', low_confidence:'OCR ต่ำ', reviewed:'✓'}};
+  return flags.map(f => `<span class="pill ${{f==='reviewed'?'':'warn'}}">${{map[f]||f}}</span>`).join(' ');
+}}
+async function loadLedger() {{
+  const parts = selectedChatParts();
+  const chat_id = parts.chat_id || '';
+  const bot_key = parts.bot_key || '';
+  const account_key = (document.getElementById('ledgerAccountKey')||{{}}).value || '';
+  const flow = (document.getElementById('ledgerFlow')||{{}}).value || 'all';
+  const date_from = (document.getElementById('ledgerDateFrom')||{{}}).value || '';
+  const date_to   = (document.getElementById('ledgerDateTo')||{{}}).value || '';
+  const body = document.getElementById('ledgerBody');
+  const kpi  = document.getElementById('ledgerKpi');
+  if (!body) return;
+  if (!account_key) {{ body.innerHTML = '<div class="muted mini">เลือกบัญชีก่อน</div>'; return; }}
+  body.innerHTML = '<div class="muted mini">กำลังโหลด…</div>';
+  const q = new URLSearchParams({{chat_id, bot_key, account_key, flow_type:flow, date_from, date_to, limit:500}}).toString();
+  try {{
+    const r = await fetch('/api/ledger?' + q, {{headers: hdr()}});
+    const data = await r.json();
+    if (!data.ok) {{ body.innerHTML = `<div class="muted mini">Error: ${{esc(data.error||'ไม่พบข้อมูล')}}</div>`; return; }}
+    _ledgerSnapshot = data;
+    const totals = data.totals || {{}};
+    const acc = data.account || {{}};
+    if (kpi) kpi.innerHTML = `
+      <span>บัญชี: <b>${{esc([acc.company_name,acc.bank,acc.account_no].filter(Boolean).join(' '))}}</b></span> &nbsp;·&nbsp;
+      <span>ยอดเข้า: <b class="good">+${{money(totals.in||0)}}</b></span> &nbsp;·&nbsp;
+      <span>ยอดออก: <b class="warn">-${{money(totals.out||0)}}</b></span> &nbsp;·&nbsp;
+      <span>สุทธิ: <b>${{money(totals.net||0)}}</b></span> &nbsp;·&nbsp;
+      <span>ยอดสะสม: <b>${{money(totals.ending_balance||0)}}</b></span> &nbsp;·&nbsp;
+      <span>รายการ: <b>${{totals.row_count||0}}</b></span>
+      ${{totals.issue_count ? ` &nbsp;·&nbsp;<span class="pill warn">${{totals.issue_count}} ปัญหา</span>` : ''}}
+    `;
+    const rows = data.rows || [];
+    if (!rows.length) {{ body.innerHTML = '<div class="muted mini">ไม่พบรายการในช่วงที่เลือก</div>'; return; }}
+    let html = `<div class="scroll-x"><table class="responsive-table"><thead><tr>
+      <th>วันที่/เวลา</th><th>Flow</th><th>ผู้โอน</th><th>ต้นทาง</th><th>ยอดเข้า</th><th>ยอดออก</th><th>ยอดสะสม</th><th>Badge</th><th>Actions</th>
+    </tr></thead><tbody>`;
+    rows.forEach(r => {{
+      const flow_label = r.chat_title||'';
+      const is_deposit = flow_label.toLowerCase().includes('ฝาก')||flow_label.toLowerCase().includes('deposit');
+      const amount = parseFloat(r.amount||0);
+      const bal = parseFloat(r.running_balance||0);
+      const flags = r.flags||[];
+      const rowClass = flags.includes('pending_delete')?'opacity:0.5':flags.includes('reviewed')?'color:var(--muted)':'';
+      html += `<tr style="${{rowClass}}">
+        <td class="mini">${{esc(r.slip_date_iso||r.slip_date_display||'-')}}</td>
+        <td>${{is_deposit ? '<span class="pill good">ฝาก</span>' : '<span class="pill warn">ถอน</span>'}}</td>
+        <td class="mini">${{esc(r.transferor_name||r.sender_name||'-')}}</td>
+        <td class="mini">${{esc(r.from_bank||r.issuer_bank||'-')}}</td>
+        <td class="good">${{is_deposit ? money(amount) : ''}}</td>
+        <td class="warn">${{!is_deposit ? money(amount) : ''}}</td>
+        <td><b>${{money(bal)}}</b></td>
+        <td>${{ledgerFlag(flags)}}</td>
+        <td style="white-space:nowrap">
+          ${{r.image_url ? `<a href="${{esc(r.image_url)}}" target="_blank" class="mini">📄</a> ` : ''}}
+          ${{flags.includes('bank_unclear') ? `<button class="mini" data-admin-only="true" onclick="ledgerRecheckBank('${{esc(r.id)}}',this)">🔍</button> ` : ''}}
+          ${{!flags.includes('reviewed') ? `<button class="mini" data-admin-only="true" onclick="ledgerMarkReviewed('${{esc(r.id)}}',this)">✓</button>` : ''}}
+        </td>
+      </tr>`;
+    }});
+    html += '</tbody></table></div>';
+    body.innerHTML = html;
+    applyAdminVisibility();
+    const exportBtn = document.getElementById('ledgerExportBtn');
+    if (exportBtn) exportBtn.disabled = false;
+  }} catch(e) {{ body.innerHTML = `<div class="muted mini">โหลดผิดพลาด: ${{e}}</div>`; console.error(e); }}
+}}
+async function ledgerRecheckBank(slipId, btn) {{
+  if (!await dashboardConfirm('ให้ OpenAI รีเช็คธนาคารสำหรับสลิปนี้?')) return;
+  if (btn) {{ btn.disabled=true; btn.textContent='…'; }}
+  try {{
+    const r = await fetch('/api/bank-review/openai' + query(), {{method:'POST', headers:postHeaders(), body:JSON.stringify({{id:slipId,apply:true}})}});
+    const d = await r.json();
+    await loadLedger();
+  }} catch(e) {{ console.error(e); }}
+}}
+async function ledgerMarkReviewed(slipId, btn) {{
+  if (btn) {{ btn.disabled=true; btn.textContent='…'; }}
+  try {{
+    const r = await fetch('/api/slip/mark-reviewed', {{method:'POST', headers:postHeaders(), body:JSON.stringify({{id:slipId}})}});
+    await loadLedger();
+  }} catch(e) {{ console.error(e); }}
+}}
+function exportLedgerExcel() {{
+  if (!_ledgerSnapshot) return;
+  const acc = _ledgerSnapshot.account || {{}};
+  const rows = _ledgerSnapshot.rows || [];
+  const headers = ['วันที่','Flow','ผู้โอน','ต้นทาง','ยอดเข้า','ยอดออก','ยอดสะสม','Badge','Slip ID'];
+  const csvRows = [headers.join(',')];
+  rows.forEach(r => {{
+    const flow_label = (r.chat_title||'').toLowerCase();
+    const is_dep = flow_label.includes('ฝาก')||flow_label.includes('deposit');
+    const amt = parseFloat(r.amount||0);
+    csvRows.push([
+      r.slip_date_iso||r.slip_date_display||'',
+      is_dep?'ฝาก':'ถอน',
+      r.transferor_name||r.sender_name||'',
+      r.from_bank||r.issuer_bank||'',
+      is_dep?amt:'',
+      !is_dep?amt:'',
+      parseFloat(r.running_balance||0),
+      (r.flags||[]).join('|'),
+      r.id||'',
+    ].map(v=>`"${{String(v).replace(/"/g,'""')}}"`).join(','));
+  }});
+  const blob = new Blob([String.fromCharCode(0xFEFF)+csvRows.join(String.fromCharCode(10))], {{type:'text/csv;charset=utf-8'}});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `ledger-${{acc.company_name||'account'}}-${{new Date().toISOString().slice(0,10)}}.csv`;
+  a.click();
+}}
+// ========== End Ledger ===========
+
 async function loadPendingActions(options={{}}) {{
   const filterEl = document.getElementById('pendingStatusFilter');
   const container = document.getElementById('pendingTableContainer');
@@ -6789,6 +7341,7 @@ async function approvePending(pendingId) {{
   }}
   await loadPendingActions({{scrollTop:false}});
   refreshPendingBadge();
+  await load({{scrollTop:false}});
 }}
 async function rejectPending(pendingId) {{
   const reason = await dashboardInput('เหตุผลที่ปฏิเสธคำขอ #' + pendingId + ' (ระบุก็ได้)', 'ปฏิเสธคำขอ', '', {{placeholder:'เหตุผล (ไม่บังคับ)', confirmText:'ปฏิเสธ', danger:true}});
@@ -6806,6 +7359,7 @@ async function rejectPending(pendingId) {{
   }}
   await loadPendingActions({{scrollTop:false}});
   refreshPendingBadge();
+  await load({{scrollTop:false}});
 }}
 async function cancelPending(pendingId) {{
   const ok = await dashboardConfirm('ยกเลิกคำขอ #' + pendingId + '? (ใช้ได้เฉพาะผู้ที่ขอ)', 'ยืนยันยกเลิก', true);
@@ -6823,6 +7377,7 @@ async function cancelPending(pendingId) {{
   }}
   await loadPendingActions({{scrollTop:false}});
   refreshPendingBadge();
+  await load({{scrollTop:false}});
 }}
 async function executePending(pendingId) {{
   const ok = await dashboardConfirm('ดำเนินการคำขอที่อนุมัติแล้ว #' + pendingId + '?', 'ยืนยัน execute');
@@ -6840,6 +7395,7 @@ async function executePending(pendingId) {{
   }}
   await loadPendingActions({{scrollTop:false}});
   refreshPendingBadge();
+  await load({{scrollTop:false}});
 }}
 async function load(options={{}}) {{
   const botEl = document.getElementById('botFilter');
@@ -6909,10 +7465,19 @@ async function load(options={{}}) {{
     const hasPreviousReconcileBot = previousReconcileBot && Array.from(reconcileCompanyFilter.options || []).some(opt => opt.value === previousReconcileBot);
     reconcileCompanyFilter.value = hasPreviousReconcileBot ? previousReconcileBot : (selectedBot && selectedBot !== '__all__' ? selectedBot : '__all__');
   }}
+  const ledgerCompanyFilter = document.getElementById('ledgerCompanyFilter');
+  const previousLedgerBot = ledgerCompanyFilter ? (ledgerCompanyFilter.value || '') : '';
+  if (ledgerCompanyFilter) {{
+    ledgerCompanyFilter.innerHTML = companyOptions;
+    const hasPreviousLedgerBot = previousLedgerBot && Array.from(ledgerCompanyFilter.options || []).some(opt => opt.value === previousLedgerBot);
+    ledgerCompanyFilter.value = hasPreviousLedgerBot ? previousLedgerBot : (selectedBot && selectedBot !== '__all__' ? selectedBot : '__all__');
+  }}
   flowEl.value = data.flow_type || currentFlow || 'all';
   const activeFlow = flowEl.value || 'all';
   const reconcileFlowFilter = document.getElementById('reconcileFlowFilter');
   if (reconcileFlowFilter && !reconcileFlowFilter.value && (activeFlow === 'deposit' || activeFlow === 'withdraw')) {{ reconcileFlowFilter.value = activeFlow; }}
+  const ledgerFlowFilter = document.getElementById('ledgerFlowFilter');
+  if (ledgerFlowFilter && (activeFlow === 'deposit' || activeFlow === 'withdraw')) {{ ledgerFlowFilter.value = activeFlow; }}
   const chatRows = (data.chats || []).filter(c => String(c.bot_key || 'default') === String(selectedBot || 'default') && (activeFlow === 'all' || String(c.flow_type || 'other') === activeFlow));
   if (selectedBot === '__all__') {{
     chatEl.disabled = true;
@@ -6979,6 +7544,8 @@ async function load(options={{}}) {{
   document.getElementById('operatorHome').innerHTML = renderOperatorHome(data.company_summary);
   document.getElementById('exceptionQueue').innerHTML = renderExceptionQueue(data);
   wireExceptionButtons();
+  const bankLedgerSummaryEl = document.getElementById('bankLedgerSummary');
+  if (bankLedgerSummaryEl && data.bank_ledger_summary) bankLedgerSummaryEl.innerHTML = renderBankLedgerSnapshot(data.bank_ledger_summary);
   document.getElementById('sideCompanies').innerHTML = renderSideCompanies(data.company_menu || data.company_summary);
   wireCompanyButtons();
   document.getElementById('botSettings').innerHTML = renderTelegramBots(data.telegram_bots);
@@ -7034,7 +7601,12 @@ async function load(options={{}}) {{
   updateExcel();
   if (!initialMenuApplied || (options && options.home)) {{
     initialMenuApplied = true;
-    if (!(options && options.scrollTarget)) showMenuSection('section-operator-home', {{scroll:false, persist:false}});
+    const initialHashTarget = String(location.hash || '').replace(/^#/, '');
+    if (initialHashTarget && document.getElementById(initialHashTarget) && document.getElementById(initialHashTarget).classList.contains('menu-section')) {{
+      showMenuSection(initialHashTarget, {{scroll:false, persist:false}});
+    }} else if (!(options && options.scrollTarget)) {{
+      showMenuSection('section-operator-home', {{scroll:false, persist:false}});
+    }}
   }}
   if (options && options.scrollTarget) scrollElementIntoView(options.scrollTarget, options.smooth !== false);
   else if (options && options.scrollTop) scrollDashboardTop(options.smooth !== false);
@@ -7299,10 +7871,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/api/health":
-            self.send_json(dashboard_operational_health(DB_PATH))
-            return
         q = parse_qs(parsed.query)
+        if parsed.path == "/api/health":
+            if health_env_bool("AUDITSLIP_HEALTH_QUICK_DEFAULT", False) or q.get("quick") in (["1"], ["true"], ["yes"], ["on"]):
+                self.send_json(dashboard_quick_health(DB_PATH))
+            else:
+                self.send_json(dashboard_operational_health(DB_PATH))
+            return
         if q.get("token") and parsed.path in {"/", "/index.html"}:
             clean_q = {k: v for k, v in q.items() if k != "token"}
             new_query = urlencode([(k, vv) for k, vs in clean_q.items() for vv in vs])
@@ -7343,6 +7918,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
             account_search_mode = (q.get("account_search_mode") or [""])[0] or "scoped"
             detail_level = (q.get("detail") or q.get("detail_level") or ["full"])[0]
             self.send_json(dashboard_snapshot(DB_PATH, chat_id=chat_id, bot_key=bot_key, flow_type=flow_type, scope=scope, slip_filter=slip_filter, slip_search=slip_search, account_search_mode=account_search_mode, detail_level=detail_level))
+            return
+        if parsed.path == "/api/ledger":
+            q = parse_qs(parsed.query)
+            chat_id = (q.get("chat_id") or [""])[0]
+            bot_key = (q.get("bot_key") or [""])[0]
+            account_key = (q.get("account_key") or [""])[0]
+            date_from = (q.get("date_from") or [""])[0]
+            date_to = (q.get("date_to") or [""])[0]
+            flow_type = (q.get("flow_type") or ["all"])[0]
+            try:
+                limit = max(1, min(2000, int((q.get("limit") or ["500"])[0])))
+            except (TypeError, ValueError):
+                limit = 500
+            try:
+                self.send_json(account_ledger_rows(DB_PATH, bot_key=bot_key, chat_id=chat_id, account_key=account_key, date_from=date_from, date_to=date_to, flow_type=flow_type, limit=limit))
+            except Exception as exc:
+                logger.exception("api_ledger failed")
+                self.send_json({"ok": False, "error": safe_error(exc), "rows": []}, 400)
             return
         if parsed.path == "/api/pending":
             actor_role = self.actor_role()
@@ -7828,6 +8421,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 record_endpoint_mutation(DB_PATH, "reprocess", actor=self.actor_fingerprint(), request_id=request_id, bot_key=bot_key_in, slip_id=slip_id_in, payload=payload, result_status="error", result_summary=safe_error(exc))
                 self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
             return
+        if parsed.path == "/api/slip/mark-reviewed":
+            if not self.role_or_401("admin", "operator", "auditor"):
+                return
+            slip_id_in = str(payload.get("id") or payload.get("slip_id") or "")
+            note = str(payload.get("note") or "")
+            try:
+                result = mark_slip_reviewed(DB_PATH, slip_id_in, reviewed_by=self.actor_fingerprint(), note=note)
+                record_endpoint_mutation(DB_PATH, "mark_reviewed", actor=self.actor_fingerprint(), slip_id=slip_id_in, payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("error") or ""))
+                self.send_json(result, 200 if result.get("ok") else 400)
+            except Exception as exc:
+                logger.exception("api_slip_mark_reviewed failed")
+                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+            return
         if parsed.path == "/api/bank-review/openai":
             if not self.role_or_401("admin", "operator"):
                 return
@@ -7870,6 +8476,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 logger.exception("api_bank_review_openai_all failed")
                 record_mutation(DB_PATH, "bank_review_batch", actor=self.actor_fingerprint(), payload=payload, result_status="error", result_summary=safe_error(exc))
                 self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+            return
+        if parsed.path == "/api/ledger/preview":
+            if not self.role_or_401("admin"):
+                return
+            try:
+                req_payload = dict(payload) if isinstance(payload, dict) else {}
+                if uploaded_statement_path and not req_payload.get("statement_path"):
+                    req_payload["statement_path"] = str(uploaded_statement_path)
+                statement_path = safe_statement_file_path(str(req_payload.get("statement_path") or ""))
+                if not statement_path.exists():
+                    self.send_json({"ok": False, "error": f"statement not found: {statement_path}", "dry_run": True}, 404)
+                    return
+                result = preview_bank_ledger_import(
+                    DB_PATH,
+                    statement_path,
+                    bot_key=str(req_payload.get("bot_key") or ""),
+                    company_name=str(req_payload.get("company_name") or ""),
+                    bank=str(req_payload.get("bank") or ""),
+                    account_no=str(req_payload.get("account_no") or ""),
+                    account_name=str(req_payload.get("account_name") or ""),
+                    flow_type=str(req_payload.get("flow_type") or "all"),
+                    scope=str(req_payload.get("scope") or "all"),
+                )
+                result["approval_required"] = False
+                self.send_json(result, 200 if result.get("ok") else 400)
+            except Exception as exc:
+                logger.exception("api_ledger_preview failed")
+                self.send_json({"ok": False, "error": safe_error(exc), "dry_run": True}, 400)
             return
         if parsed.path == "/api/reconcile/statement":
             if not self.role_or_401("admin"):
@@ -8098,6 +8732,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         self.send_json({"ok": False, "error": "not found"}, 404)
 
+
+
+
+def configure_bank_ledger_component() -> None:
+    bank_ledger_component.configure(
+        DB_PATH=DB_PATH,
+        clean_display=clean_display,
+        clean_company_name=clean_company_name,
+        display_bank=display_bank,
+        account_key_for=account_key_for,
+        normalize_match_date=normalize_match_date,
+        normalize_match_text=normalize_match_text,
+        normalize_flow_type=normalize_flow_type,
+        flow_label=flow_label,
+        sqlite_table_exists=sqlite_table_exists,
+        rows_to_dicts=rows_to_dicts,
+        scope_date_range=scope_date_range,
+        scope_to_date=scope_to_date,
+        connect=connect,
+        parse_statement_file=parse_statement_file,
+        filter_statement_reconcile_rows=filter_statement_reconcile_rows,
+        slip_reconcile_rows=slip_reconcile_rows,
+        amount_time_date_match=amount_time_date_match,
+        reconcile_daily_summary=reconcile_daily_summary,
+    )
+
+
+configure_bank_ledger_component()
 
 def main() -> None:
     if not DASHBOARD_TOKEN and not dashboard_owner_login_enabled():
