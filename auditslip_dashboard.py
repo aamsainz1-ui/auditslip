@@ -3550,7 +3550,7 @@ def _extract_request_id(result_summary: str) -> str:
 # ---------------------------------------------------------------------------
 
 PENDING_ACTION_TTL_HOURS = 24
-APPROVAL_REQUIRED_ACTIONS = {"slip.delete", "period.close", "account.limit", "company.account", "reconcile.run"}
+APPROVAL_REQUIRED_ACTIONS = {"slip.delete", "period.close", "account.limit", "company.account", "reconcile.run", "ledger.import"}
 _PENDING_ACTIONS_READY = False
 
 
@@ -3889,6 +3889,28 @@ def execute_pending_action(db_path: Path, pending_id: int, actor_fp: str) -> Dic
                 result = reconcile_backend_excel(db_path, excel_path, chat_id=chat_id, scope=scope, bot_key=bot_key, flow_type=flow_type)
                 mutation_action = "reconcile"
                 summary = f"diff={result.get('diff_amount')} matched={result.get('matched', {}).get('count')} missing={result.get('missing', {}).get('count')} extra={result.get('extra', {}).get('count')}"
+        elif action == "ledger.import":
+            flow_type = str(payload.get("flow_type") or "all")
+            scope = str(payload.get("scope") or "all")
+            statement_path = safe_statement_file_path(str(payload.get("statement_path") or ""))
+            mutation_action = "ledger_import"
+            if not statement_path.exists():
+                result = {"ok": False, "error": f"statement not found: {statement_path}", "status_code": 404}
+                summary = "statement not found"
+            else:
+                result = import_bank_ledger_statement(
+                    db_path,
+                    statement_path,
+                    bot_key=bot_key,
+                    company_name=str(payload.get("company_name") or ""),
+                    bank=str(payload.get("bank") or ""),
+                    account_no=str(payload.get("account_no") or ""),
+                    account_name=str(payload.get("account_name") or ""),
+                    scope=scope,
+                    flow_type=flow_type,
+                    dry_run=False,
+                )
+                summary = f"inserted={result.get('inserted', {}).get('count')} duplicates={result.get('duplicates', {}).get('count')} matched={result.get('matched', {}).get('count')} ledger_extra={result.get('ledger_extra', {}).get('count')} slip_extra={result.get('slip_extra', {}).get('count')}"
         else:
             return {"ok": False, "error": f"unsupported pending action: {action}", "pending_id": int(pending_id), "status_code": 400}
     except Exception as exc:
@@ -5952,8 +5974,8 @@ def render_dashboard_html(token: str = "") -> str:
     </section>
     <section id="section-bank-ledger" class="sections menu-section" hidden>
       <div class="card">
-        <h3>เดินบัญชีรายบัญชี <span class="pill good">preview-only</span></h3>
-        <div class="mini">อัปโหลด statement รายบัญชีเพื่อดู preview ก่อน import · match กับสลิปตามบัญชี/ยอด/เวลา/วันที่ โดยไม่สร้าง pending หรือ mutation log</div>
+        <h3>เดินบัญชีรายบัญชี <span class="pill good">preview-first</span></h3>
+        <div class="mini">อัปโหลด statement รายบัญชีเพื่อ preview ก่อน import · import จริงต้องผ่าน pending approval (ledger.import) และเก็บ audit-chain</div>
         <div class="reconcile-controls">
           <label class="reconcile-step"><span>บริษัท</span><select id="ledgerCompanyFilter" title="เลือกบริษัทของ ledger"></select></label>
           <label class="reconcile-step"><span>ฝาก/ถอน</span><select id="ledgerFlowFilter" title="เลือกทิศทาง statement"><option value="deposit">ฝาก/เงินเข้า</option><option value="withdraw">ถอน/เงินออก</option><option value="all">ทุกทิศทาง</option></select></label>
@@ -5963,7 +5985,7 @@ def render_dashboard_html(token: str = "") -> str:
           <label class="reconcile-step"><span>ชื่อบัญชี</span><input id="statementAccountName" placeholder="ชื่อบัญชี" /></label>
           <label class="reconcile-step reconcile-upload"><span>statement Excel/CSV</span><input id="ledgerStatementFile" type="file" accept=".xlsx,.xlsm,.csv" /></label>
           <label class="reconcile-step reconcile-upload" data-admin-only="true"><span>หรือ path บน server</span><input id="ledgerStatementPath" placeholder="statement_path" /></label>
-          <div class="reconcile-actions"><button onclick="runBankLedgerPreview()">Preview เดินบัญชีรายบัญชี</button></div>
+          <div class="reconcile-actions"><button onclick="runBankLedgerPreview()">Preview เดินบัญชีรายบัญชี</button><button data-admin-only="true" onclick="requestBankLedgerImport()">ขอ Import หลัง approval</button></div>
         </div>
         <div id="bankLedgerSummary" style="margin-top:12px"></div>
       </div>
@@ -6912,6 +6934,51 @@ async function runBankLedgerPreview() {{
   }}
   const data = await res.json();
   box.innerHTML = bankLedgerPreviewSummary(data);
+  enhanceResponsiveTables(box);
+}}
+async function requestBankLedgerImport() {{
+  const ok = await dashboardConfirm('ขอ Import หลัง approval?', 'ระบบจะสร้าง pending action ledger.import ก่อนเขียนรายการเดินบัญชีเข้า ledger จริง');
+  if (!ok) return;
+  const bot = document.getElementById('ledgerCompanyFilter').value || selectedBotKey() || '__all__';
+  const flow = document.getElementById('ledgerFlowFilter').value || document.getElementById('flowFilter').value || 'all';
+  const scope = document.getElementById('ledgerDateScope').value || selectedDashboardScope();
+  const bank = document.getElementById('statementBank').value || '';
+  const account_no = document.getElementById('statementAccountNo').value || '';
+  const account_name = document.getElementById('statementAccountName').value || '';
+  const statement_path = document.getElementById('ledgerStatementPath').value || '';
+  const statementFile = document.getElementById('ledgerStatementFile').files[0];
+  const box = document.getElementById('bankLedgerSummary');
+  if (!account_no) {{ await dashboardNotify('ใส่เลขบัญชีก่อนขอ import'); return; }}
+  if (!statementFile && !statement_path) {{ await dashboardNotify('อัปโหลด statement หรือใส่ path statement ก่อน'); return; }}
+  box.innerHTML = '<div class="muted">กำลังสร้างคำขอ import ledger...</div>';
+  let res;
+  if (statementFile) {{
+    const form = new FormData();
+    form.append('bot_key', bot);
+    form.append('flow_type', flow);
+    form.append('scope', scope);
+    form.append('bank', bank);
+    form.append('account_no', account_no);
+    form.append('account_name', account_name);
+    if (statement_path) form.append('statement_path', statement_path);
+    form.append('statement', statementFile);
+    res = await fetch('/api/ledger/import'+query(), {{method:'POST', headers:ACTION_HEADER, body: form}});
+  }} else {{
+    res = await fetch('/api/ledger/import'+query(), {{method:'POST', headers:postHeaders(), body: JSON.stringify({{bot_key:bot, flow_type:flow, scope, bank, account_no, account_name, statement_path}})}});
+  }}
+  const data = await res.json();
+  if (!res.ok || !data.ok) {{
+    box.innerHTML = '<div class="bad">'+esc(data.error || 'สร้างคำขอ import ไม่สำเร็จ')+'</div>';
+    await dashboardNotify(data.error || 'สร้างคำขอ import ไม่สำเร็จ');
+    return;
+  }}
+  if (data.status === 'executed') {{
+    box.innerHTML = '<div class="good"><b>Import สำเร็จ</b></div><div class="mini">inserted '+esc((data.inserted||{{}}).count||0)+' · duplicates '+esc((data.duplicates||{{}}).count||0)+' · action '+esc(data.action||'ledger.import')+'</div>';
+  }} else {{
+    box.innerHTML = '<div class="warn"><b>สร้างคำขอ import แล้ว</b></div><div class="mini">pending_id '+esc(data.pending_id)+' · action '+esc(data.action||'ledger.import')+' · ไปที่เมนูรออนุมัติเพื่อ approve/execute</div>';
+  }}
+  await refreshPendingBadge();
+  await loadPendingActions({{scrollTop:false}});
   enhanceResponsiveTables(box);
 }}
 function reconcileScopeValue() {{
@@ -8476,6 +8543,59 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 logger.exception("api_bank_review_openai_all failed")
                 record_mutation(DB_PATH, "bank_review_batch", actor=self.actor_fingerprint(), payload=payload, result_status="error", result_summary=safe_error(exc))
                 self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+            return
+        if parsed.path == "/api/ledger/import":
+            if not self.role_or_401("admin"):
+                return
+            actor_fp = self.actor_fingerprint()
+            approval_mode = self.parse_approval_param()
+            if approval_mode == "request":
+                req_payload = dict(payload) if isinstance(payload, dict) else {}
+                if uploaded_statement_path and not req_payload.get("statement_path"):
+                    req_payload["statement_path"] = str(uploaded_statement_path)
+                statement_path = safe_statement_file_path(str(req_payload.get("statement_path") or ""))
+                if not statement_path.exists():
+                    self.send_json({"ok": False, "error": f"statement not found: {statement_path}"}, 404)
+                    return
+                request_id = uuid.uuid4().hex[:12]
+                pending_id = create_pending_action(
+                    DB_PATH,
+                    action="ledger.import",
+                    payload=req_payload,
+                    requested_by=actor_fp,
+                    request_id=request_id,
+                )
+                record_endpoint_mutation(
+                    DB_PATH,
+                    "ledger_import.request",
+                    actor=actor_fp,
+                    request_id=request_id,
+                    bot_key=str(req_payload.get("bot_key") or ""),
+                    payload=req_payload,
+                    result_status="pending",
+                    result_summary=f"pending_id={pending_id}",
+                )
+                auto_result = simple_auto_execute_pending(DB_PATH, pending_id, actor_fp, self.actor_role())
+                if auto_result:
+                    status_code = int(auto_result.pop("status_code", 200)) if not auto_result.get("ok") else 200
+                    self.send_json(auto_result, status_code)
+                    return
+                self.send_json({"ok": True, "status": "pending", "pending_id": pending_id, "request_id": request_id, "expires_in_hours": PENDING_ACTION_TTL_HOURS, "action": "ledger.import"})
+                return
+            try:
+                pending_id_executed = int(payload.get("pending_id") or 0)
+            except (TypeError, ValueError):
+                pending_id_executed = 0
+            if not pending_id_executed:
+                self.send_json({"ok": False, "error": "pending_id required for execute"}, 400)
+                return
+            row = load_pending_action(DB_PATH, pending_id_executed)
+            if not row or row.get("action") != "ledger.import":
+                self.send_json({"ok": False, "error": "pending action not found"}, 404)
+                return
+            result = execute_pending_action(DB_PATH, pending_id_executed, actor_fp)
+            status_code = int(result.pop("status_code", 200)) if not result.get("ok") else 200
+            self.send_json(result, status_code)
             return
         if parsed.path == "/api/ledger/preview":
             if not self.role_or_401("admin"):
