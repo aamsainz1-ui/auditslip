@@ -2616,6 +2616,7 @@ def duplicate_pair_rows(conn: sqlite3.Connection, chat_id: str, scope: str = "op
                d.file_id AS duplicate_file_id,
                d.message_id AS duplicate_message_id,
                d.sender_name AS duplicate_sender_name,
+               d.username AS duplicate_username,
                d.reference_no AS reference_no,
                d.seq AS seq,
                d.aid AS aid,
@@ -2638,6 +2639,7 @@ def duplicate_pair_rows(conn: sqlite3.Connection, chat_id: str, scope: str = "op
                o.file_id AS original_file_id,
                o.message_id AS original_message_id,
                o.sender_name AS original_sender_name,
+               o.username AS original_username,
                o.reference_no AS original_reference_no,
                o.seq AS original_seq,
                o.aid AS original_aid,
@@ -6694,8 +6696,10 @@ async function reprocessAllIssues(btn) {{
   if (status) status.textContent = 'รี OCR Issues เสร็จ: สำเร็จ '+ok+' / fail '+fail;
   await load();
 }}
-function duplicateContextLine(prefix, company, bot, chatTitle, flowLabel) {{
-  return '<div class="mini dupe-meta"><b>'+esc(prefix)+'</b> · บริษัท/Bot '+esc(company || bot || '-')+' ('+esc(bot || '-')+') · กลุ่ม Telegram '+esc(chatTitle || '-')+' · '+esc(flowLabel || '-').replace('กลุ่ม','กลุ่ม')+'</div>';
+function duplicateContextLine(prefix, company, bot, chatTitle, flowLabel, senderName, username) {{
+  const sender = senderName || (username ? '@'+username : '');
+  const senderPart = sender ? ' · ชื่อผู้ส่ง '+esc(sender) : '';
+  return '<div class="mini dupe-meta"><b>'+esc(prefix)+'</b> · บริษัท/Bot '+esc(company || bot || '-')+' ('+esc(bot || '-')+') · กลุ่ม Telegram '+esc(chatTitle || '-')+senderPart+' · '+esc(flowLabel || '-').replace('กลุ่ม','กลุ่ม')+'</div>';
 }}
 function renderDuplicatePairs(rows) {{
   if (!rows || !rows.length) return '<div class="muted">ยังไม่พบสลิปซ้ำในช่วงนี้</div>';
@@ -6711,8 +6715,8 @@ function renderDuplicatePairs(rows) {{
     return '<div class="slip-card dupe-card">'
       + '<div class="dupe-thumbs">'+dupImg+origImg+'</div>'
       + '<div class="slip-body"><div class="top"><b>สลิปซ้ำ</b><span class="pill">ซ้ำกับใบต้นฉบับ</span></div>'
-      + duplicateContextLine('ใบซ้ำ', r.duplicate_company_name, r.duplicate_bot_key, r.duplicate_chat_title, r.duplicate_flow_label || flowName(r.duplicate_flow_type))
-      + duplicateContextLine('ต้นฉบับ', r.original_company_name, r.original_bot_key, r.original_chat_title, r.original_flow_label || flowName(r.original_flow_type))
+      + duplicateContextLine('ใบซ้ำ', r.duplicate_company_name, r.duplicate_bot_key, r.duplicate_chat_title, r.duplicate_flow_label || flowName(r.duplicate_flow_type), r.duplicate_sender_name, r.duplicate_username)
+      + duplicateContextLine('ต้นฉบับ', r.original_company_name, r.original_bot_key, r.original_chat_title, r.original_flow_label || flowName(r.original_flow_type), r.original_sender_name, r.original_username)
       + '<div class="mini dupe-submitted"><b>เวลาส่งเข้ามา</b>: ต้นฉบับ '+esc(originalSubmitted)+' · ใบซ้ำ '+esc(duplicateSubmitted)+'</div>'
       + '<div><b>ข้อมูลใบซ้ำ</b>: '+esc((r.slip_date_display || r.slip_date_iso || '')+' '+(r.slip_time || ''))+' · '+esc(r.transferor_name || '(ไม่ทราบผู้โอน)')+' → '+esc(r.recipient_name || '-')+'</div>'
       + '<div class="mini">'+esc(banks)+' · ref '+esc(ref)+' · msg '+esc(r.duplicate_message_id || '-')+'</div>'

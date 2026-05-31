@@ -72,9 +72,12 @@ bot.save_slip({
     "amount": 25.0,
 })
 
-# Duplicate pair in a deposit/manual-topup group; the card must show both company/bot and Telegram group context.
+# Duplicate pair in a deposit/manual-topup group; the card must show company/bot, Telegram group,
+# and the Telegram sender/uploader name for both original and duplicate sides.
 bot.save_slip({
     **base,
+    "sender_name": "คนส่งต้นฉบับ",
+    "username": "orig_operator",
     "id": "ORIG-DUP-META",
     "chat_id": "CHAT_DEP",
     "chat_title": "666 สลิป (เติมมือ)",
@@ -90,6 +93,8 @@ bot.save_slip({
 })
 bot.save_slip({
     **base,
+    "sender_name": "คนส่งใบซ้ำ",
+    "username": "dup_operator",
     "id": "DUP-META",
     "chat_id": "CHAT_DEP",
     "chat_title": "666 สลิป (เติมมือ)",
@@ -130,10 +135,12 @@ assert pair["duplicate_bot_key"] == "bot6", pair
 assert pair["duplicate_company_name"] == "บริษัท 6", pair
 assert pair["duplicate_chat_title"] == "666 สลิป (เติมมือ)", pair
 assert pair["duplicate_flow_type"] == "deposit", pair
+assert pair["duplicate_sender_name"] == "คนส่งใบซ้ำ", pair
 assert pair["original_bot_key"] == "bot6", pair
 assert pair["original_company_name"] == "บริษัท 6", pair
 assert pair["original_chat_title"] == "666 สลิป (เติมมือ)", pair
 assert pair["original_flow_type"] == "deposit", pair
+assert pair["original_sender_name"] == "คนส่งต้นฉบับ", pair
 
 html = Dash.render_dashboard_html("test-token")
 for marker in [
@@ -145,6 +152,9 @@ for marker in [
     "pickLimit(r.limit_key || '', r.display_name || r.name || '', r.bank || '', r.account || '', Number((r.limit_amount ?? r.daily_limit) || 0), r.bot_key || '')",
     "'bot:' + bot",
     "duplicateContextLine",
+    "duplicate_sender_name",
+    "original_sender_name",
+    "ชื่อผู้ส่ง",
     "บริษัท/Bot",
     "กลุ่ม Telegram",
 ]:

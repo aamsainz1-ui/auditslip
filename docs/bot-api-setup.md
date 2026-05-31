@@ -14,7 +14,7 @@ Flow หลักของระบบ:
 4. Bot ส่งรูปให้ OCR provider ตาม `OCR_PROVIDERS` เช่น Gemini ก่อน แล้ว fallback OpenAI
 5. ผล OCR ถูก normalize แล้วบันทึกลง SQLite (`data/auditslip.db`) พร้อม duplicate/evidence metadata
 6. Dashboard service เปิด UI + JSON API ที่พอร์ต `AUDITSLIP_DASHBOARD_PORT` เช่น `8095`
-7. Operator ใช้ dashboard เพื่อดูยอด, export Excel/ZIP, reconcile, preview/import bank statement ledger, ตั้งค่า account/company, approve pending actions
+7. Operator ใช้ dashboard เพื่อดูยอด, export Excel/ZIP, reconcile, preview/import bank statement ledger, ตั้งค่าวงเงินรายบัญชีแบบบันทึกตรง, ตั้งค่า company account, approve pending actions สำหรับงานเสี่ยง
 8. Watchdog/backup timers ตรวจ health/queue และ backup DB ตามรอบ
 
 ส่วน external API ที่เกี่ยวข้อง:
@@ -449,9 +449,11 @@ curl -s "http://127.0.0.1:8095/api/export/preview?bot_key=bot1&flow_type=withdra
 - `POST /api/bank-review/openai-all`
   - admin
   - payload/query: `bot_key`, `chat_id`, `scope`, `flow_type`, `slip_search`, `apply`
-- `POST /api/account-limit?approval=request|execute`
+- `POST /api/account-limit`
   - admin
-  - ตั้ง daily/account limit ผ่าน pending action
+  - ตั้ง daily/account limit แบบบันทึกตรง ไม่ต้อง pending approval
+  - payload: `chat_id` หรือ `bot:<bot_key>`, `limit_key`, `display_name`, `bank`, `account`, `limit_amount`
+  - legacy: `approval=execute` ยังรองรับ pending `account.limit` เก่าที่ approved แล้ว
 - `POST /api/company-account?approval=request|execute`
   - admin
   - ตั้งบัญชีบริษัท/บัญชีปลายทาง/วงเงิน

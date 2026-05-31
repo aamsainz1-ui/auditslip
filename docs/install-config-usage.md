@@ -6,6 +6,8 @@
 
 ถ้าต้องการขั้นตอนเฉพาะเรื่อง “สร้างบอท → ใส่บอทเข้ากลุ่ม → เชื่อม API ทุกส่วน” ให้ใช้ [`docs/bot-api-setup.md`](bot-api-setup.md)
 
+ถ้าต้องการประเมินว่า audit ยอดพนักงานมีอะไรแล้ว/ยังขาดอะไร ให้ใช้ [`docs/employee-audit-guide.md`](employee-audit-guide.md)
+
 ห้ามใส่ token หรือ production secret จริงใน git ให้เก็บค่าจริงเฉพาะใน `/etc/auditslip/auditslip.env` บน server เท่านั้น
 
 ## 1. What Auditslip does
@@ -37,6 +39,22 @@ Default production layout:
 - Backup timer: `auditslip-backup.timer`
 
 ## 3. Fresh install on Ubuntu/VPS
+
+### 3.0 One-command installer
+
+สำหรับเครื่องใหม่ แนะนำใช้ตัวติดตั้งตัวเดียวจบ:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/aamsainz1-ui/auditslip/main/install.sh | sudo bash
+```
+
+สคริปต์จะถามค่า Telegram/OCR/dashboard ทีละ step, สร้าง env จริงที่ `/etc/auditslip/auditslip.env`, ติดตั้ง systemd, run validation และ start service เมื่อค่าจำเป็นครบ
+
+โหมดติดตั้งไฟล์ก่อนแต่ไม่ start service:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/aamsainz1-ui/auditslip/main/install.sh | sudo bash -s -- --no-start
+```
 
 ### 3.1 Install OS packages
 
@@ -350,7 +368,19 @@ Safe workflow:
 
 Production smoke rule: never execute a real import just to test production. Use a tiny temporary statement fixture, verify preview/dry-run and missing-file rejection, then delete the fixture.
 
-## 8. Operations commands
+## 8. Employee/staff audit
+
+Auditslip มี endpoint audit พนักงาน/คนทำรายการเบื้องต้นแล้ว:
+
+```text
+GET /api/audit/daily-variance
+GET /api/audit/reconcile
+GET /api/audit/cross-dup
+```
+
+รายละเอียดและ gap ที่ควรเพิ่มอยู่ใน [`docs/employee-audit-guide.md`](employee-audit-guide.md)
+
+## 9. Operations commands
 
 ### Service status
 
@@ -415,7 +445,7 @@ Expected result:
 RESULT: OK
 ```
 
-## 9. Development and test workflow
+## 10. Development and test workflow
 
 Before editing production code:
 

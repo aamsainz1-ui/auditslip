@@ -272,7 +272,8 @@ curl -fsS 'http://127.0.0.1:8095/api/health?quick=1'
 4. เลือก scope: วันนี้, วันที่, ช่วงวันที่, open, all
 5. ตรวจยอดรวม, รายการล่าสุด, duplicate, queue, review
 6. ใช้ export/reconcile/ledger หลังตรวจ scope ถูกแล้ว
-7. งานเสี่ยงให้ใช้ pending approval ไม่กด execute สุ่ม
+7. ตั้งวงเงินรายบัญชีบันทึกตรง ไม่ต้อง approval
+8. งานเสี่ยงให้ใช้ pending approval ไม่กด execute สุ่ม
 
 ## 15. Export, reconcile, ledger
 
@@ -292,6 +293,7 @@ GET  /api/export/preview
 GET  /api/export
 POST /api/reconcile/preview
 POST /api/ledger/preview
+POST /api/account-limit              # ตั้งวงเงินรายบัญชี บันทึกตรง ไม่ต้อง approval
 POST /api/ledger/import?approval=request
 POST /api/pending/approve
 ```

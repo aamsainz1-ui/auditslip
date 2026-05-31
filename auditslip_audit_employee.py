@@ -352,43 +352,54 @@ def employee_daily_variance(
 # Phase 1: Reconcile slips ↔ bank_ledger per account
 # ---------------------------------------------------------------------------
 
-def _score_match(slip: Dict[str, Any], entry: Dict[str, Any]) -> int:
-    """Score how well a slip matches a bank_ledger_entry (higher = better)."""
-    score = 0
-    if abs(_float(slip.get("amount")) - _float(entry.get("amount"))) > 0.009:
-        return -1  # amount must match
+def _parse_hhmm(t: str) -> Optional[int]:
+    """Return minutes-since-midnight from 'HH:MM' or 'HH:MM:SS'. None if invalid."""
+    t = _clean(t)
+    if not t:
+        return None
+    parts = t.split(":")
+    if len(parts) < 2:
+        return None
+    try:
+        h = int(parts[0])
+        m = int(parts[1])
+    except (TypeError, ValueError):
+        return None
+    if not (0 <= h < 24 and 0 <= m < 60):
+        return None
+    return h * 60 + m
 
-    # date match
+
+def _score_match(slip: Dict[str, Any], entry: Dict[str, Any], time_tol_min: int = 5) -> int:
+    """Simple matcher: amount + date must match exactly; time within tolerance.
+
+    Returns score >= 1 if matched, -1 if not.
+    Ignores names, references, descriptions completely (per user request).
+    """
+    # 1. Amount must match (within rounding)
+    if abs(_float(slip.get("amount")) - _float(entry.get("amount"))) > 0.009:
+        return -1
+
+    # 2. Date must match exactly (both present)
     slip_date = _clean(slip.get("slip_date_iso") or slip.get("date_key"))
     entry_date = _clean(entry.get("date_key") or entry.get("date"))
     if slip_date and entry_date:
-        if slip_date == entry_date:
-            score += 30
-        else:
-            return -1  # date mismatch disqualifies
+        if slip_date != entry_date:
+            return -1
+    else:
+        # if either side missing date, allow but lower score
+        return 1
 
-    # reference match
-    slip_ref = _clean(slip.get("reference_no") or slip.get("seq") or slip.get("aid")).lower()
-    entry_ref = _clean(entry.get("reference") or "").lower()
-    if slip_ref and entry_ref:
-        if slip_ref == entry_ref:
-            score += 50
-        elif slip_ref in entry_ref or entry_ref in slip_ref:
-            score += 20
-
-    # time match
-    slip_time = _clean(slip.get("slip_time") or "")
-    entry_time = _clean(entry.get("time") or "")
-    if slip_time and entry_time and slip_time[:5] == entry_time[:5]:
-        score += 15
-
-    # name / description match
-    slip_name = _clean(slip.get("transferor_name") or slip.get("sender_name") or "").lower()
-    entry_desc = _clean(entry.get("description") or entry.get("sender") or "").lower()
-    if slip_name and entry_desc and (slip_name in entry_desc or entry_desc in slip_name):
-        score += 10
-
-    return max(score, 1)  # matched (at minimum amount ok)
+    # 3. Time check (within tolerance)
+    slip_min = _parse_hhmm(slip.get("slip_time") or "")
+    entry_min = _parse_hhmm(entry.get("time") or "")
+    if slip_min is not None and entry_min is not None:
+        diff = abs(slip_min - entry_min)
+        if diff > time_tol_min:
+            return -1
+        return 100 - diff  # closer time = higher score
+    # if one side missing time, accept on amount+date only
+    return 50
 
 
 def reconcile_slips_ledger(
