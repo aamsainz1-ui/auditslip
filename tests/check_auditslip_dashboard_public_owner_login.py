@@ -122,6 +122,32 @@ with Dash.connect(Path(os.environ["AUDITSLIP_DB"])) as conn:
     blank_rows = conn.execute("SELECT COUNT(*) AS c FROM account_limits WHERE chat_id='' OR limit_key='' OR account='' ").fetchone()
 assert int(blank_rows["c"] if blank_rows else 0) == 0
 
+# Account-limit settings are direct operational saves, not pending approvals.
+valid_limit = request(
+    "POST",
+    "/api/account-limit?approval=request",
+    cookie=session_cookie,
+    payload={
+        "chat_id": "bot:bot6",
+        "limit_key": "scb|x0522",
+        "display_name": "บัญชีถอน",
+        "bank": "SCB",
+        "account": "xxx-xxx052-2",
+        "limit_amount": 123456,
+    },
+)
+assert valid_limit._status_code == int(HTTPStatus.OK), (valid_limit._status_code, valid_limit.wfile.getvalue())
+valid_data = valid_limit.json_body()
+assert valid_data.get("ok") is True and valid_data.get("status") == "saved", valid_data
+assert "pending_id" not in valid_data, valid_data
+with Dash.connect(Path(os.environ["AUDITSLIP_DB"])) as conn:
+    saved = conn.execute("SELECT limit_amount FROM account_limits WHERE chat_id=? AND limit_key=?", ("bot:bot6", "scb|x0522")).fetchone()
+Dash.ensure_pending_actions_table(Path(os.environ["AUDITSLIP_DB"]))
+with Dash.connect(Path(os.environ["AUDITSLIP_DB"])) as conn:
+    pending_count = conn.execute("SELECT COUNT(*) AS c FROM pending_actions WHERE action='account.limit'").fetchone()
+assert saved and float(saved["limit_amount"]) == 123456.0, saved
+assert int(pending_count["c"] if pending_count else 0) == 0
+
 # Rendered dashboard exposes the no-token owner-login UI.
 html = Dash.render_dashboard_html("legacy-admin-token")
 for marker in ["adminUsername", "adminPassword", "/api/login", "เข้าสู่ระบบ Admin"]:

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Guard: two-person approval workflow extends to account.limit, company.account, reconcile.run.
+"""Guard: two-person approval workflow covers company.account and reconcile.run.
 
-For each of the three new approval actions:
+Account-limit changes are operational settings and should save directly from the
+UI/API without creating pending approvals. High-risk actions still use pending.
+For each pending action in this test:
   - create_pending_action stores the row with status='pending'
   - self-approval (requester == approver) is blocked
   - second actor approval flips status to 'approved'
@@ -46,8 +48,8 @@ dash_spec.loader.exec_module(Dash)
 actor_a = "fpAAAAAAAAAA"
 actor_b = "fpBBBBBBBBBB"
 
-# Sanity: APPROVAL_REQUIRED_ACTIONS now covers the new dotted action names.
-assert "account.limit" in Dash.APPROVAL_REQUIRED_ACTIONS, Dash.APPROVAL_REQUIRED_ACTIONS
+# Sanity: account.limit is direct-save, while high-risk dotted action names still require approval.
+assert "account.limit" not in Dash.APPROVAL_REQUIRED_ACTIONS, Dash.APPROVAL_REQUIRED_ACTIONS
 assert "company.account" in Dash.APPROVAL_REQUIRED_ACTIONS, Dash.APPROVAL_REQUIRED_ACTIONS
 assert "reconcile.run" in Dash.APPROVAL_REQUIRED_ACTIONS, Dash.APPROVAL_REQUIRED_ACTIONS
 # Old approval actions still present.
@@ -94,18 +96,6 @@ def assert_full_approval_cycle(action: str, payload: dict) -> None:
 
 
 assert_full_approval_cycle(
-    "account.limit",
-    {
-        "chat_id": "CHAT_A",
-        "limit_key": "lim-key-1",
-        "display_name": "Alpha Account",
-        "bank": "SCB",
-        "account": "1234567890",
-        "limit_amount": 50000,
-    },
-)
-
-assert_full_approval_cycle(
     "company.account",
     {
         "bot_key": "bot3",
@@ -129,4 +119,4 @@ assert_full_approval_cycle(
     },
 )
 
-print("ok: approval workflow extended to account.limit/company.account/reconcile.run")
+print("ok: approval workflow covers company.account/reconcile.run and excludes direct account limits")

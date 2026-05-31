@@ -199,7 +199,7 @@ for key in ordered_keys:
 html = Dash.render_dashboard_html("test-token")
 for marker in ["byAccountDay", "วงเงินรายวันต่อบัญชี", "ยอดวันนี้", "วงเงิน/วัน", "dailyAccountLimitTable", "ตั้งวงเงินจากยอดรายวัน", "เหลือ/เกินวันนี้"]:
     assert marker in html, marker
-for forbidden in ["ยอดวันนั้น", "เหลือ/เกินวันนั้น", "วันนั้น", "ยอดรวมช่วง", "เหลือ/เกินจากยอดรวม"]:
+for forbidden in ["ยอดวันนั้น", "เหลือ/เกินวันนั้น", "วันนั้น", "ยอดรวมช่วง", "เหลือ/เกินจากยอดรวม", "ส่งคำขอตั้งวงเงิน", "api/account-limit'+query({{approval:'request'}})"]:
     assert forbidden not in html, forbidden
 
 print("ok: daily account limits reset by date and account")

@@ -54,6 +54,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import auditslip_bank_ledger as bank_ledger_component
+import auditslip_audit_employee as audit_employee_component
 
 from auditslip_bot import (
     APP_NAME,
@@ -3597,7 +3598,7 @@ def _extract_request_id(result_summary: str) -> str:
 # ---------------------------------------------------------------------------
 
 PENDING_ACTION_TTL_HOURS = 24
-APPROVAL_REQUIRED_ACTIONS = {"slip.delete", "period.close", "account.limit", "company.account", "reconcile.run", "ledger.import"}
+APPROVAL_REQUIRED_ACTIONS = {"slip.delete", "period.close", "company.account", "reconcile.run", "ledger.import"}
 _PENDING_ACTIONS_READY = False
 
 
@@ -5917,6 +5918,7 @@ def render_dashboard_html(token: str = "") -> str:
           <div class="side-heading" style="margin-top:14px"><span>ตรวจเงิน</span><small>ledger · ธนาคาร · กระทบยอด</small></div>
           <div class="side-nav">
             <button class="side-menu-item" type="button" data-menu-target="section-account-ledger" onclick="showMenuSection('section-account-ledger')"><span class="side-menu-icon">≡</span><span class="side-menu-text"><span class="side-menu-title">เดินบัญชีรายบัญชี</span><span class="side-menu-desc">timeline + running balance</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-employee-audit" onclick="showMenuSection('section-employee-audit')"><span class="side-menu-icon">◫</span><span class="side-menu-text"><span class="side-menu-title">ออดิตพนักงาน</span><span class="side-menu-desc">1 เทียบ ledger · 2 รายวัน · 3 ซ้ำข้ามบริษัท</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-bank-ledger" onclick="showMenuSection('section-bank-ledger')"><span class="side-menu-icon">▤</span><span class="side-menu-text"><span class="side-menu-title">Preview Statement</span><span class="side-menu-desc">อัปโหลด statement เทียบสลิป</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-banks" onclick="showMenuSection('section-banks')"><span class="side-menu-icon">⇄</span><span class="side-menu-text"><span class="side-menu-title">ยอดธนาคาร</span><span class="side-menu-desc">ยอดแยกต้นทาง/ปลายทาง</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-reconcile" onclick="showMenuSection('section-reconcile')"><span class="side-menu-icon">✓</span><span class="side-menu-text"><span class="side-menu-title">กระทบยอด Statement</span><span class="side-menu-desc">หลังบ้าน vs สลิป</span></span></button>
@@ -6040,6 +6042,23 @@ def render_dashboard_html(token: str = "") -> str:
           <div class="reconcile-actions"><button onclick="runBankLedgerPreview()">Preview เดินบัญชีรายบัญชี</button><button data-admin-only="true" onclick="requestBankLedgerImport()">ขอ Import หลัง approval</button></div>
         </div>
         <div id="bankLedgerSummary" style="margin-top:12px"></div>
+      </div>
+    </section>
+
+    <section id="section-employee-audit" class="sections menu-section" hidden>
+      <div class="card">
+        <h3>ออดิตยอดพนักงาน</h3>
+        <div class="mini">ใช้ตัวกรองบริษัท/กลุ่ม/ฝากถอน/วันที่ด้านซ้ายร่วมกัน · ข้อ 1 เทียบสลิปกับ ledger, ข้อ 2 สรุปยอดรายวันต่อพนักงาน, ข้อ 3 จับสลิปซ้ำข้ามบอทหรือบริษัท</div>
+        <div class="reconcile-controls">
+          <label class="reconcile-step"><span>เลขบัญชี/Account key สำหรับข้อ 1</span><input id="auditAccountKey" placeholder="เว้นว่างเพื่อดูทั้ง scope" /></label>
+          <label class="reconcile-step"><span>Threshold variance</span><input id="auditVarianceThreshold" type="number" step="0.01" value="100" /></label>
+          <div class="reconcile-actions"><button onclick="runEmployeeAudit()">โหลดออดิต 1-2-3</button></div>
+        </div>
+        <div id="employeeAuditSummary" style="margin-top:12px"><div class="muted">กดโหลดออดิตเพื่อเริ่มตรวจ</div></div>
+      </div>
+      <div class="card">
+        <h3>ผลลัพธ์ออดิต</h3>
+        <div id="employeeAuditDetails"><div class="muted">ยังไม่มีข้อมูล</div></div>
       </div>
     </section>
 
@@ -6847,11 +6866,10 @@ async function saveAccountLimit() {{
   const payload = {{chat_id: scopeKey, limit_key: document.getElementById('limitKey').value, display_name: document.getElementById('limitName').value, bank: document.getElementById('limitBank').value, account: document.getElementById('limitAccount').value, limit_amount: Number(document.getElementById('limitAmount').value || 0)}};
   if (!payload.chat_id) return await dashboardNotify('เลือกบริษัทหรือกลุ่มก่อนตั้งวงเงิน');
   if (!payload.limit_key) return await dashboardNotify('เลือกบัญชีจากปุ่มตั้งวงเงินก่อน');
-  const res = await fetch('/api/account-limit'+query({{approval:'request'}}), {{method:'POST', headers:postHeaders(), body: JSON.stringify(payload)}});
+  const res = await fetch('/api/account-limit'+query(), {{method:'POST', headers:postHeaders(), body: JSON.stringify(payload)}});
   const data = await res.json();
   if (!res.ok || !data.ok) return await dashboardNotify(data.error || 'บันทึกไม่สำเร็จ');
-  if (data.status === 'pending') await dashboardNotify('ส่งคำขอตั้งวงเงินแล้ว · รออนุมัติ #' + (data.pending_id || '-'));
-  else await dashboardNotify('บันทึกวงเงินแล้ว');
+  await dashboardNotify('บันทึกวงเงินแล้ว');
   await load({{scrollTarget:'byTransferor', smooth:false}});
 }}
 function renderTelegramBots(rows) {{
@@ -7149,6 +7167,81 @@ async function runStatementReconcile() {{
   const data = await res.json();
   box.innerHTML = statementReconcileSummary(data);
   enhanceResponsiveTables(box);
+}}
+function employeeAuditParams() {{
+  const parts = selectedChatParts();
+  const bot = selectedBotKey() || parts.bot_key || '__all__';
+  const flow = document.getElementById('flowFilter').value || parts.flow_type || 'all';
+  const scope = (currentSnapshot && currentSnapshot.scope) || selectedDashboardScope();
+  const chat = (parts.bot_key === bot && (flow === 'all' || parts.flow_type === flow)) ? (parts.chat_id || '') : '';
+  const account = (document.getElementById('auditAccountKey') || {{}}).value || '';
+  const threshold = (document.getElementById('auditVarianceThreshold') || {{}}).value || '100';
+  return {{bot_key:bot, chat_id:chat, flow_type:flow, scope, account_key:account, threshold}};
+}}
+function renderEmployeeAuditSummary(reconcile, variance, crossDup) {{
+  const rec = (reconcile && reconcile.summary) || {{}};
+  const hasLedger = reconcile && reconcile.has_ledger;
+  const scope = (reconcile && reconcile.scope) || {{}};
+  const cards = [
+    '<div class="operator-stat"><div class="label">1 สลิปไม่เจอ ledger</div><div class="value '+(Number(rec.slip_only_count||0) ? 'warn' : 'good')+'">'+esc(rec.slip_only_count || 0)+'</div><div class="mini">'+money(rec.slip_only_amount || 0)+'</div></div>',
+    '<div class="operator-stat"><div class="label">1 ledger ไม่เจอสลิป</div><div class="value '+(Number(rec.ledger_only_count||0) ? 'warn' : 'good')+'">'+esc(rec.ledger_only_count || 0)+'</div><div class="mini">'+money(rec.ledger_only_amount || 0)+'</div></div>',
+    '<div class="operator-stat"><div class="label">2 วันพนักงานที่ flagged</div><div class="value '+(Number((variance||{{}}).flagged_count||0) ? 'warn' : 'good')+'">'+esc((variance||{{}}).flagged_count || 0)+'</div><div class="mini">พนักงาน '+esc((variance||{{}}).employee_count || 0)+'</div></div>',
+    '<div class="operator-stat"><div class="label">3 กลุ่มซ้ำข้ามบริษัท</div><div class="value '+(Number((crossDup||{{}}).group_count||0) ? 'bad' : 'good')+'">'+esc((crossDup||{{}}).group_count || 0)+'</div><div class="mini">ยอดเสี่ยง '+money((crossDup||{{}}).total_suspicious_amount || 0)+'</div></div>'
+  ].join('');
+  const note = hasLedger ? 'มี ledger สำหรับเทียบ' : 'ยังไม่มีตาราง ledger/import statement ใน scope นี้ ข้อ 1 จะแสดงสลิปเป็นหลัก';
+  return '<div class="operator-home-grid">'+cards+'</div><div class="mini">บริษัท '+esc(scope.bot_key || '-')+' · กลุ่ม '+esc(scope.flow_type || '-')+' · scope '+esc(scope.scope || '-')+' · '+esc(note)+'</div>';
+}}
+function renderEmployeeVariance(data) {{
+  if (!data || !data.ok) return '<div class="bad">'+esc((data && data.error) || 'โหลด variance ไม่สำเร็จ')+'</div>';
+  const employees = (data.employees || []).slice(0,80);
+  const rows = (data.rows || []).slice(0,120);
+  const employeeTable = table(employees, [['พนักงาน','employee'], ['สลิป','total_slips'], ['ยอดรวม', r => money(r.total_amount)], ['วันที่ flagged','flagged_days']]);
+  const rowTable = table(rows, [['วันที่','date'], ['พนักงาน','employee'], ['บริษัท','company_name'], ['สลิป','slip_count'], ['ยอดสลิป', r => money(r.slip_total)], ['ยอด ledger วันที่เดียวกัน', r => r.ledger_total === null || r.ledger_total === undefined ? '-' : money(r.ledger_total)], ['variance', r => r.variance === null || r.variance === undefined ? '-' : money(r.variance)], ['flag', r => r.flagged ? 'ต้องตรวจ' : '']]);
+  return '<h4>2 สรุปพนักงาน</h4>'+employeeTable+'<h4>2 รายวันต่อพนักงาน</h4>'+rowTable;
+}}
+function renderEmployeeReconcile(data) {{
+  if (!data || !data.ok) return '<div class="bad">'+esc((data && data.error) || 'โหลด reconcile ไม่สำเร็จ')+'</div>';
+  const summary = data.summary || {{}};
+  const top = '<div class="mini">สลิป '+esc(summary.slip_count || 0)+' · '+money(summary.slip_total || 0)+' | ledger '+esc(summary.ledger_count || 0)+' · '+money(summary.ledger_total || 0)+' | match '+esc(summary.matched_count || 0)+' · diff '+money(summary.diff_amount || 0)+'</div>';
+  const matched = (data.matched || []).map(m => ({{...(m.slip || {{}}), score:m.score, ledger_ref:(m.entry||{{}}).reference || '', ledger_desc:(m.entry||{{}}).description || ''}}));
+  const matchedTable = table(matched, [['วันที่','slip_date_iso'], ['ชื่อ','transferor_name'], ['บัญชีต้นทาง','from_account'], ['บัญชีปลายทาง','to_account'], ['ref สลิป','reference_no'], ['ref ledger','ledger_ref'], ['ยอด', r => money(r.amount)], ['score','score']]);
+  const slipOnlyTable = table(data.slip_only || [], [['วันที่','slip_date_iso'], ['ชื่อ','transferor_name'], ['ต้นทาง','from_account'], ['ปลายทาง','to_account'], ['ref','reference_no'], ['ยอด', r => money(r.amount)]]);
+  const ledgerOnlyTable = table(data.ledger_only || [], [['วันที่','date_key'], ['เวลา','time'], ['บัญชี','account_no'], ['รายการ','description'], ['ref','reference'], ['ยอด', r => money(r.amount)]]);
+  return '<h4>1 เทียบสลิปกับ ledger</h4>'+top+'<h4>1 รายการที่ match</h4>'+matchedTable+'<h4>1 สลิปมี แต่ไม่พบ ledger</h4>'+slipOnlyTable+'<h4>1 ledger มี แต่ไม่พบสลิป</h4>'+ledgerOnlyTable;
+}}
+function renderCrossBotDuplicates(data) {{
+  if (!data || !data.ok) return '<div class="bad">'+esc((data && data.error) || 'โหลด cross duplicate ไม่สำเร็จ')+'</div>';
+  const groups = data.groups || [];
+  if (!groups.length) return '<h4>3 สลิปซ้ำข้ามบอท/บริษัท</h4><div class="good">ไม่พบกลุ่มซ้ำข้าม source ใน scope นี้</div>';
+  const html = groups.slice(0,80).map(g => {{
+    const slipRows = (g.slips || []).map(s => ({{...s, source:(s.company_name || s.bot_key || '-') + ' · ' + (s.chat_title || s.chat_id || '-')}}));
+    return '<article class="cross-company-card"><div class="cross-company-head"><div><div class="label">fingerprint</div><div class="cross-company-account">'+esc(g.fingerprint || '-')+'</div></div><div class="cross-company-total">'+esc(g.slip_count || 0)+' สลิป · '+money(g.total_amount || 0)+'</div></div>'
+      + table(slipRows, [['source','source'], ['วันที่','slip_date_iso'], ['ชื่อ','transferor_name'], ['ref','reference_no'], ['ยอด', r => money(r.amount)], ['ซ้ำแล้ว', r => Number(r.is_duplicate || 0) ? 'ใช่' : 'ยัง']])
+      + '</article>';
+  }}).join('');
+  return '<h4>3 สลิปซ้ำข้ามบอท/บริษัท</h4><div class="cross-company-list">'+html+'</div>';
+}}
+async function runEmployeeAudit() {{
+  const summaryBox = document.getElementById('employeeAuditSummary');
+  const detailsBox = document.getElementById('employeeAuditDetails');
+  const p = employeeAuditParams();
+  if (summaryBox) summaryBox.innerHTML = '<div class="muted">กำลังโหลดออดิต 1-2-3...</div>';
+  if (detailsBox) detailsBox.innerHTML = '<div class="muted">รอผลตรวจ...</div>';
+  const common = {{bot_key:p.bot_key, chat_id:p.chat_id, flow_type:p.flow_type, scope:p.scope}};
+  try {{
+    const [recRes, varRes, dupRes] = await Promise.all([
+      fetch('/api/audit/reconcile'+query({{...common, account_key:p.account_key}}), {{cache:'no-store'}}),
+      fetch('/api/audit/daily-variance'+query({{...common, threshold:p.threshold}}), {{cache:'no-store'}}),
+      fetch('/api/audit/cross-dup'+query({{bot_key:p.bot_key, scope:p.scope}}), {{cache:'no-store'}})
+    ]);
+    const [reconcile, variance, crossDup] = await Promise.all([recRes.json(), varRes.json(), dupRes.json()]);
+    if (summaryBox) summaryBox.innerHTML = renderEmployeeAuditSummary(reconcile, variance, crossDup);
+    if (detailsBox) detailsBox.innerHTML = renderEmployeeReconcile(reconcile) + renderEmployeeVariance(variance) + renderCrossBotDuplicates(crossDup);
+    enhanceResponsiveTables(detailsBox || document);
+  }} catch (err) {{
+    if (summaryBox) summaryBox.innerHTML = '<div class="bad">โหลดออดิตไม่สำเร็จ</div>';
+    if (detailsBox) detailsBox.innerHTML = '<div class="bad">'+esc(err)+'</div>';
+  }}
 }}
 function showToast(msg, type='info') {{
   try {{
@@ -8056,6 +8149,52 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 logger.exception("api_ledger failed")
                 self.send_json({"ok": False, "error": safe_error(exc), "rows": []}, 400)
             return
+        # --- audit employee endpoints ---
+        if parsed.path == "/api/audit/reconcile":
+            q = parse_qs(parsed.query)
+            bot_key = (q.get("bot_key") or [""])[0]
+            chat_id = (q.get("chat_id") or [""])[0]
+            account_key = (q.get("account_key") or [""])[0]
+            scope = (q.get("scope") or ["open"])[0]
+            flow_type = (q.get("flow_type") or ["all"])[0]
+            try:
+                self.send_json(audit_employee_component.reconcile_slips_ledger(
+                    DB_PATH, bot_key=bot_key, chat_id=chat_id, account_key=account_key, scope=scope, flow_type=flow_type
+                ))
+            except Exception as exc:
+                logger.exception("api_audit_reconcile failed")
+                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+            return
+        if parsed.path == "/api/audit/daily-variance":
+            q = parse_qs(parsed.query)
+            bot_key = (q.get("bot_key") or [""])[0]
+            chat_id = (q.get("chat_id") or [""])[0]
+            scope = (q.get("scope") or ["open"])[0]
+            flow_type = (q.get("flow_type") or ["all"])[0]
+            try:
+                threshold = max(0.0, float((q.get("threshold") or ["100"])[0]))
+            except (TypeError, ValueError):
+                threshold = 100.0
+            try:
+                self.send_json(audit_employee_component.employee_daily_variance(
+                    DB_PATH, bot_key=bot_key, chat_id=chat_id, scope=scope, flow_type=flow_type, threshold=threshold
+                ))
+            except Exception as exc:
+                logger.exception("api_audit_daily_variance failed")
+                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+            return
+        if parsed.path == "/api/audit/cross-dup":
+            q = parse_qs(parsed.query)
+            bot_key = (q.get("bot_key") or [""])[0]
+            scope = (q.get("scope") or ["open"])[0]
+            try:
+                self.send_json(audit_employee_component.cross_bot_duplicates(
+                    DB_PATH, bot_key=bot_key, scope=scope
+                ))
+            except Exception as exc:
+                logger.exception("api_audit_cross_dup failed")
+                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+            return
         if parsed.path == "/api/pending":
             actor_role = self.actor_role()
             if actor_role not in {"admin", "operator", "auditor"}:
@@ -8304,28 +8443,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             actor_fp = self.actor_fingerprint()
             approval_mode = self.parse_approval_param()
-            if approval_mode == "request":
+            if approval_mode != "execute":
                 payload_err = account_limit_payload_error(payload)
                 if payload_err:
                     self.send_json({"ok": False, "error": payload_err}, 400)
                     return
                 request_id = uuid.uuid4().hex[:12]
-                pending_id = create_pending_action(
-                    DB_PATH,
-                    action="account.limit",
-                    payload=payload,
-                    requested_by=actor_fp,
-                    request_id=request_id,
-                )
-                record_endpoint_mutation(DB_PATH, "account_limit.request", actor=actor_fp, request_id=request_id, chat_id=str(payload.get("chat_id") or ""), payload=payload, result_status="pending", result_summary=f"pending_id={pending_id}")
-                auto_result = simple_auto_execute_pending(DB_PATH, pending_id, actor_fp, self.actor_role())
-                if auto_result:
-                    status_code = int(auto_result.pop("status_code", 200)) if not auto_result.get("ok") else 200
-                    self.send_json(auto_result, status_code)
-                    return
-                self.send_json({"ok": True, "status": "pending", "pending_id": pending_id, "request_id": request_id, "expires_in_hours": PENDING_ACTION_TTL_HOURS})
+                try:
+                    result = save_account_limit(
+                        DB_PATH,
+                        str(payload.get("chat_id") or ""),
+                        str(payload.get("limit_key") or ""),
+                        str(payload.get("display_name") or ""),
+                        str(payload.get("bank") or ""),
+                        str(payload.get("account") or ""),
+                        parse_number(payload.get("limit_amount")),
+                    )
+                    record_endpoint_mutation(DB_PATH, "account_limit", actor=actor_fp, request_id=request_id, chat_id=str(payload.get("chat_id") or ""), payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("limit_key") or result.get("error") or ""))
+                    if isinstance(result, dict):
+                        result["request_id"] = request_id
+                        if result.get("ok"):
+                            result["status"] = "saved"
+                    self.send_json(result, 200 if result.get("ok") else int(result.get("status_code") or 400))
+                except Exception as exc:
+                    logger.exception("api_account_limit failed")
+                    record_endpoint_mutation(DB_PATH, "account_limit", actor=actor_fp, request_id=request_id, chat_id=str(payload.get("chat_id") or ""), payload=payload, result_status="error", result_summary=safe_error(exc))
+                    self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
                 return
-            # approval_mode == "execute"
+            # Legacy support: execute an already-approved account.limit pending action.
             try:
                 pending_id_executed = int(payload.get("pending_id") or 0)
             except (TypeError, ValueError):
