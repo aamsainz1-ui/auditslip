@@ -383,6 +383,20 @@ def ensure_dashboard_performance_indexes(conn: sqlite3.Connection) -> None:
         WHERE status IN ('unclear','error','success')
         """
     )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_slips_duplicate_created
+        ON slips(created_at DESC, bot_key, chat_id, duplicate_of)
+        WHERE status='success' AND COALESCE(is_duplicate,0)=1
+        """
+    )
+    if sqlite_table_exists(conn, "ocr_jobs"):
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_ocr_jobs_slip_bot_created
+            ON ocr_jobs(slip_id, bot_key, created_at)
+            """
+        )
 
 
 def rows_to_dicts(rows: List[sqlite3.Row]) -> List[Dict[str, Any]]:

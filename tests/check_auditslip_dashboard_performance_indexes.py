@@ -36,7 +36,10 @@ spec.loader.exec_module(Dash)
 with sqlite3.connect(db_path) as conn:
     Dash.ensure_dashboard_performance_indexes(conn)
     index_names = {row[1] for row in conn.execute("PRAGMA index_list('slips')").fetchall()}
+    job_index_names = {row[1] for row in conn.execute("PRAGMA index_list('ocr_jobs')").fetchall()}
 
 assert "idx_slips_bot_chat_date_amount" in index_names, index_names
 assert "idx_slips_status" in index_names, index_names
+assert "idx_slips_duplicate_created" in index_names, index_names
+assert "idx_ocr_jobs_slip_bot_created" in job_index_names, job_index_names
 print("ok: dashboard performance indexes are created idempotently")
