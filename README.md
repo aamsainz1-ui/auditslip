@@ -46,3 +46,7 @@ python3 -m py_compile auditslip_bot.py
 python3 tests/check_auditslip_product_contract.py
 systemctl status auditslip-bot.service --no-pager
 ```
+
+## Runbooks
+
+- Dashboard performance workflow: [`docs/dashboard-performance-runbook.md`](docs/dashboard-performance-runbook.md)
