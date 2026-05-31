@@ -634,6 +634,10 @@ def account_limit_scope_key(chat_id: str = "", bot_key: str = "") -> str:
     return ""
 
 
+def account_limit_scoped_key(scope: Any, limit_key: Any) -> str:
+    return f"{clean_display(scope)}\x1f{clean_display(limit_key)}"
+
+
 def load_account_limits(conn: sqlite3.Connection, chat_id: str, bot_key: str = "") -> Dict[str, Dict[str, Any]]:
     ensure_account_limit_table(conn)
     scopes: List[str] = []
@@ -649,8 +653,37 @@ def load_account_limits(conn: sqlite3.Connection, chat_id: str, bot_key: str = "
     for scope in scopes:
         rows = conn.execute("SELECT * FROM account_limits WHERE chat_id=?", (scope,)).fetchall()
         for r in rows:
-            out[str(r["limit_key"])] = dict(r)
+            row = dict(r)
+            out[str(r["limit_key"])] = row
+            out[account_limit_scoped_key(scope, r["limit_key"])] = row
     return out
+
+
+def load_bot_account_limits(conn: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
+    """Load bot-scoped limits for the all-company overview.
+
+    The overview groups rows from multiple bots/companies.  A plain dict keyed only
+    by limit_key can collide across companies, so store only scoped keys here.
+    """
+    ensure_account_limit_table(conn)
+    out: Dict[str, Dict[str, Any]] = {}
+    rows = conn.execute("SELECT * FROM account_limits WHERE chat_id LIKE 'bot:%'").fetchall()
+    for r in rows:
+        out[account_limit_scoped_key(r["chat_id"], r["limit_key"])] = dict(r)
+    return out
+
+
+def account_limit_for(account_limits: Dict[str, Dict[str, Any]], limit_key: Any, bot_key: Any = "") -> Dict[str, Any]:
+    key = clean_display(limit_key)
+    if not key:
+        return {}
+    direct = account_limits.get(key)
+    if direct:
+        return direct
+    bot_scope = account_limit_scope_key("", clean_display(bot_key))
+    if bot_scope:
+        return account_limits.get(account_limit_scoped_key(bot_scope, key), {})
+    return {}
 
 
 def account_limit_payload_error(payload: Dict[str, Any]) -> str:
@@ -1039,7 +1072,7 @@ def transferor_totals(conn: sqlite3.Connection, where_clause: str, params: List[
     out = []
     for group in sorted(groups, key=lambda g: (-g["amount"], -g["count"], g["display_name"]))[:limit]:
         name = f"{group['display_name']} ({group['bank']})" if group["bank"] else group["display_name"]
-        limit_row = account_limits.get(group["limit_key"], {})
+        limit_row = account_limit_for(account_limits, group["limit_key"], group.get("bot_key", ""))
         raw_limit = limit_row.get("limit_amount") if limit_row else bank_limit_amount(group["bank"])
         limit_amount = float(raw_limit or 0)
         daily_rows = sorted(
@@ -1157,7 +1190,7 @@ def daily_account_totals(conn: sqlite3.Connection, where_clause: str, params: Li
     sorted_groups = sorted(sorted_groups, key=lambda g: str(g["sort_date"] or ""), reverse=True)
     selected_groups = sorted_groups if not limit or limit <= 0 else sorted_groups[:limit]
     for group in selected_groups:
-        limit_row = account_limits.get(group["limit_key"], {})
+        limit_row = account_limit_for(account_limits, group["limit_key"], group.get("bot_key", ""))
         raw_limit = limit_row.get("limit_amount") if limit_row else bank_limit_amount(group["bank"])
         daily_limit = float(raw_limit or 0)
         amount = float(group["amount"] or 0)
@@ -4473,7 +4506,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
             selected_all_where, selected_all_params = apply_flow_sql(selected_all_where, selected_all_params, flow_type_key)
             duplicate_where = selected_all_where + " AND status='success' AND COALESCE(is_duplicate,0)=1"
             duplicate_params = selected_all_params
-            account_limits = {}
+            account_limits = load_bot_account_limits(conn)
             company_accounts = []
             open_where, open_params, _ = global_scope_where("open", success_only=True)
             open_where, open_params = apply_flow_sql(open_where, open_params, flow_type_key)

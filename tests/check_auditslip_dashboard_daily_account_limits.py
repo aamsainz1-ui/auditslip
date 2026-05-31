@@ -88,6 +88,31 @@ for company_no, amount in [(6, 6000.0), (3, 3000.0), (1, 100.0), (5, 5000.0), (2
         "confidence": 0.99,
     })
 
+# Bot-level limit set from the all-company overview must still render in the
+# all-company overview after reload. This mirrors the mobile operator flow:
+# overview (__all__) -> row has bot_key -> save as bot:<bot_key> -> reload overview.
+bot.save_slip({
+    "id": "GLOBAL_BOT_LIMIT",
+    "bot_key": "bot6",
+    "company_name": "บริษัท 6",
+    "chat_id": "CHAT6",
+    "chat_title": "บริษัท 6 ถอน",
+    "message_id": 606,
+    "file_id": "FILE_GLOBAL_BOT_LIMIT",
+    "sender_name": "Uploader",
+    "status": "success",
+    "slip_date_display": "25/05/26",
+    "slip_date_iso": "2026-05-25",
+    "slip_time": "12:06",
+    "transferor_name": "สหรัฐ ท.",
+    "issuer_bank": "SCB",
+    "from_bank": "SCB",
+    "from_account": "xxx-xxx052-2",
+    "to_bank": "KBANK",
+    "amount": 1234.0,
+    "confidence": 0.99,
+})
+
 # Duplicate slips must not count toward daily limit usage.
 bot.save_slip({
     "id": "DL_DUP",
@@ -121,6 +146,18 @@ limit_key = by_transferor["111-xxx-222"]["limit_key"]
 Dash.save_account_limit(Path(os.environ["AUDITSLIP_DB"]), "CHAT1", limit_key, "คุณเอ", "KBANK", "111-xxx-222", 300.0)
 split_limit_key = by_transferor["777-xxx-888"]["limit_key"]
 Dash.save_account_limit(Path(os.environ["AUDITSLIP_DB"]), "CHAT1", split_limit_key, "คุณเอ", "KBANK", "777-xxx-888", 200.0)
+
+global_snapshot_before = Dash.dashboard_snapshot(Path(os.environ["AUDITSLIP_DB"]), bot_key="__all__", scope="all")
+global_rows_before = {(r["bot_key"], r["account"]): r for r in global_snapshot_before["by_account_day"]}
+global_bot_row_before = global_rows_before[("bot6", "xxx-xxx052-2")]
+assert global_bot_row_before["daily_limit"] == 200000.0, global_bot_row_before  # SCB default before override
+Dash.save_account_limit(Path(os.environ["AUDITSLIP_DB"]), "bot:bot6", global_bot_row_before["limit_key"], "สหรัฐ ท.", "SCB", "xxx-xxx052-2", 100000.0)
+
+global_snapshot = Dash.dashboard_snapshot(Path(os.environ["AUDITSLIP_DB"]), bot_key="__all__", scope="all")
+global_rows = {(r["bot_key"], r["account"]): r for r in global_snapshot["by_account_day"]}
+global_bot_row = global_rows[("bot6", "xxx-xxx052-2")]
+assert global_bot_row["daily_limit"] == 100000.0, global_bot_row
+assert global_bot_row["remaining_amount"] == 98766.0, global_bot_row
 
 snapshot = Dash.dashboard_snapshot(Path(os.environ["AUDITSLIP_DB"]), chat_id="CHAT1", scope="all")
 summary_rows = {row["account"]: row for row in snapshot["by_transferor"]}
