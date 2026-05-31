@@ -49,4 +49,5 @@ systemctl status auditslip-bot.service --no-pager
 
 ## Runbooks
 
+- Installation, configuration, and usage: [`docs/install-config-usage.md`](docs/install-config-usage.md)
 - Dashboard performance workflow: [`docs/dashboard-performance-runbook.md`](docs/dashboard-performance-runbook.md)

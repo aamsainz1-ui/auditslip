@@ -1,0 +1,8 @@
+[Unit]
+Description=Auditslip SQLite backup
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/projects/auditslip
+EnvironmentFile=/etc/auditslip/auditslip.env
+ExecStart=/usr/bin/python3 /root/projects/auditslip/auditslip-backup.py

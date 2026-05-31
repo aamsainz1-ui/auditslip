@@ -1,0 +1,19 @@
+[Unit]
+Description=Auditslip Telegram OCR bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/projects/auditslip
+EnvironmentFile=/etc/auditslip/auditslip.env
+ExecStart=/usr/bin/python3 /root/projects/auditslip/auditslip_bot.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
