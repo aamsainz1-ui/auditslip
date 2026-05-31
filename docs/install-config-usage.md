@@ -2,6 +2,8 @@
 
 This document is the operator/developer setup guide for Auditslip: Telegram slip OCR bot, SQLite ledger, dashboard, exports, reconciliation, bank-ledger preview/import, watchdog, and backups.
 
+For the detailed “create bot → add to group → connect every API” walkthrough, use [`docs/bot-api-setup.md`](bot-api-setup.md).
+
 No real tokens or production secrets belong in git. Put real secrets only in `/etc/auditslip/auditslip.env` on the server.
 
 ## 1. What Auditslip does
@@ -40,7 +42,7 @@ The production systemd templates use `/usr/bin/python3`.
 
 ```bash
 sudo apt update
-sudo apt install -y git python3 python3-requests python3-openpyxl curl
+sudo apt install -y git python3 python3-requests python3-openpyxl sqlite3 curl
 ```
 
 Alternative: use a Python venv, install `requirements.txt`, and edit the `ExecStart=` lines in `systemd/*.service` to point to the venv Python.
@@ -127,6 +129,8 @@ If the dashboard is public behind a reverse proxy, verify the public URL separat
 
 ### 4.1 Telegram bot config
 
+For step-by-step BotFather creation, group insertion, chat ID discovery, `AUDITSLIP_TELEGRAM_BOTS`, flow mapping, and Telegram API verification, see [`docs/bot-api-setup.md`](bot-api-setup.md).
+
 Single bot:
 
 ```env
@@ -139,7 +143,7 @@ Multi-company/multi-bot:
 ```env
 BOT_TOKEN_1=
 BOT_TOKEN_2=
-AUDITSLIP_TELEGRAM_BOTS=bot1:BOT_TOKEN_1:บริษัท 1,bot2:BOT_TOKEN_2:บริษัท 2
+AUDITSLIP_TELEGRAM_BOTS="bot1:BOT_TOKEN_1:บริษัท 1,bot2:BOT_TOKEN_2:บริษัท 2"
 ```
 
 `AUDITSLIP_TELEGRAM_BOTS` entries are `bot_key:TOKEN_ENV_NAME:company_name`.
@@ -220,7 +224,7 @@ Access patterns:
 If group titles are generic, use explicit mapping instead of title heuristics:
 
 ```env
-AUDITSLIP_FLOW_MAP=bot1|CHAT_ID_DEPOSIT=deposit,bot1|CHAT_ID_WITHDRAW=withdraw
+AUDITSLIP_FLOW_MAP="bot1|CHAT_ID_DEPOSIT=deposit,bot1|CHAT_ID_WITHDRAW=withdraw"
 ```
 
 Valid flow values:

@@ -4,9 +4,9 @@ Auditslip is a single Telegram bot for slip auditing.
 
 ## Key behavior
 
-- One bot process, one Telegram bot token.
+- One supervised bot process can run either one Telegram bot token or configured multi-bot/company tokens.
 - OCR provider router inside the bot: `OCR_PROVIDERS=gemini,openai`.
-- Gemini and OpenAI are fallback providers, not separate bots.
+- Gemini and OpenAI are fallback providers, not separate services.
 - SQLite ledger with WAL.
 - Excel export with sheets:
   - `Slips`
@@ -50,4 +50,5 @@ systemctl status auditslip-bot.service --no-pager
 ## Runbooks
 
 - Installation, configuration, and usage: [`docs/install-config-usage.md`](docs/install-config-usage.md)
+- Bot creation, group setup, and API connections: [`docs/bot-api-setup.md`](docs/bot-api-setup.md)
 - Dashboard performance workflow: [`docs/dashboard-performance-runbook.md`](docs/dashboard-performance-runbook.md)
