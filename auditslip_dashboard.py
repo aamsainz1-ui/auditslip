@@ -5939,10 +5939,10 @@ def render_dashboard_html(token: str = "") -> str:
             <button class="side-menu-item" type="button" data-menu-target="section-overview" onclick="showMenuSection('section-overview')"><span class="side-menu-icon">▦</span><span class="side-menu-text"><span class="side-menu-title">ภาพรวม</span><span class="side-menu-desc">ยอดรวมแยกบริษัท</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="all" onclick="showAllMenuSections()"><span class="side-menu-icon">⌘</span><span class="side-menu-text"><span class="side-menu-title">แสดงทั้งหมด</span><span class="side-menu-desc">ทุกการ์ดและทุกตาราง</span></span></button>
           </div>
-          <div class="side-heading" style="margin-top:14px"><span>ตรวจเงิน</span><small>ledger · ธนาคาร · กระทบยอด</small></div>
+          <div class="side-heading" style="margin-top:14px"><span>ตรวจเงิน</span><small>เดินบัญชี · ธนาคาร · กระทบยอด</small></div>
           <div class="side-nav">
             <button class="side-menu-item" type="button" data-menu-target="section-account-ledger" onclick="showMenuSection('section-account-ledger')"><span class="side-menu-icon">≡</span><span class="side-menu-text"><span class="side-menu-title">เดินบัญชีรายบัญชี</span><span class="side-menu-desc">timeline + running balance</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="section-employee-audit" onclick="showMenuSection('section-employee-audit')"><span class="side-menu-icon">◫</span><span class="side-menu-text"><span class="side-menu-title">ออดิตพนักงาน</span><span class="side-menu-desc">1 เทียบ ledger · 2 รายวัน · 3 ซ้ำข้ามบริษัท</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-employee-audit" onclick="showMenuSection('section-employee-audit')"><span class="side-menu-icon">◫</span><span class="side-menu-text"><span class="side-menu-title">ตรวจยอด</span><span class="side-menu-desc">1 เทียบเดินบัญชี · 2 รายวัน · 3 ซ้ำข้ามบริษัท</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-bank-ledger" onclick="showMenuSection('section-bank-ledger')"><span class="side-menu-icon">▤</span><span class="side-menu-text"><span class="side-menu-title">Preview Statement</span><span class="side-menu-desc">อัปโหลด statement เทียบสลิป</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-banks" onclick="showMenuSection('section-banks')"><span class="side-menu-icon">⇄</span><span class="side-menu-text"><span class="side-menu-title">ยอดธนาคาร</span><span class="side-menu-desc">ยอดแยกต้นทาง/ปลายทาง</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-reconcile" onclick="showMenuSection('section-reconcile')"><span class="side-menu-icon">✓</span><span class="side-menu-text"><span class="side-menu-title">กระทบยอด Statement</span><span class="side-menu-desc">หลังบ้าน vs สลิป</span></span></button>
@@ -6071,17 +6071,17 @@ def render_dashboard_html(token: str = "") -> str:
 
     <section id="section-employee-audit" class="sections menu-section" hidden>
       <div class="card">
-        <h3>ออดิตยอดพนักงาน</h3>
-        <div class="mini">ใช้ตัวกรองบริษัท/กลุ่ม/ฝากถอน/วันที่ด้านซ้ายร่วมกัน · ข้อ 1 เทียบสลิปกับ ledger, ข้อ 2 สรุปยอดรายวันต่อพนักงาน, ข้อ 3 จับสลิปซ้ำข้ามบอทหรือบริษัท</div>
+        <h3>ตรวจยอด</h3>
+        <div class="mini">ใช้ตัวกรองบริษัท/กลุ่ม/ฝากถอน/วันที่ด้านซ้ายร่วมกัน · ข้อ 1 เทียบสลิปกับเดินบัญชี, ข้อ 2 สรุปยอดรายวัน, ข้อ 3 จับสลิปซ้ำข้ามบอท/บริษัท</div>
         <div class="reconcile-controls">
           <label class="reconcile-step"><span>เลขบัญชี/Account key สำหรับข้อ 1</span><input id="auditAccountKey" placeholder="เว้นว่างเพื่อดูทั้ง scope" /></label>
           <label class="reconcile-step"><span>Threshold variance</span><input id="auditVarianceThreshold" type="number" step="0.01" value="100" /></label>
-          <div class="reconcile-actions"><button onclick="runEmployeeAudit()">โหลดออดิต 1-2-3</button></div>
+          <div class="reconcile-actions"><button onclick="runEmployeeAudit()">โหลดตรวจยอด 1-2-3</button></div>
         </div>
-        <div id="employeeAuditSummary" style="margin-top:12px"><div class="muted">กดโหลดออดิตเพื่อเริ่มตรวจ</div></div>
+        <div id="employeeAuditSummary" style="margin-top:12px"><div class="muted">กดโหลดเพื่อเริ่มตรวจยอด</div></div>
       </div>
       <div class="card">
-        <h3>ผลลัพธ์ออดิต</h3>
+        <h3>ผลลัพธ์ตรวจยอด</h3>
         <div id="employeeAuditDetails"><div class="muted">ยังไม่มีข้อมูล</div></div>
       </div>
     </section>
@@ -6967,7 +6967,7 @@ function renderBankLedgerSnapshot(data) {{
   const unmatchedLedger = data.unmatched_ledger || data.ledger_extra || {{}};
   const unmatchedSlips = data.unmatched_slips || data.slip_extra || {{}};
   const account = data.account || {{}};
-  const accountLine = account.account_no ? ('บัญชี '+esc(account.account_no)+' · '+esc(account.bank || '-')+' · '+esc(account.account_name || '')) : 'ยังไม่มี ledger ใน scope นี้';
+  const accountLine = account.account_no ? ('บัญชี '+esc(account.account_no)+' · '+esc(account.bank || '-')+' · '+esc(account.account_name || '')) : 'ยังไม่มีเดินบัญชีใน scope นี้';
   const cards = '<div class="muted">'+accountLine+'</div>'
     + '<div class="mini">รายการเดินบัญชี '+esc(entries.count || 0)+' · '+money(entries.amount || 0)+' | match '+esc(matched.count || 0)+' | เดินบัญชีเกิน '+esc(unmatchedLedger.count || 0)+' | สลิปเกิน '+esc(unmatchedSlips.count || 0)+'</div>';
   const ledgerRows = (unmatchedLedger.rows || []).slice(0,50);
@@ -6983,7 +6983,7 @@ function bankLedgerPreviewSummary(data) {{
   const account = data.account || {{}};
   const cards = '<div class="'+(complete?'good':'warn')+'"><b>'+(complete?'Preview เดินบัญชี: ครบ':'Preview เดินบัญชี: มีรายการค้างตรวจ')+'</b></div>'
     + '<div class="mini">บริษัท/Bot: '+esc(account.bot_key || '-')+' · บัญชี '+esc(account.account_no || '-')+' · '+esc(account.bank || '-')+' · dry-run '+esc(data.dry_run ? 'yes' : 'no')+'</div>'
-    + '<div class="muted">statement '+(data.incoming.count||0)+' รายการ · '+money(data.incoming.amount)+' | สลิป '+(data.slips.count||0)+' รายการ · '+money(data.slips.amount)+' | match '+(data.matched.count||0)+' | ledger เกิน '+(data.ledger_extra.count||0)+' | สลิปเกิน '+(data.slip_extra.count||0)+'</div>';
+    + '<div class="muted">statement '+(data.incoming.count||0)+' รายการ · '+money(data.incoming.amount)+' | สลิป '+(data.slips.count||0)+' รายการ · '+money(data.slips.amount)+' | match '+(data.matched.count||0)+' | เดินบัญชีเกิน '+(data.ledger_extra.count||0)+' | สลิปเกิน '+(data.slip_extra.count||0)+'</div>';
   const matchedRows = (data.matched.rows || []).map(m => ({{...(m.ledger || {{}}), status:'match', slip_source:(m.slip||{{}}).source || ''}}));
   const matched = table(matchedRows, [['สถานะ','status'], ['วันที่','date'], ['เวลา','time'], ['รายการ','description'], ['ref','reference'], ['ยอด', r => money(r.amount)], ['สลิป','slip_source']]);
   const ledgerExtra = table((data.ledger_extra || {{}}).rows || [], [['สถานะ', r => 'เดินบัญชีมี แต่ไม่พบสลิป'], ['วันที่','date'], ['เวลา','time'], ['รายการ','description'], ['ref','reference'], ['ยอด', r => money(r.amount)]]);
@@ -7209,7 +7209,7 @@ function renderEmployeeAuditSummary(reconcile, variance, crossDup) {{
   const hasLedger = reconcile && reconcile.has_ledger;
   const scope = (reconcile && reconcile.scope) || {{}};
   const cards = [
-    '<div class="operator-stat"><div class="label">1 สลิปไม่เจอ ledger</div><div class="value '+(Number(rec.slip_only_count||0) ? 'warn' : 'good')+'">'+esc(rec.slip_only_count || 0)+'</div><div class="mini">'+money(rec.slip_only_amount || 0)+'</div></div>',
+    '<div class="operator-stat"><div class="label">1 สลิปไม่เจอเดินบัญชี</div><div class="value '+(Number(rec.slip_only_count||0) ? 'warn' : 'good')+'">'+esc(rec.slip_only_count || 0)+'</div><div class="mini">'+money(rec.slip_only_amount || 0)+'</div></div>',
     '<div class="operator-stat"><div class="label">1 ledger ไม่เจอสลิป</div><div class="value '+(Number(rec.ledger_only_count||0) ? 'warn' : 'good')+'">'+esc(rec.ledger_only_count || 0)+'</div><div class="mini">'+money(rec.ledger_only_amount || 0)+'</div></div>',
     '<div class="operator-stat"><div class="label">2 วันพนักงานที่ flagged</div><div class="value '+(Number((variance||{{}}).flagged_count||0) ? 'warn' : 'good')+'">'+esc((variance||{{}}).flagged_count || 0)+'</div><div class="mini">พนักงาน '+esc((variance||{{}}).employee_count || 0)+'</div></div>',
     '<div class="operator-stat"><div class="label">3 กลุ่มซ้ำข้ามบริษัท</div><div class="value '+(Number((crossDup||{{}}).group_count||0) ? 'bad' : 'good')+'">'+esc((crossDup||{{}}).group_count || 0)+'</div><div class="mini">ยอดเสี่ยง '+money((crossDup||{{}}).total_suspicious_amount || 0)+'</div></div>'
@@ -7233,7 +7233,7 @@ function renderEmployeeReconcile(data) {{
   const matchedTable = table(matched, [['วันที่','slip_date_iso'], ['ชื่อ','transferor_name'], ['บัญชีต้นทาง','from_account'], ['บัญชีปลายทาง','to_account'], ['ref สลิป','reference_no'], ['ref ledger','ledger_ref'], ['ยอด', r => money(r.amount)], ['score','score']]);
   const slipOnlyTable = table(data.slip_only || [], [['วันที่','slip_date_iso'], ['ชื่อ','transferor_name'], ['ต้นทาง','from_account'], ['ปลายทาง','to_account'], ['ref','reference_no'], ['ยอด', r => money(r.amount)]]);
   const ledgerOnlyTable = table(data.ledger_only || [], [['วันที่','date_key'], ['เวลา','time'], ['บัญชี','account_no'], ['รายการ','description'], ['ref','reference'], ['ยอด', r => money(r.amount)]]);
-  return '<h4>1 เทียบสลิปกับ ledger</h4>'+top+'<h4>1 รายการที่ match</h4>'+matchedTable+'<h4>1 สลิปมี แต่ไม่พบ ledger</h4>'+slipOnlyTable+'<h4>1 ledger มี แต่ไม่พบสลิป</h4>'+ledgerOnlyTable;
+  return '<h4>1 เทียบสลิปกับเดินบัญชี</h4>'+top+'<h4>1 รายการที่ match</h4>'+matchedTable+'<h4>1 สลิปมี แต่ไม่พบเดินบัญชี</h4>'+slipOnlyTable+'<h4>1 เดินบัญชีมี แต่ไม่พบสลิป</h4>'+ledgerOnlyTable;
 }}
 function renderCrossBotDuplicates(data) {{
   if (!data || !data.ok) return '<div class="bad">'+esc((data && data.error) || 'โหลด cross duplicate ไม่สำเร็จ')+'</div>';
@@ -7251,7 +7251,7 @@ async function runEmployeeAudit() {{
   const summaryBox = document.getElementById('employeeAuditSummary');
   const detailsBox = document.getElementById('employeeAuditDetails');
   const p = employeeAuditParams();
-  if (summaryBox) summaryBox.innerHTML = '<div class="muted">กำลังโหลดออดิต 1-2-3...</div>';
+  if (summaryBox) summaryBox.innerHTML = '<div class="muted">กำลังโหลดตรวจยอด 1-2-3...</div>';
   if (detailsBox) detailsBox.innerHTML = '<div class="muted">รอผลตรวจ...</div>';
   const common = {{bot_key:p.bot_key, chat_id:p.chat_id, flow_type:p.flow_type, scope:p.scope}};
   try {{
