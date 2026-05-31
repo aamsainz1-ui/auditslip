@@ -1,10 +1,12 @@
-# Auditslip installation, configuration, and usage
+# คู่มือติดตั้ง ตั้งค่า และใช้งาน Auditslip
 
-This document is the operator/developer setup guide for Auditslip: Telegram slip OCR bot, SQLite ledger, dashboard, exports, reconciliation, bank-ledger preview/import, watchdog, and backups.
+เอกสารนี้คือคู่มือสำหรับติดตั้ง/ตั้งค่า Auditslip บน production: Telegram slip OCR bot, SQLite ledger, dashboard, export, reconcile, bank-ledger preview/import, watchdog และ backup
 
-For the detailed “create bot → add to group → connect every API” walkthrough, use [`docs/bot-api-setup.md`](bot-api-setup.md).
+ถ้าต้องการคำอธิบายภาษาไทยแบบอ่านตามขั้นตอนสำหรับ operator/developer ให้เริ่มที่ [`docs/thai-operator-guide.md`](thai-operator-guide.md)
 
-No real tokens or production secrets belong in git. Put real secrets only in `/etc/auditslip/auditslip.env` on the server.
+ถ้าต้องการขั้นตอนเฉพาะเรื่อง “สร้างบอท → ใส่บอทเข้ากลุ่ม → เชื่อม API ทุกส่วน” ให้ใช้ [`docs/bot-api-setup.md`](bot-api-setup.md)
+
+ห้ามใส่ token หรือ production secret จริงใน git ให้เก็บค่าจริงเฉพาะใน `/etc/auditslip/auditslip.env` บน server เท่านั้น
 
 ## 1. What Auditslip does
 

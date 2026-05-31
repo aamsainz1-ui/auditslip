@@ -1,4 +1,4 @@
-# Auditslip bot and API setup guide
+# คู่มือสร้างบอทและเชื่อม API สำหรับ Auditslip
 
 คู่มือนี้คือขั้นตอนแบบครบสำหรับการสร้าง Telegram bot, ใส่บอทเข้ากลุ่ม, เชื่อม OCR/API providers, เชื่อม Dashboard API, และตรวจว่าทุกส่วนทำงานจริงหลัง deploy
 
