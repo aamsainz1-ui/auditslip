@@ -70,6 +70,24 @@ assert full["recent"], full
 assert full["company_account_daily"], full
 assert full["by_account_day"], full
 
+def _forbid_lite_detail_call(name):
+    def _blocked(*args, **kwargs):
+        raise AssertionError(f"lite snapshot should not compute detail helper: {name}")
+    return _blocked
+
+for helper_name in [
+    "duplicate_pair_rows",
+    "source_bank_review_rows",
+    "account_slip_search_rows",
+    "cross_company_account_usage",
+    "cross_company_account_slip_search_rows",
+    "date_totals",
+    "daily_flow_totals",
+    "bank_totals",
+    "grouped_totals",
+]:
+    setattr(Dash, helper_name, _forbid_lite_detail_call(helper_name))
+
 lite = Dash.dashboard_snapshot(db_path, bot_key="bot1", flow_type="withdraw", scope="2026-05-23", detail_level="lite")
 assert lite["detail_level"] == "lite", lite.keys()
 assert lite["totals"]["selected_success_count"] == 1, lite["totals"]

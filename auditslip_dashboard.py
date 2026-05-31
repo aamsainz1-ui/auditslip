@@ -4402,6 +4402,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
     detail_level_key = clean_display(detail_level).lower() or "full"
     if detail_level_key not in {"full", "lite"}:
         detail_level_key = "full"
+    include_detail_rows = detail_level_key == "full"
     account_search_mode_key = clean_display(account_search_mode).lower()
     if account_search_mode_key not in {"scoped", "cross", "both", ""}:
         account_search_mode_key = ""
@@ -4496,17 +4497,17 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
             by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals, withdraw_limit_usage = flow_split_panels(
                 conn, selected_where, selected_params, flow_type_key, account_limits, slip_search_key
             )
-            duplicate_pairs = duplicate_pair_rows(conn, "", scope, "", slip_search_key, flow_type=flow_type_key)
-            source_bank_review = source_bank_review_rows(conn, selected_where, selected_params, slip_search_key, exclude_ids=pending_delete_ids)
+            duplicate_pairs = duplicate_pair_rows(conn, "", scope, "", slip_search_key, flow_type=flow_type_key) if include_detail_rows else []
+            source_bank_review = source_bank_review_rows(conn, selected_where, selected_params, slip_search_key, exclude_ids=pending_delete_ids) if include_detail_rows else []
             source_bank_review_total = source_bank_review_count(conn, selected_where, selected_params, slip_search_key, exclude_ids=pending_delete_ids)
-            by_date = date_totals(conn, selected_where, selected_params)
-            daily_flow_summary = daily_flow_totals(conn, selected_where, selected_params)
-            by_from_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(from_bank,''), '(ไม่ทราบธนาคารต้นทาง)')", "(ไม่ทราบธนาคารต้นทาง)")
-            by_to_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(to_bank,''), '(ไม่ทราบธนาคารปลายทาง)')", "(ไม่ทราบธนาคารปลายทาง)")
-            by_sender = grouped_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(sender_name,''), NULLIF(username,''), '(ไม่ทราบผู้ส่งรูป)')")
+            by_date = date_totals(conn, selected_where, selected_params) if include_detail_rows else []
+            daily_flow_summary = daily_flow_totals(conn, selected_where, selected_params) if include_detail_rows else []
+            by_from_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(from_bank,''), '(ไม่ทราบธนาคารต้นทาง)')", "(ไม่ทราบธนาคารต้นทาง)") if include_detail_rows else []
+            by_to_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(to_bank,''), '(ไม่ทราบธนาคารปลายทาง)')", "(ไม่ทราบธนาคารปลายทาง)") if include_detail_rows else []
+            by_sender = grouped_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(sender_name,''), NULLIF(username,''), '(ไม่ทราบผู้ส่งรูป)')") if include_detail_rows else []
             company_account_daily = company_account_daily_totals(conn, selected_where, selected_params, account_daily_search_key)
-            account_slip_search = account_slip_search_rows(conn, selected_where, selected_params, slip_search_key)
-            account_cross_company = cross_company_account_usage(conn, scope, flow_type_key, selected_bot_key, slip_search_key)
+            account_slip_search = account_slip_search_rows(conn, selected_where, selected_params, slip_search_key) if include_detail_rows else empty_account_slip_search(slip_search_key)
+            account_cross_company = cross_company_account_usage(conn, scope, flow_type_key, selected_bot_key, slip_search_key) if include_detail_rows else []
         elif selected_chat_id:
             selected_where, selected_params, scope_label = scope_where(selected_chat_id, scope, success_only=True, bot_key=selected_bot_key)
             selected_where, selected_params = apply_flow_sql(selected_where, selected_params, flow_type_key)
@@ -4554,17 +4555,17 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
             by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals, withdraw_limit_usage = flow_split_panels(
                 conn, selected_where, selected_params, flow_type_key, account_limits, slip_search_key
             )
-            duplicate_pairs = duplicate_pair_rows(conn, selected_chat_id, scope, selected_bot_key, slip_search_key, flow_type=flow_type_key)
-            source_bank_review = source_bank_review_rows(conn, selected_where, selected_params, slip_search_key, exclude_ids=pending_delete_ids)
+            duplicate_pairs = duplicate_pair_rows(conn, selected_chat_id, scope, selected_bot_key, slip_search_key, flow_type=flow_type_key) if include_detail_rows else []
+            source_bank_review = source_bank_review_rows(conn, selected_where, selected_params, slip_search_key, exclude_ids=pending_delete_ids) if include_detail_rows else []
             source_bank_review_total = source_bank_review_count(conn, selected_where, selected_params, slip_search_key, exclude_ids=pending_delete_ids)
-            by_date = date_totals(conn, selected_where, selected_params)
-            daily_flow_summary = daily_flow_totals(conn, selected_where, selected_params)
-            by_from_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(from_bank,''), '(ไม่ทราบธนาคารต้นทาง)')", "(ไม่ทราบธนาคารต้นทาง)")
-            by_to_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(to_bank,''), '(ไม่ทราบธนาคารปลายทาง)')", "(ไม่ทราบธนาคารปลายทาง)")
-            by_sender = grouped_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(sender_name,''), NULLIF(username,''), '(ไม่ทราบผู้ส่งรูป)')")
+            by_date = date_totals(conn, selected_where, selected_params) if include_detail_rows else []
+            daily_flow_summary = daily_flow_totals(conn, selected_where, selected_params) if include_detail_rows else []
+            by_from_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(from_bank,''), '(ไม่ทราบธนาคารต้นทาง)')", "(ไม่ทราบธนาคารต้นทาง)") if include_detail_rows else []
+            by_to_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(to_bank,''), '(ไม่ทราบธนาคารปลายทาง)')", "(ไม่ทราบธนาคารปลายทาง)") if include_detail_rows else []
+            by_sender = grouped_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(sender_name,''), NULLIF(username,''), '(ไม่ทราบผู้ส่งรูป)')") if include_detail_rows else []
             company_account_daily = company_account_daily_totals(conn, selected_where, selected_params, account_daily_search_key)
-            account_slip_search = account_slip_search_rows(conn, selected_where, selected_params, slip_search_key)
-            account_cross_company = cross_company_account_usage(conn, scope, flow_type_key, selected_bot_key, slip_search_key)
+            account_slip_search = account_slip_search_rows(conn, selected_where, selected_params, slip_search_key) if include_detail_rows else empty_account_slip_search(slip_search_key)
+            account_cross_company = cross_company_account_usage(conn, scope, flow_type_key, selected_bot_key, slip_search_key) if include_detail_rows else []
         else:
             selected_bot_key = selected_bot_key or requested_bot_key
             if selected_bot_key:
@@ -4612,17 +4613,17 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
                 by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals, withdraw_limit_usage = flow_split_panels(
                     conn, selected_where, selected_params, flow_type_key, account_limits, slip_search_key
                 )
-                duplicate_pairs = duplicate_pair_rows(conn, "", scope, selected_bot_key, slip_search_key, flow_type=flow_type_key)
-                source_bank_review = source_bank_review_rows(conn, selected_where, selected_params, slip_search_key, exclude_ids=pending_delete_ids)
+                duplicate_pairs = duplicate_pair_rows(conn, "", scope, selected_bot_key, slip_search_key, flow_type=flow_type_key) if include_detail_rows else []
+                source_bank_review = source_bank_review_rows(conn, selected_where, selected_params, slip_search_key, exclude_ids=pending_delete_ids) if include_detail_rows else []
                 source_bank_review_total = source_bank_review_count(conn, selected_where, selected_params, slip_search_key, exclude_ids=pending_delete_ids)
-                by_date = date_totals(conn, selected_where, selected_params)
-                daily_flow_summary = daily_flow_totals(conn, selected_where, selected_params)
-                by_from_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(from_bank,''), '(ไม่ทราบธนาคารต้นทาง)')", "(ไม่ทราบธนาคารต้นทาง)")
-                by_to_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(to_bank,''), '(ไม่ทราบธนาคารปลายทาง)')", "(ไม่ทราบธนาคารปลายทาง)")
-                by_sender = grouped_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(sender_name,''), NULLIF(username,''), '(ไม่ทราบผู้ส่งรูป)')")
+                by_date = date_totals(conn, selected_where, selected_params) if include_detail_rows else []
+                daily_flow_summary = daily_flow_totals(conn, selected_where, selected_params) if include_detail_rows else []
+                by_from_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(from_bank,''), '(ไม่ทราบธนาคารต้นทาง)')", "(ไม่ทราบธนาคารต้นทาง)") if include_detail_rows else []
+                by_to_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(to_bank,''), '(ไม่ทราบธนาคารปลายทาง)')", "(ไม่ทราบธนาคารปลายทาง)") if include_detail_rows else []
+                by_sender = grouped_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(sender_name,''), NULLIF(username,''), '(ไม่ทราบผู้ส่งรูป)')") if include_detail_rows else []
                 company_account_daily = company_account_daily_totals(conn, selected_where, selected_params, account_daily_search_key)
-                account_slip_search = account_slip_search_rows(conn, selected_where, selected_params, slip_search_key)
-                account_cross_company = cross_company_account_usage(conn, scope, flow_type_key, selected_bot_key, slip_search_key)
+                account_slip_search = account_slip_search_rows(conn, selected_where, selected_params, slip_search_key) if include_detail_rows else empty_account_slip_search(slip_search_key)
+                account_cross_company = cross_company_account_usage(conn, scope, flow_type_key, selected_bot_key, slip_search_key) if include_detail_rows else []
             else:
                 scope_label = "ไม่มีข้อมูล"
                 open_totals = {"count": 0, "amount": 0}
@@ -4653,7 +4654,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
                 source_bank_review = []
                 source_bank_review_total = 0
 
-        if account_search_mode_key == "scoped":
+        if account_search_mode_key == "scoped" or not include_detail_rows:
             cross_company_account_slip_search = empty_account_slip_search(slip_search_key)
             cross_company_account_slip_search.update({"company_count": 0, "companies": [], "is_cross_company": False})
         else:
@@ -4663,38 +4664,42 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
 
         slip_status_rows = conn.execute(f"SELECT status, COUNT(*) AS count FROM slips {status_where} GROUP BY status", status_params).fetchall()
         job_status_rows = conn.execute(f"SELECT status, COUNT(*) AS count FROM ocr_jobs {job_where} GROUP BY status", job_params).fetchall()
-        recent = conn.execute(
-            f"""
-            SELECT id, COALESCE(NULLIF(bot_key,''),'default') AS bot_key, company_name, chat_id, chat_title, file_id, message_id,
-                   status, error, slip_date_display, slip_date_iso, slip_time,
-                   TRIM(COALESCE(NULLIF(slip_date_display,''), NULLIF(slip_date_iso,''), '') || ' ' || COALESCE(NULLIF(slip_time,''), '')) AS slip_date_text,
-                   transferor_name, recipient_name, sender_name, username, issuer_bank, from_bank, to_bank,
-                   amount, confidence, created_at_iso, settlement_id, is_duplicate, duplicate_of
-            FROM slips
-            {recent_where}
-            -- Operator "recent slips" should follow the slip/message chronology, not OCR completion time.
-            -- A delayed OCR batch can otherwise hide later withdrawal messages behind older slips that finished late.
-            ORDER BY COALESCE(NULLIF(slip_date_iso,''), '') DESC,
-                     COALESCE(NULLIF(slip_time,''), '') DESC,
-                     CAST(COALESCE(message_id,0) AS INTEGER) DESC,
-                     created_at DESC
-            LIMIT 40
-            """,
-            recent_params,
-        ).fetchall()
-        issues = conn.execute(
-            f"""
-            SELECT id, COALESCE(NULLIF(bot_key,''),'default') AS bot_key, company_name, chat_id, chat_title, file_id,
-                   status, error, message_id, created_at_iso,
-                   TRIM(COALESCE(NULLIF(slip_date_display,''), NULLIF(slip_date_iso,''), '') || ' ' || COALESCE(NULLIF(slip_time,''), '')) AS slip_date_text,
-                   transferor_name, recipient_name, sender_name, username, amount, confidence, raw_text
-            FROM slips
-            {issue_where}
-            ORDER BY created_at DESC
-            LIMIT 40
-            """,
-            issue_params,
-        ).fetchall()
+        if include_detail_rows:
+            recent = conn.execute(
+                f"""
+                SELECT id, COALESCE(NULLIF(bot_key,''),'default') AS bot_key, company_name, chat_id, chat_title, file_id, message_id,
+                       status, error, slip_date_display, slip_date_iso, slip_time,
+                       TRIM(COALESCE(NULLIF(slip_date_display,''), NULLIF(slip_date_iso,''), '') || ' ' || COALESCE(NULLIF(slip_time,''), '')) AS slip_date_text,
+                       transferor_name, recipient_name, sender_name, username, issuer_bank, from_bank, to_bank,
+                       amount, confidence, created_at_iso, settlement_id, is_duplicate, duplicate_of
+                FROM slips
+                {recent_where}
+                -- Operator "recent slips" should follow the slip/message chronology, not OCR completion time.
+                -- A delayed OCR batch can otherwise hide later withdrawal messages behind older slips that finished late.
+                ORDER BY COALESCE(NULLIF(slip_date_iso,''), '') DESC,
+                         COALESCE(NULLIF(slip_time,''), '') DESC,
+                         CAST(COALESCE(message_id,0) AS INTEGER) DESC,
+                         created_at DESC
+                LIMIT 40
+                """,
+                recent_params,
+            ).fetchall()
+            issues = conn.execute(
+                f"""
+                SELECT id, COALESCE(NULLIF(bot_key,''),'default') AS bot_key, company_name, chat_id, chat_title, file_id,
+                       status, error, message_id, created_at_iso,
+                       TRIM(COALESCE(NULLIF(slip_date_display,''), NULLIF(slip_date_iso,''), '') || ' ' || COALESCE(NULLIF(slip_time,''), '')) AS slip_date_text,
+                       transferor_name, recipient_name, sender_name, username, amount, confidence, raw_text
+                FROM slips
+                {issue_where}
+                ORDER BY created_at DESC
+                LIMIT 40
+                """,
+                issue_params,
+            ).fetchall()
+        else:
+            recent = []
+            issues = []
         issue_count_row = conn.execute(f"SELECT COUNT(*) AS count FROM slips {issue_where}", issue_params).fetchone()
         issue_queue_count_total = int(issue_count_row["count"] or 0) if issue_count_row else 0
         provider_usage = conn.execute(
@@ -4714,7 +4719,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
             ORDER BY provider, model, status
             """,
             status_params,
-        ).fetchall()
+        ).fetchall() if include_detail_rows else []
         jobs_recent = conn.execute(
             f"""
             SELECT job_id, slip_id, COALESCE(NULLIF(bot_key,''),'default') AS bot_key, company_name, chat_id, message_id, status, attempts, max_attempts, locked_by, error, created_at, updated_at
@@ -4724,7 +4729,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
             LIMIT 50
             """,
             job_recent_params,
-        ).fetchall()
+        ).fetchall() if include_detail_rows else []
 
         company_where = "WHERE 1=1"
         company_where_params: List[Any] = []
