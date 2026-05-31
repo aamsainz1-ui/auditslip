@@ -1972,6 +1972,26 @@ def filter_statement_reconcile_rows(rows: List[Dict[str, Any]], scope: str, flow
     return kept, filtered
 
 
+RECONCILE_TIME_TOLERANCE_MIN = int(os.environ.get("AUDITSLIP_RECONCILE_TIME_TOL_MIN", "5"))
+
+
+def _hhmm_to_minutes(value: Any) -> int:
+    """Return minutes since midnight or -1 if unparseable."""
+    t = clean_display(value)
+    if not t:
+        return -1
+    parts = t.split(":")
+    if len(parts) < 2:
+        return -1
+    try:
+        h = int(parts[0]); m = int(parts[1])
+    except (TypeError, ValueError):
+        return -1
+    if not (0 <= h < 24 and 0 <= m < 60):
+        return -1
+    return h * 60 + m
+
+
 def amount_time_date_match(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
     if abs(float(left.get("amount") or 0) - float(right.get("amount") or 0)) > 0.009:
         return False
@@ -1979,10 +1999,12 @@ def amount_time_date_match(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
     right_date = normalize_match_date(right.get("date_key") or right.get("date"))
     if left_date and right_date and left_date != right_date:
         return False
-    left_time = clean_display(left.get("time"))
-    right_time = clean_display(right.get("time"))
-    if left_time and right_time and left_time != right_time:
-        return False
+    # Time tolerance (default ±5 minutes) - configurable via env
+    left_min = _hhmm_to_minutes(left.get("time"))
+    right_min = _hhmm_to_minutes(right.get("time"))
+    if left_min >= 0 and right_min >= 0:
+        if abs(left_min - right_min) > RECONCILE_TIME_TOLERANCE_MIN:
+            return False
     return True
 
 

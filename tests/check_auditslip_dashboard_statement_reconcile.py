@@ -106,6 +106,8 @@ csv_flows = {(r["amount"], r["time"]): r["flow_type"] for r in csv_rows}
 assert csv_flows[(100.0, "11:05")] == "deposit", csv_rows
 assert csv_flows[(777.0, "12:00")] == "deposit", csv_rows
 assert Dash.safe_statement_file_path(statement_csv.name) == statement_csv.resolve()
+assert Dash.amount_time_date_match({"amount": 100.0, "date_key": "2026-05-22", "time": "11:05"}, {"amount": 100.0, "date_key": "2026-05-22", "time": "11:09"})
+assert not Dash.amount_time_date_match({"amount": 100.0, "date_key": "2026-05-22", "time": "11:05"}, {"amount": 100.0, "date_key": "2026-05-22", "time": "11:11"})
 
 wd = Dash.reconcile_backend_slips_statement(
     db_path,
