@@ -47,17 +47,20 @@ GET /api/audit/cross-dup?bot_key=__all__&scope=today
 
 ## 3. สิ่งที่ควรเพิ่มเพื่อ audit ยอดพนักงานให้แข็งแรง
 
-### P0 — ควรทำก่อนถ้าจะใช้ audit จริง
+### P0 — ทำเพิ่มแล้วรอบแรก / ยังควรต่อยอด
 
-1. **Employee master table**
-   - `employee_id`, `display_name`, `telegram_user_id`, `username`, aliases, role, active
-   - map คนส่งรูป/คนทำรายการ/คนอนุมัติให้เป็น ID เดียวกัน
+1. **Employee master table + Telegram sender mapping — มีแล้วรอบแรก**
+   - เพิ่มตาราง `employee_master` และ `employee_aliases`
+   - sync จาก `user_id`, `username`, `sender_name` ของ Telegram โดยไม่แก้ข้อมูลสลิปเดิม
+   - `daily-variance` ใช้ `employee_id`/`display_name` จาก master ก่อน แล้วค่อย fallback raw sender/transferor
+   - ยังควรเพิ่มหน้าจอจัดการ alias/manual merge ถ้าคนเดียวมีหลายบัญชี Telegram
 
-2. **Employee assignment ต่อสลิป**
-   - เพิ่ม field เช่น `employee_id`, `employee_source` (`telegram_sender`, `manual_assign`, `backoffice_import`)
+2. **Employee assignment ต่อสลิป — มีแบบ derived แล้ว / ยังขาด manual assign**
+   - ตอนนี้ map ด้วย alias จาก Telegram sender โดยไม่เขียนทับ slip row
+   - ยังควรมี manual assignment ต่อสลิป/ต่อกลุ่มรายการ เช่น `employee_id`, `employee_source` (`telegram_sender`, `manual_assign`, `backoffice_import`)
    - มีคิว “ยังไม่รู้พนักงาน” ให้ operator แก้
 
-3. **Employee daily close / shift close**
+3. **Employee daily close / shift close — ยังขาด**
    - เปิดรอบพนักงาน, ปิดรอบพนักงาน, ยอดตั้งต้น, ยอดส่งมอบ, diff
    - เก็บลายเซ็น/ack หรืออย่างน้อย actor + timestamp
 
@@ -128,4 +131,4 @@ curl -fsS 'http://127.0.0.1:8095/api/audit/reconcile?bot_key=bot1&scope=today&fl
 
 ## 5. คำแนะนำสั้น ๆ
 
-ถ้าจะ audit ยอดพนักงานจริง ขั้นต่อไปที่คุ้มที่สุดคือเพิ่ม **Employee master + Employee assignment + Employee daily close** ก่อน ไม่ใช่เพิ่มกราฟ เพราะตอนนี้ข้อมูลยอดมีพอสมควรแล้ว แต่ identity ของ “พนักงานคนไหนรับผิดชอบรายการไหน” ยังไม่แข็งแรงพอสำหรับ audit เชิงความรับผิดชอบ
+ถ้าจะ audit ยอดพนักงานจริง ขั้นต่อไปที่คุ้มที่สุดหลังจากมี **Employee master + Telegram sender mapping** แล้ว คือเพิ่ม **manual alias/assignment + Employee daily close/shift close** เพื่อให้ identity ของ “พนักงานคนไหนรับผิดชอบรายการไหน” แข็งแรงพอสำหรับ audit เชิงความรับผิดชอบ

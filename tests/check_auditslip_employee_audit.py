@@ -42,21 +42,36 @@ bot_b = bot_mod.AuditslipBot(token="TEST_TOKEN", db_path=db_path, dry_run=True, 
 bot_a.init_db()
 
 
-def save(bot: object, slip_id: str, bot_key: str, company: str, amount: float, ref: str, account: str) -> None:
+def save(
+    bot: object,
+    slip_id: str,
+    bot_key: str,
+    company: str,
+    amount: float,
+    ref: str,
+    account: str,
+    *,
+    sender: str = "Uploader",
+    username: str = "ops_a",
+    user_id: str = "U-OPS-A",
+    transferor: str = "Alice",
+) -> None:
     bot.save_slip({
         "id": slip_id,
         "bot_key": bot_key,
         "company_name": company,
         "chat_id": f"{bot_key}_DEP",
         "chat_title": f"{company} ฝาก",
+        "user_id": user_id,
+        "username": username,
         "message_id": int(slip_id.rsplit("-", 1)[-1]),
         "file_id": "FILE" + slip_id,
-        "sender_name": "Uploader",
+        "sender_name": sender,
         "status": "success",
         "slip_date_display": "22/05/26",
         "slip_date_iso": "2026-05-22",
         "slip_time": "11:05",
-        "transferor_name": "Alice",
+        "transferor_name": transferor,
         "from_bank": "SCB",
         "from_account": "111-222-333",
         "to_bank": "KBANK",
@@ -66,9 +81,9 @@ def save(bot: object, slip_id: str, bot_key: str, company: str, amount: float, r
     })
 
 
-save(bot_a, "A-1", "botA", "บริษัท A", 100.0, "REF-100", "999-888-777")
-save(bot_a, "A-2", "botA", "บริษัท A", 55.0, "REF-055", "000-000-000")
-save(bot_b, "B-3", "botB", "บริษัท B", 100.0, "REF-100", "999-888-777")
+save(bot_a, "A-1", "botA", "บริษัท A", 100.0, "REF-100", "999-888-777", transferor="Alice")
+save(bot_a, "A-2", "botA", "บริษัท A", 55.0, "REF-055", "000-000-000", transferor="Bob")
+save(bot_b, "B-3", "botB", "บริษัท B", 100.0, "REF-100", "999-888-777", sender="Uploader B", username="ops_b", user_id="U-OPS-B", transferor="Alice")
 
 with sqlite3.connect(db_path) as conn:
     ledger_mod.ensure_bank_ledger_tables(conn)
@@ -92,9 +107,21 @@ assert reconcile["summary"]["matched_count"] == 1, reconcile
 assert reconcile["summary"]["ledger_only_count"] == 1, reconcile
 assert reconcile["summary"]["slip_only_count"] == 0, reconcile
 
+sync = Audit.sync_employee_master_from_slips(db_path, bot_key="botA", scope="2026-05-22", flow_type="deposit")
+assert sync["ok"] is True, sync
+assert sync["inserted_employees"] == 1, sync
+assert sync["inserted_aliases"] >= 2, sync
+assert sync["employees"][0]["display_name"] == "Uploader", sync
+assert sync["employees"][0]["employee_id"].startswith("emp_"), sync
+
 variance = Audit.employee_daily_variance(db_path, bot_key="botA", scope="2026-05-22", flow_type="deposit", threshold=10)
 assert variance["ok"] is True and variance["has_ledger"] is True, variance
-assert variance["employee_count"] >= 1 and variance["flagged_count"] >= 1, variance
+assert variance["employee_count"] == 1 and variance["flagged_count"] == 1, variance
+employee = variance["employees"][0]
+assert employee["employee"] == "Uploader", variance
+assert employee["employee_id"] == sync["employees"][0]["employee_id"], variance
+assert employee["total_slips"] == 2 and employee["total_amount"] == 155.0, variance
+assert all(row["identity_source"] == "employee_master" for row in variance["rows"]), variance
 
 cross = Audit.cross_bot_duplicates(db_path, scope="2026-05-22")
 assert cross["ok"] is True and cross["group_count"] == 1, cross
@@ -107,7 +134,7 @@ sys.modules["auditslip_dashboard"] = Dash
 dash_spec.loader.exec_module(Dash)
 
 html = Dash.render_dashboard_html("test-token")
-for marker in ["section-employee-audit", "runEmployeeAudit", "/api/audit/reconcile", "/api/audit/daily-variance", "/api/audit/cross-dup"]:
+for marker in ["section-employee-audit", "runEmployeeAudit", "/api/audit/reconcile", "/api/audit/daily-variance", "/api/audit/cross-dup", "Employee ID", "identity_source"]:
     assert marker in html, marker
 
 print("ok: employee audit 1-2-3 covers reconcile, daily variance, and cross-bot duplicates")

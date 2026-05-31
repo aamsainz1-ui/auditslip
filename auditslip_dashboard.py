@@ -7221,8 +7221,8 @@ function renderEmployeeVariance(data) {{
   if (!data || !data.ok) return '<div class="bad">'+esc((data && data.error) || 'โหลด variance ไม่สำเร็จ')+'</div>';
   const employees = (data.employees || []).slice(0,80);
   const rows = (data.rows || []).slice(0,120);
-  const employeeTable = table(employees, [['พนักงาน','employee'], ['สลิป','total_slips'], ['ยอดรวม', r => money(r.total_amount)], ['วันที่ flagged','flagged_days']]);
-  const rowTable = table(rows, [['วันที่','date'], ['พนักงาน','employee'], ['บริษัท','company_name'], ['สลิป','slip_count'], ['ยอดสลิป', r => money(r.slip_total)], ['ยอด ledger วันที่เดียวกัน', r => r.ledger_total === null || r.ledger_total === undefined ? '-' : money(r.ledger_total)], ['variance', r => r.variance === null || r.variance === undefined ? '-' : money(r.variance)], ['flag', r => r.flagged ? 'ต้องตรวจ' : '']]);
+  const employeeTable = table(employees, [['พนักงาน','employee'], ['Employee ID','employee_id'], ['แหล่ง identity','identity_source'], ['สลิป','total_slips'], ['ยอดรวม', r => money(r.total_amount)], ['วันที่ flagged','flagged_days']]);
+  const rowTable = table(rows, [['วันที่','date'], ['พนักงาน','employee'], ['Employee ID','employee_id'], ['identity','identity_source'], ['บริษัท','company_name'], ['สลิป','slip_count'], ['ยอดสลิป', r => money(r.slip_total)], ['ยอด ledger วันที่เดียวกัน', r => r.ledger_total === null || r.ledger_total === undefined ? '-' : money(r.ledger_total)], ['variance', r => r.variance === null || r.variance === undefined ? '-' : money(r.variance)], ['flag', r => r.flagged ? 'ต้องตรวจ' : '']]);
   return '<h4>2 สรุปพนักงาน</h4>'+employeeTable+'<h4>2 รายวันต่อพนักงาน</h4>'+rowTable;
 }}
 function renderEmployeeReconcile(data) {{
