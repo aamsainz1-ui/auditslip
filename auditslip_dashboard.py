@@ -2564,8 +2564,8 @@ def apply_flow_sql(clause: str, params: List[Any], flow_type: str, alias: str = 
     return clause + extra, [*params, *extra_params]
 
 
-def outside_transfer_sql_clause(alias: str = "") -> Tuple[str, List[Any]]:
-    """Exclude manual/external transfer rows from withdrawal limit/company usage panels."""
+def outside_transfer_match_sql_clause(alias: str = "") -> Tuple[str, List[Any]]:
+    """Match manual/external transfer rows (โอนนอก) for separate reporting."""
     prefix = f"{alias}." if alias else ""
     pieces: List[str] = []
     params: List[Any] = []
@@ -2576,12 +2576,35 @@ def outside_transfer_sql_clause(alias: str = "") -> Tuple[str, List[Any]]:
             params.append(f"%{clean_display(token).lower()}%")
     if not pieces:
         return "", []
-    return " AND NOT (" + " OR ".join(pieces) + ")", params
+    return " AND (" + " OR ".join(pieces) + ")", params
+
+
+def outside_transfer_sql_clause(alias: str = "") -> Tuple[str, List[Any]]:
+    """Exclude manual/external transfer rows from withdrawal limit/company usage panels."""
+    match, params = outside_transfer_match_sql_clause(alias=alias)
+    if not match:
+        return "", []
+    return " AND NOT " + match.removeprefix(" AND "), params
 
 
 def exclude_outside_transfers(clause: str, params: List[Any], alias: str = "") -> Tuple[str, List[Any]]:
     extra, extra_params = outside_transfer_sql_clause(alias=alias)
     return clause + extra, [*params, *extra_params]
+
+
+def outside_transfer_scope_clause(where_clause: str, params: List[Any], flow_type: str) -> Tuple[str, List[Any]]:
+    """Scope the separate โอนนอก list to withdrawal rows only."""
+    flow = normalize_flow_type(flow_type)
+    if flow == "deposit":
+        return "1=0", []
+    if flow == "all":
+        clause, scoped_params = apply_flow_sql(where_clause, params, "withdraw")
+    elif flow == "withdraw":
+        clause, scoped_params = where_clause, list(params)
+    else:
+        return "1=0", []
+    extra, extra_params = outside_transfer_match_sql_clause()
+    return clause + extra, [*scoped_params, *extra_params]
 
 
 def limit_scope_clause(where_clause: str, params: List[Any], flow_type: str) -> Tuple[str, List[Any]]:
@@ -3009,6 +3032,7 @@ DASHBOARD_LITE_EMPTY_ARRAY_KEYS = (
     "provider_usage",
     "company_account_daily",
     "withdraw_limit_usage",
+    "outside_transfer_withdrawals",
     "shared_withdraw_limit_usage",
     "account_cross_company",
     "by_transferor",
@@ -3357,6 +3381,63 @@ def cross_company_account_slip_search_rows(conn: sqlite3.Connection, scope: str 
 def count_amount_for_where(conn: sqlite3.Connection, where_clause: str, params: List[Any]) -> Dict[str, Any]:
     row = conn.execute(f"SELECT COUNT(*) AS count, COALESCE(SUM(amount),0) AS amount FROM slips WHERE {where_clause}", params).fetchone()
     return {"count": int(row["count"] or 0), "amount": float(row["amount"] or 0)}
+
+
+def outside_transfer_withdrawal_company_rows(conn: sqlite3.Connection, where_clause: str, params: List[Any], per_company_limit: int = 20) -> List[Dict[str, Any]]:
+    """Return โอนนอก withdrawal rows grouped by company for a separate non-limit panel."""
+    rows = conn.execute(
+        f"""
+        SELECT id, COALESCE(NULLIF(bot_key,''),'default') AS bot_key,
+               COALESCE(NULLIF(company_name,''), COALESCE(NULLIF(bot_key,''),'default')) AS company_name,
+               chat_id, chat_title, message_id, sender_name, username,
+               slip_date_display, slip_date_iso, slip_time,
+               transferor_name, recipient_name, issuer_bank, from_bank, from_account, to_bank, to_account,
+               amount, created_at_iso
+        FROM slips
+        WHERE {where_clause}
+        ORDER BY COALESCE(NULLIF(slip_date_iso,''), '') DESC,
+                 COALESCE(NULLIF(slip_time,''), '') DESC,
+                 CAST(COALESCE(message_id,0) AS INTEGER) DESC,
+                 created_at DESC
+        """,
+        params,
+    ).fetchall()
+    groups: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        item = dict(row)
+        clean_company_fields(item)
+        bot_key = clean_display(item.get("bot_key")) or "default"
+        group = groups.setdefault(
+            bot_key,
+            {
+                "bot_key": bot_key,
+                "company_name": clean_company_name(item.get("company_name"), bot_key),
+                "count": 0,
+                "amount": 0.0,
+                "rows": [],
+            },
+        )
+        amount = float(item.get("amount") or 0)
+        group["count"] += 1
+        group["amount"] += amount
+        date_key, date_label, sort_date = date_bucket(item.get("slip_date_display"), item.get("slip_date_iso"))
+        for field in ["issuer_bank", "from_bank", "to_bank"]:
+            item[field] = display_bank(item.get(field))
+        item.update(
+            {
+                "date_key": date_key,
+                "date": date_label,
+                "sort_date": sort_date,
+                "amount": amount,
+                "sender_display": telegram_sender_display(item.get("sender_name"), item.get("username")),
+            }
+        )
+        item.pop("id", None)
+        if len(group["rows"]) < per_company_limit:
+            group["rows"].append(item)
+    out = list(groups.values())
+    out.sort(key=dict_company_sort_key)
+    return out
 
 
 def flow_split_panels(
@@ -4965,6 +5046,8 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
                 account_cross_company = cross_company_account_usage(conn, scope, flow_type_key, selected_bot_key, slip_search_key) if include_detail_rows else []
             else:
                 scope_label = "ไม่มีข้อมูล"
+                selected_where = "1=0"
+                selected_params = []
                 open_totals = {"count": 0, "amount": 0}
                 all_totals = {"count": 0, "amount": 0}
                 selected_totals = {"count": 0, "amount": 0}
@@ -5155,6 +5238,13 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
         row["raw_text"] = clean_display(row.get("raw_text"))[:240]
 
     limit_check_enabled = limit_check_enabled_for_flow(flow_type_key)
+    if limit_check_enabled:
+        outside_transfer_where, outside_transfer_params = outside_transfer_scope_clause(selected_where, selected_params, flow_type_key)
+        outside_transfer_totals = count_amount_for_where(conn, outside_transfer_where, outside_transfer_params)
+        outside_transfer_withdrawals = outside_transfer_withdrawal_company_rows(conn, outside_transfer_where, outside_transfer_params) if include_detail_rows else []
+    else:
+        outside_transfer_totals = {"count": 0, "amount": 0.0}
+        outside_transfer_withdrawals = []
     shared_withdraw_limit_usage = shared_withdraw_limit_usage_summary(by_account_day_all) if limit_check_enabled else []
     if not limit_check_enabled:
         by_transferor = []
@@ -5213,6 +5303,8 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
             "withdraw_limit_count": int(withdraw_limit_totals.get("count", 0) or 0),
             "withdraw_limit_amount": float(withdraw_limit_totals.get("amount", 0) or 0),
             **withdraw_limit_totals_extra,
+            "outside_transfer_count": int(outside_transfer_totals.get("count", 0) or 0),
+            "outside_transfer_amount": float(outside_transfer_totals.get("amount", 0) or 0),
             "deposit_customer_count": int(deposit_customer_totals.get("count", 0) or 0),
             "deposit_customer_amount": float(deposit_customer_totals.get("amount", 0) or 0),
             "source_bank_review_count": int(source_bank_review_total or 0),
@@ -5227,6 +5319,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
         "company_menu": company_menu_rows,
         "company_account_daily": aggregate_dicts(company_account_daily),
         "withdraw_limit_usage": aggregate_dicts(withdraw_limit_usage),
+        "outside_transfer_withdrawals": aggregate_dicts(outside_transfer_withdrawals),
         "shared_withdraw_limit_usage": aggregate_dicts(shared_withdraw_limit_usage),
         "account_slip_search": account_slip_search,
         "cross_company_account_slip_search": cross_company_account_slip_search,
@@ -6319,6 +6412,7 @@ def render_dashboard_html(token: str = "") -> str:
     </section>
     <section id="limitSection" class="sections menu-section" hidden>
       <div class="card"><h3>ยอดถอนรวม / วงเงินรวมทุกบัญชี</h3><div class="mini">รวมทุกบัญชีถอนในบริษัท/วันที่เลือก · วงเงินเป็นวงเงินรายวันรวมตามบัญชีและวันที่ใน scope</div><div id="withdrawLimitUsageChart"></div></div>
+      <div class="card"><h3>ถอนโอนนอก · แยกต่างหาก</h3><div class="mini">รายการถอนที่เป็นโอนนอก แยกออกจากวงเงินถอนหลัก ไม่เอาไปบวกยอดเกินวงเงิน</div><div id="outsideTransferWithdrawals"></div></div>
       <div class="card"><h3>ฝั่งถอน · วงเงินรายวันต่อบัญชี</h3><div id="withdrawLimitSummary" class="mini">นับเฉพาะกลุ่มถอน ไม่รวมฝาก/เติมมือและโอนนอก</div><div class="mini">แยกตามวันที่ของสลิปและเลขบัญชีผู้โอน วงเงิน/วันจะ reset ทุกวัน และไม่นับสลิปซ้ำ</div><div id="byAccountDay"></div></div>
       <div class="card"><h3>ฝั่งถอน · ตั้งวงเงินจากยอดรายวัน</h3><div class="mini">ตั้งวงเงินบัญชี: กด “ตั้งวงเงิน” จากแถวบัญชี ระบบจะจำบริษัทของแถวนั้นให้เอง แม้ตอนดูรวมทุกบริษัท</div><div class="toolbar limit-edit-form"><input id="limitKey" placeholder="เลือกบัญชีจากปุ่มตั้งวงเงิน" readonly /><input id="limitScopeValue" placeholder="บริษัท/กลุ่มที่จะบันทึก" readonly /><input id="limitName" placeholder="ชื่อบัญชี" /><input id="limitBank" placeholder="ธนาคาร" /><input id="limitAccount" placeholder="เลขบัญชี" /><input id="limitAmount" type="number" step="0.01" placeholder="วงเงินต่อวัน" /><button onclick="saveAccountLimit()">บันทึกวงเงิน</button></div><div id="limitScopeHint" class="mini muted">เลือกบัญชีจากตารางด้านล่างก่อนแก้ไขวงเงิน</div><div id="byTransferor"></div></div>
     </section>
@@ -6800,6 +6894,30 @@ function renderWithdrawLimitUsageChart(rows, totals={{}}) {{
       + '<div><div class="limit-usage-track"><div class="limit-usage-fill '+(isOver ? 'over' : '')+'" style="width:'+width+'%"></div></div><div class="mini">ใช้ไป '+rowPercent.toFixed(1)+'%'+noLimit+'</div></div>'
       + '<div class="limit-usage-values"><div>ถอน '+money(r.withdraw_amount || 0)+'</div><div>วงเงิน '+(Number(r.limit_amount || 0) ? money(r.limit_amount || 0) : '-')+'</div><div class="'+(isOver ? 'bad' : 'good')+'">เหลือ/เกิน '+remainingText+'</div></div>'
       + '</div>';
+  }}).join('')+'</div>';
+}}
+function renderOutsideTransferWithdrawals(rows, totals={{}}) {{
+  const items = rows || [];
+  const totalCount = Number((totals && totals.outside_transfer_count) || items.reduce((sum, r) => sum + Number(r.count || 0), 0));
+  const totalAmount = Number((totals && totals.outside_transfer_amount) || items.reduce((sum, r) => sum + Number(r.amount || 0), 0));
+  const summary = '<div class="limit-usage-summary">'
+    + '<div class="limit-usage-stat"><div class="label">ถอนโอนนอก</div><div class="value bad">'+money(totalAmount)+'</div><div class="mini">'+esc(totalCount)+' สลิป · แยกไม่บวกวงเงิน</div></div>'
+    + '</div>';
+  if (!items.length) return summary + '<div class="muted">ไม่มีรายการถอนโอนนอกใน scope นี้</div>';
+  return summary + '<div class="cross-company-list outside-transfer-list">'+items.map(c => {{
+    const detail = (c.rows || []).map(r => {{
+      const who = r.sender_display || r.sender_name || r.username || '-';
+      const from = [r.from_bank, r.from_account].filter(Boolean).join(' ');
+      const to = [r.to_bank, r.to_account].filter(Boolean).join(' ');
+      const banks = [from || '-', to || '-'].join(' → ');
+      return '<div class="cross-company-day-row"><span>'+esc((r.date || r.date_key || '-')+' '+(r.slip_time || '')+' · msg '+(r.message_id || '-'))+'</span><span class="day-amount">'+money(r.amount || 0)+'</span></div>'
+        + '<div class="mini">'+esc(who)+' · '+esc(banks)+'</div>';
+    }}).join('');
+    return '<article class="cross-company-card outside-transfer-card">'
+      + '<div class="cross-company-head"><div><div class="label">บริษัท</div><div class="cross-company-account">'+esc(c.company_name || c.bot_key || '-')+'</div></div><div class="cross-company-chips">'+esc(c.count || 0)+' สลิป</div></div>'
+      + '<div class="cross-company-summary"><div class="cross-company-stat"><div class="label">ยอดโอนนอก</div><div class="value bad">'+money(c.amount || 0)+'</div></div></div>'
+      + '<div class="cross-company-section-title">รายการในบริษัทนี้</div><div class="cross-company-days">'+(detail || '<div class="muted">ไม่มีรายการ</div>')+'</div>'
+      + '</article>';
   }}).join('')+'</div>';
 }}
 function renderSharedWithdrawLimitUsage(rows) {{
@@ -8192,8 +8310,10 @@ async function load(options={{}}) {{
     document.getElementById('byDate').innerHTML = dateTable(data.by_date);
     const withdrawSummary = document.getElementById('withdrawLimitSummary');
     const withdrawUsageChart = document.getElementById('withdrawLimitUsageChart');
+    const outsideTransferWithdrawals = document.getElementById('outsideTransferWithdrawals');
     const depositSummary = document.getElementById('depositCustomerSummary');
     if (withdrawUsageChart) withdrawUsageChart.innerHTML = renderWithdrawLimitUsageChart(data.withdraw_limit_usage || [], data.totals || {{}});
+    if (outsideTransferWithdrawals) outsideTransferWithdrawals.innerHTML = renderOutsideTransferWithdrawals(data.outside_transfer_withdrawals || [], data.totals || {{}});
     if (withdrawSummary) withdrawSummary.textContent = 'ฝั่งถอน/วงเงิน: ' + (data.totals.withdraw_limit_count || 0) + ' สลิป · ' + money(data.totals.withdraw_limit_amount || 0) + ' / วงเงินรวม ' + money(data.totals.withdraw_limit_capacity_amount || 0) + ' · ไม่รวมฝาก/เติมมือและโอนนอก';
     if (depositSummary) depositSummary.textContent = 'ฝั่งฝาก/เติมมือ: ' + (data.totals.deposit_customer_count || 0) + ' สลิป · ' + money(data.totals.deposit_customer_amount || 0) + ' · สลิปลูกค้า ไม่มีวงเงิน';
     if (data.limit_check_enabled === false) {{
