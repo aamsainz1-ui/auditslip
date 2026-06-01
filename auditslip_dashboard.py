@@ -3187,6 +3187,7 @@ def annotate_cross_duplicate_matches(conn: sqlite3.Connection, rows: List[Dict[s
             SELECT COALESCE(NULLIF(s.bot_key,''),'default') AS bot_key,
                    s.company_name, s.chat_id, s.message_id,
                    s.sender_name, s.username, s.amount, s.reference_no,
+                   TRIM(COALESCE(NULLIF(s.slip_date_display,''), NULLIF(s.slip_date_iso,''), '') || ' ' || COALESCE(NULLIF(s.slip_time,''), '')) AS slip_date_text,
                    s.slip_date_iso, s.is_duplicate
             FROM slips s
             JOIN duplicate_keys k
@@ -3229,6 +3230,7 @@ def annotate_cross_duplicate_matches(conn: sqlite3.Connection, rows: List[Dict[s
                 "message_id": clean_display(match.get("message_id")),
                 "amount": float(match.get("amount") or 0),
                 "sender_display": telegram_sender_display(match.get("sender_name"), match.get("username")),
+                "slip_date_text": clean_display(match.get("slip_date_text")),
                 "is_duplicate": int(match.get("is_duplicate") or 0),
             })
         row["cross_duplicate_source_count"] = len({f"{m.get('bot_key') or 'default'}:{m.get('chat_id') or ''}" for m in group}) if group else 0
@@ -5991,6 +5993,15 @@ def render_dashboard_html(token: str = "") -> str:
     .side-actions {{ display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:10px; }}
     .side-actions.single {{ grid-template-columns:1fr; }}
     .side-nav {{ display:grid; gap:7px; }}
+    .side-nav-quick {{ margin-bottom:10px; }}
+    .side-menu-group {{ border-top:1px solid rgba(148,163,184,.14); margin-top:10px; padding-top:8px; }}
+    .side-menu-group summary {{ list-style:none; display:flex; justify-content:space-between; align-items:center; gap:8px; cursor:pointer; padding:8px 2px; color:#f8fafc; }}
+    .side-menu-group summary::-webkit-details-marker {{ display:none; }}
+    .side-menu-group summary span {{ font-size:13px; font-weight:900; }}
+    .side-menu-group summary small {{ color:var(--muted); font-size:11px; }}
+    .side-menu-group summary::after {{ content:'▸'; color:var(--muted); font-size:12px; }}
+    .side-menu-group[open] summary::after {{ content:'▾'; }}
+    .side-menu-group .side-nav {{ margin-top:4px; }}
     .side-menu-item {{ width:100%; display:flex; gap:10px; align-items:center; text-align:left; padding:10px; border-radius:14px; background:rgba(15,23,42,.72); border:1px solid transparent; color:var(--text); }}
     .side-menu-item:hover, .side-menu-item.active {{ border-color:rgba(59,130,246,.45); background:linear-gradient(135deg,rgba(37,99,235,.28),rgba(15,23,42,.8)); }}
     .side-menu-icon {{ width:28px; height:28px; border-radius:10px; display:flex; align-items:center; justify-content:center; flex:0 0 auto; background:#1f2a44; color:#bfdbfe; font-size:14px; }}
@@ -6180,35 +6191,41 @@ def render_dashboard_html(token: str = "") -> str:
         </details>
 
         <section class="side-panel side-nav-panel" data-legacy-label="เมนูฟังก์ชั่น">
-          <div class="side-heading"><span>เมนูหลัก</span><small>จัดหมวดตามงาน</small></div>
-          <div class="side-nav">
-            <button class="side-menu-item active" type="button" data-menu-target="section-operator-home" onclick="showMenuSection('section-operator-home')"><span class="side-menu-icon">★</span><span class="side-menu-text"><span class="side-menu-title">งานวันนี้</span><span class="side-menu-desc">ภาพรวม operator และรายการที่ต้องจัดการ</span></span></button>
+          <div class="side-heading"><span>เมนูด่วน</span><small>เปิดบ่อย</small></div>
+          <div class="side-nav side-nav-quick">
+            <button class="side-menu-item active" type="button" data-menu-target="section-operator-home" onclick="showMenuSection('section-operator-home')"><span class="side-menu-icon">★</span><span class="side-menu-text"><span class="side-menu-title">งานวันนี้</span><span class="side-menu-desc">รายการที่ต้องจัดการ</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-cross-company-accounts" onclick="showMenuSection('section-cross-company-accounts')"><span class="side-menu-icon">⇆</span><span class="side-menu-text"><span class="side-menu-title">ยอดข้ามบริษัท</span><span class="side-menu-desc">บัญชีถอนซ้ำ · ใครส่ง/เวลา</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-duplicates" onclick="showMenuSection('section-duplicates')"><span class="side-menu-icon">⧉</span><span class="side-menu-text"><span class="side-menu-title">สลิปซ้ำ</span><span class="side-menu-desc">ตรวจคู่ซ้ำ</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="limitSection" onclick="showMenuSection('limitSection')"><span class="side-menu-icon">↯</span><span class="side-menu-text"><span class="side-menu-title">ฝั่งถอน/วงเงิน</span><span class="side-menu-desc">เกินวงเงินรายวัน</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-overview" onclick="showMenuSection('section-overview')"><span class="side-menu-icon">▦</span><span class="side-menu-text"><span class="side-menu-title">ภาพรวม</span><span class="side-menu-desc">ยอดรวมแยกบริษัท</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="all" onclick="showAllMenuSections()"><span class="side-menu-icon">⌘</span><span class="side-menu-text"><span class="side-menu-title">แสดงทั้งหมด</span><span class="side-menu-desc">ทุกการ์ดและทุกตาราง</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="all" onclick="showAllMenuSections()"><span class="side-menu-icon">⌘</span><span class="side-menu-text"><span class="side-menu-title">แสดงทั้งหมด</span><span class="side-menu-desc">ทุกการ์ด</span></span></button>
           </div>
-          <div class="side-heading" style="margin-top:14px"><span>ตรวจเงิน</span><small>เดินบัญชี · ธนาคาร · กระทบยอด</small></div>
-          <div class="side-nav">
-            <button class="side-menu-item" type="button" data-menu-target="section-account-ledger" onclick="showMenuSection('section-account-ledger')"><span class="side-menu-icon">≡</span><span class="side-menu-text"><span class="side-menu-title">เดินบัญชีรายบัญชี</span><span class="side-menu-desc">timeline + running balance</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="section-employee-audit" onclick="showMenuSection('section-employee-audit')"><span class="side-menu-icon">◫</span><span class="side-menu-text"><span class="side-menu-title">ตรวจยอด</span><span class="side-menu-desc">1 เทียบเดินบัญชี · 2 รายวัน · 3 ซ้ำข้ามบริษัท</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="section-cross-company-accounts" onclick="showMenuSection('section-cross-company-accounts')"><span class="side-menu-icon">⇆</span><span class="side-menu-text"><span class="side-menu-title">ยอดข้ามบริษัท</span><span class="side-menu-desc">บัญชีถอนซ้ำหลายบริษัท · คนส่งรูป</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="section-bank-ledger" onclick="showMenuSection('section-bank-ledger')"><span class="side-menu-icon">▤</span><span class="side-menu-text"><span class="side-menu-title">Preview Statement</span><span class="side-menu-desc">อัปโหลด statement เทียบสลิป</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="section-banks" onclick="showMenuSection('section-banks')"><span class="side-menu-icon">⇄</span><span class="side-menu-text"><span class="side-menu-title">ยอดธนาคาร</span><span class="side-menu-desc">ยอดแยกต้นทาง/ปลายทาง</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="section-reconcile" onclick="showMenuSection('section-reconcile')"><span class="side-menu-icon">✓</span><span class="side-menu-text"><span class="side-menu-title">กระทบยอด Statement</span><span class="side-menu-desc">หลังบ้าน vs สลิป</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="section-bank-review" onclick="showMenuSection('section-bank-review')"><span class="side-menu-icon">◎</span><span class="side-menu-text"><span class="side-menu-title">รีเช็คธนาคาร</span><span class="side-menu-desc">OpenAI เช็กต้นทางที่ไม่ชัด</span></span></button>
-          </div>
-          <div class="side-heading" style="margin-top:14px"><span>จัดการสลิป</span><small>สลิปล่าสุด · ฝาก/ถอน · ซ้ำ</small></div>
-          <div class="side-nav">
-            <button class="side-menu-item" type="button" data-menu-target="section-recent" onclick="showMenuSection('section-recent')"><span class="side-menu-icon">●</span><span class="side-menu-text"><span class="side-menu-title">Recent / Queue</span><span class="side-menu-desc">รายการล่าสุดและคิว OCR</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="section-deposit-slips" onclick="showMenuSection('section-deposit-slips')"><span class="side-menu-icon">＋</span><span class="side-menu-text"><span class="side-menu-title">ฝาก/เติมมือ</span><span class="side-menu-desc">สลิปลูกค้า ไม่มีวงเงิน</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="limitSection" onclick="showMenuSection('limitSection')"><span class="side-menu-icon">↯</span><span class="side-menu-text"><span class="side-menu-title">ฝั่งถอน/วงเงิน</span><span class="side-menu-desc">วงเงินรายวัน/ผู้โอนถอน</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="section-date-sender" onclick="showMenuSection('section-date-sender')"><span class="side-menu-icon">◷</span><span class="side-menu-text"><span class="side-menu-title">วันที่/ผู้ส่งรูป</span><span class="side-menu-desc">ยอดรายวันและคนส่งรูป</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="section-duplicates" onclick="showMenuSection('section-duplicates')"><span class="side-menu-icon">⧉</span><span class="side-menu-text"><span class="side-menu-title">สลิปซ้ำ</span><span class="side-menu-desc">ตรวจคู่ซ้ำ/ยกเลิกซ้ำ</span></span></button>
-          </div>
-          <div class="side-heading" style="margin-top:14px"><span>ระบบ</span><small>บัญชี · พิจารณา</small></div>
-          <div class="side-nav">
-            <button class="side-menu-item" type="button" data-menu-target="section-pending" onclick="showMenuSection('section-pending')"><span class="side-menu-icon">⏳</span><span class="side-menu-text"><span class="side-menu-title">รออนุมัติ <span id="pendingBadge" class="pending-badge" hidden>0</span></span><span class="side-menu-desc">two-person approval · ยังไม่ได้อนุมัติ</span></span></button>
-            <button class="side-menu-item" type="button" data-menu-target="section-company-accounts" onclick="showMenuSection('section-company-accounts')"><span class="side-menu-icon">🏦</span><span class="side-menu-text"><span class="side-menu-title">บัญชี/ค้นสลิป</span><span class="side-menu-desc">บัญชีรับเงินและดูรูปสลิปต่อบัญชี</span></span></button>
-          </div>
+          <details class="side-menu-group" data-menu-group="money">
+            <summary><span>ตรวจเงิน</span><small>เดินบัญชี · ธนาคาร</small></summary>
+            <div class="side-nav">
+              <button class="side-menu-item" type="button" data-menu-target="section-account-ledger" onclick="showMenuSection('section-account-ledger')"><span class="side-menu-icon">≡</span><span class="side-menu-text"><span class="side-menu-title">เดินบัญชีรายบัญชี</span><span class="side-menu-desc">timeline + running balance</span></span></button>
+              <button class="side-menu-item" type="button" data-menu-target="section-employee-audit" onclick="showMenuSection('section-employee-audit')"><span class="side-menu-icon">◫</span><span class="side-menu-text"><span class="side-menu-title">ตรวจยอด</span><span class="side-menu-desc">1 เทียบเดินบัญชี · 2 รายวัน · 3 ซ้ำข้ามบริษัท</span></span></button>
+              <button class="side-menu-item" type="button" data-menu-target="section-bank-ledger" onclick="showMenuSection('section-bank-ledger')"><span class="side-menu-icon">▤</span><span class="side-menu-text"><span class="side-menu-title">Preview Statement</span><span class="side-menu-desc">อัปโหลด statement เทียบสลิป</span></span></button>
+              <button class="side-menu-item" type="button" data-menu-target="section-banks" onclick="showMenuSection('section-banks')"><span class="side-menu-icon">⇄</span><span class="side-menu-text"><span class="side-menu-title">ยอดธนาคาร</span><span class="side-menu-desc">ยอดแยกต้นทาง/ปลายทาง</span></span></button>
+              <button class="side-menu-item" type="button" data-menu-target="section-reconcile" onclick="showMenuSection('section-reconcile')"><span class="side-menu-icon">✓</span><span class="side-menu-text"><span class="side-menu-title">กระทบยอด Statement</span><span class="side-menu-desc">หลังบ้าน vs สลิป</span></span></button>
+              <button class="side-menu-item" type="button" data-menu-target="section-bank-review" onclick="showMenuSection('section-bank-review')"><span class="side-menu-icon">◎</span><span class="side-menu-text"><span class="side-menu-title">รีเช็คธนาคาร</span><span class="side-menu-desc">OpenAI เช็กต้นทางที่ไม่ชัด</span></span></button>
+            </div>
+          </details>
+          <details class="side-menu-group" data-menu-group="slips">
+            <summary><span>จัดการสลิป</span><small>ล่าสุด · ฝาก/ถอน</small></summary>
+            <div class="side-nav">
+              <button class="side-menu-item" type="button" data-menu-target="section-recent" onclick="showMenuSection('section-recent')"><span class="side-menu-icon">●</span><span class="side-menu-text"><span class="side-menu-title">Recent / Queue</span><span class="side-menu-desc">รายการล่าสุดและคิว OCR</span></span></button>
+              <button class="side-menu-item" type="button" data-menu-target="section-deposit-slips" onclick="showMenuSection('section-deposit-slips')"><span class="side-menu-icon">＋</span><span class="side-menu-text"><span class="side-menu-title">ฝาก/เติมมือ</span><span class="side-menu-desc">สลิปลูกค้า ไม่มีวงเงิน</span></span></button>
+              <button class="side-menu-item" type="button" data-menu-target="section-date-sender" onclick="showMenuSection('section-date-sender')"><span class="side-menu-icon">◷</span><span class="side-menu-text"><span class="side-menu-title">วันที่/ผู้ส่งรูป</span><span class="side-menu-desc">ยอดรายวันและคนส่งรูป</span></span></button>
+            </div>
+          </details>
+          <details class="side-menu-group" data-menu-group="system">
+            <summary><span>ระบบ</span><small>อนุมัติ · บัญชี</small></summary>
+            <div class="side-nav">
+              <button class="side-menu-item" type="button" data-menu-target="section-pending" onclick="showMenuSection('section-pending')"><span class="side-menu-icon">⏳</span><span class="side-menu-text"><span class="side-menu-title">รออนุมัติ <span id="pendingBadge" class="pending-badge" hidden>0</span></span><span class="side-menu-desc">two-person approval · ยังไม่ได้อนุมัติ</span></span></button>
+              <button class="side-menu-item" type="button" data-menu-target="section-company-accounts" onclick="showMenuSection('section-company-accounts')"><span class="side-menu-icon">🏦</span><span class="side-menu-text"><span class="side-menu-title">บัญชี/ค้นสลิป</span><span class="side-menu-desc">บัญชีรับเงินและดูรูปสลิปต่อบัญชี</span></span></button>
+            </div>
+          </details>
         </section>
 
         <section class="side-panel side-export-panel">
@@ -6517,6 +6534,15 @@ function refreshDashboardHome() {{
 function setActiveMenu(target) {{
   document.querySelectorAll('[data-menu-target]').forEach(btn => btn.classList.toggle('active', String(btn.dataset.menuTarget || '') === String(target || 'all')));
 }}
+function openMenuGroupForTarget(target) {{
+  if (!target || target === 'all') return;
+  document.querySelectorAll('details.side-menu-group [data-menu-target]').forEach(btn => {{
+    if (String(btn.dataset.menuTarget || '') === String(target)) {{
+      const group = btn.closest('details.side-menu-group');
+      if (group) group.open = true;
+    }}
+  }});
+}}
 function showAllMenuSections(options={{}}) {{
   document.querySelectorAll('.menu-section').forEach(section => section.hidden = false);
   setActiveMenu('all');
@@ -6529,6 +6555,7 @@ function showMenuSection(target, options={{}}) {{
     section.hidden = !(section.dataset.alwaysVisible === 'true' || section.id === target);
   }});
   setActiveMenu(target);
+  openMenuGroupForTarget(target);
   const section = document.getElementById(target);
   if (options.scroll !== false && section) section.scrollIntoView({{behavior:'smooth', block:'start'}});
   if (target === 'section-account-ledger') populateLedgerAccounts();
@@ -6792,8 +6819,8 @@ function renderAccountSlipSearch(result) {{
     const accounts = [r.from_account, r.to_account].filter(Boolean).join(' → ') || '-';
     const names = [r.transferor_name, r.recipient_name].filter(Boolean).join(' → ') || r.sender_name || '-';
     return '<div class="slip-card">'+image+'<div class="slip-body"><div class="top"><b>'+esc(r.company_name || r.bot_key || '-')+'</b><span class="pill">'+esc(r.flow_label || flowName(r.flow_type))+'</span></div>'
-      + '<div class="mini">'+esc(r.slip_date_text || ((r.date || r.date_key || '')+' '+(r.slip_time || '')))+' · msg '+esc(r.message_id || '-')+' · '+esc(r.matched_label || '-')+'</div>'
-      + '<div class="mini">ผู้ส่งรูป: '+esc(r.sender_display || r.sender_name || r.username || '-')+' · กลุ่ม: '+esc(r.chat_title || '-')+'</div>'
+      + '<div class="mini"><b>เวลาในสลิป:</b> '+esc(r.slip_date_text || ((r.date || r.date_key || '')+' '+(r.slip_time || '')))+' · msg '+esc(r.message_id || '-')+' · '+esc(r.matched_label || '-')+'</div>'
+      + '<div class="mini"><b>ใครส่งรูป:</b> '+esc(r.sender_display || r.sender_name || r.username || '-')+' · กลุ่ม: '+esc(r.chat_title || '-')+'</div>'
       + '<div>'+esc(names)+'</div><div class="mini">'+esc(banks)+' · '+esc(accounts)+'</div>'
       + '<div>ยอด <b>'+money(r.amount || 0)+'</b></div>'
       + '<div class="mini">ref '+esc(r.reference || r.reference_no || '-')+'</div>'
@@ -6817,10 +6844,10 @@ function renderCrossCompanyAccountSlipSearch(result) {{
     const names = [r.transferor_name, r.recipient_name].filter(Boolean).join(' → ') || r.sender_name || '-';
     const crossDupeMatches = r.cross_duplicate_matches || [];
     const crossDupeBadge = Number(r.cross_duplicate_match_count || 0) > 0 ? '<span class="pill warn">พบสลิปตรงกันในบริษัทอื่น</span>' : '';
-    const crossDupeLine = crossDupeMatches.length ? '<div class="mini warn">พบสลิปตรงกันในบริษัทอื่น: '+crossDupeMatches.map(m => esc(m.company_name || m.bot_key || '-')+' msg '+esc(m.message_id || '-')+' · '+money(m.amount || 0)+' · ผู้ส่งรูป '+esc(m.sender_display || m.sender_name || m.username || '-')).join(' · ')+'</div>' : '';
+    const crossDupeLine = crossDupeMatches.length ? '<div class="mini warn"><b>ตรงกับบริษัทอื่น:</b> '+crossDupeMatches.map(m => esc(m.company_name || m.bot_key || '-')+' · เวลา '+esc(m.slip_date_text || '-')+' · msg '+esc(m.message_id || '-')+' · '+money(m.amount || 0)+' · ใครส่งรูป '+esc(m.sender_display || m.sender_name || m.username || '-')).join(' · ')+'</div>' : '';
     return '<div class="slip-card">'+image+'<div class="slip-body"><div class="top"><b>'+esc(r.company_name || r.bot_key || '-')+'</b><span class="pill">'+esc(r.flow_label || flowName(r.flow_type))+'</span>'+crossDupeBadge+'</div>'
-      + '<div class="mini">'+esc(r.slip_date_text || ((r.date || r.date_key || '')+' '+(r.slip_time || '')))+' · msg '+esc(r.message_id || '-')+' · '+esc(r.matched_label || '-')+'</div>'
-      + '<div class="mini">ผู้ส่งรูป: '+esc(r.sender_display || r.sender_name || r.username || '-')+' · กลุ่ม: '+esc(r.chat_title || '-')+'</div>'
+      + '<div class="mini"><b>เวลาในสลิป:</b> '+esc(r.slip_date_text || ((r.date || r.date_key || '')+' '+(r.slip_time || '')))+' · msg '+esc(r.message_id || '-')+' · '+esc(r.matched_label || '-')+'</div>'
+      + '<div class="mini"><b>ใครส่งรูป:</b> '+esc(r.sender_display || r.sender_name || r.username || '-')+' · กลุ่ม: '+esc(r.chat_title || '-')+'</div>'
       + crossDupeLine
       + '<div>'+esc(names)+'</div><div class="mini">'+esc(banks)+' · '+esc(accounts)+'</div>'
       + '<div>ยอด <b>'+money(r.amount || 0)+'</b></div>'

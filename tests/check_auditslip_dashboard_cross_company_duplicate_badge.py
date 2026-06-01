@@ -90,7 +90,8 @@ for row in flagged:
     matches = row["cross_duplicate_matches"]
     assert len(matches) == 1, row
     assert matches[0]["company_name"] != row["company_name"], row
-    assert set(matches[0]) == {"company_name", "bot_key", "message_id", "amount", "sender_display", "is_duplicate"}, matches[0]
+    assert set(matches[0]) == {"company_name", "bot_key", "message_id", "amount", "sender_display", "slip_date_text", "is_duplicate"}, matches[0]
+    assert matches[0]["slip_date_text"], matches[0]
 
 normal = [r for r in rows if r["reference"] == "NORMAL-REF-123"]
 assert normal and normal[0].get("cross_duplicate_match_count", 0) == 0, rows
