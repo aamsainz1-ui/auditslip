@@ -2410,6 +2410,8 @@ def global_scope_where(scope: str = "open", success_only: bool = True, bot_key: 
 FLOW_TYPE_LABELS = {"all": "รวมทุกกลุ่ม", "deposit": "ฝาก/เติมมือ", "withdraw": "ถอน", "other": "อื่นๆ"}
 DEPOSIT_TITLE_TOKENS = ["ฝาก", "deposit", "deposits", "รับฝาก", "เติมเงิน", "เติมมือ", "topup", "top-up"]
 WITHDRAW_TITLE_TOKENS = ["ถอน", "withdraw", "withdrawal", "withdrawals"]
+OUTSIDE_TRANSFER_TOKENS = ["โอนนอก", "external transfer"]
+OUTSIDE_TRANSFER_FIELDS = ["issuer_bank", "from_bank", "to_bank", "transaction_type", "label", "raw_text"]
 
 
 def normalize_flow_type(value: Any) -> str:
@@ -2562,14 +2564,35 @@ def apply_flow_sql(clause: str, params: List[Any], flow_type: str, alias: str = 
     return clause + extra, [*params, *extra_params]
 
 
+def outside_transfer_sql_clause(alias: str = "") -> Tuple[str, List[Any]]:
+    """Exclude manual/external transfer rows from withdrawal limit/company usage panels."""
+    prefix = f"{alias}." if alias else ""
+    pieces: List[str] = []
+    params: List[Any] = []
+    for field in OUTSIDE_TRANSFER_FIELDS:
+        expr = f"LOWER(COALESCE(CAST({prefix}{field} AS TEXT),''))"
+        for token in OUTSIDE_TRANSFER_TOKENS:
+            pieces.append(f"{expr} LIKE ?")
+            params.append(f"%{clean_display(token).lower()}%")
+    if not pieces:
+        return "", []
+    return " AND NOT (" + " OR ".join(pieces) + ")", params
+
+
+def exclude_outside_transfers(clause: str, params: List[Any], alias: str = "") -> Tuple[str, List[Any]]:
+    extra, extra_params = outside_transfer_sql_clause(alias=alias)
+    return clause + extra, [*params, *extra_params]
+
+
 def limit_scope_clause(where_clause: str, params: List[Any], flow_type: str) -> Tuple[str, List[Any]]:
-    """Scope transferor/limit panels to withdrawal slips only when the dashboard shows all flows."""
+    """Scope transferor/limit panels to withdrawal slips only and exclude โอนนอก/manual external transfers."""
     flow = normalize_flow_type(flow_type)
     if flow == "deposit":
         return "1=0", []
     if flow == "all":
-        return apply_flow_sql(where_clause, params, "withdraw")
-    return where_clause, list(params)
+        clause, scoped_params = apply_flow_sql(where_clause, params, "withdraw")
+        return exclude_outside_transfers(clause, scoped_params)
+    return exclude_outside_transfers(where_clause, list(params))
 
 
 def deposit_customer_scope_clause(where_clause: str, params: List[Any], flow_type: str) -> Tuple[str, List[Any]]:
@@ -6296,7 +6319,7 @@ def render_dashboard_html(token: str = "") -> str:
     </section>
     <section id="limitSection" class="sections menu-section" hidden>
       <div class="card"><h3>ยอดถอนรวม / วงเงินรวมทุกบัญชี</h3><div class="mini">รวมทุกบัญชีถอนในบริษัท/วันที่เลือก · วงเงินเป็นวงเงินรายวันรวมตามบัญชีและวันที่ใน scope</div><div id="withdrawLimitUsageChart"></div></div>
-      <div class="card"><h3>ฝั่งถอน · วงเงินรายวันต่อบัญชี</h3><div id="withdrawLimitSummary" class="mini">นับเฉพาะกลุ่มถอน ไม่รวมฝาก/เติมมือ</div><div class="mini">แยกตามวันที่ของสลิปและเลขบัญชีผู้โอน วงเงิน/วันจะ reset ทุกวัน และไม่นับสลิปซ้ำ</div><div id="byAccountDay"></div></div>
+      <div class="card"><h3>ฝั่งถอน · วงเงินรายวันต่อบัญชี</h3><div id="withdrawLimitSummary" class="mini">นับเฉพาะกลุ่มถอน ไม่รวมฝาก/เติมมือและโอนนอก</div><div class="mini">แยกตามวันที่ของสลิปและเลขบัญชีผู้โอน วงเงิน/วันจะ reset ทุกวัน และไม่นับสลิปซ้ำ</div><div id="byAccountDay"></div></div>
       <div class="card"><h3>ฝั่งถอน · ตั้งวงเงินจากยอดรายวัน</h3><div class="mini">ตั้งวงเงินบัญชี: กด “ตั้งวงเงิน” จากแถวบัญชี ระบบจะจำบริษัทของแถวนั้นให้เอง แม้ตอนดูรวมทุกบริษัท</div><div class="toolbar limit-edit-form"><input id="limitKey" placeholder="เลือกบัญชีจากปุ่มตั้งวงเงิน" readonly /><input id="limitScopeValue" placeholder="บริษัท/กลุ่มที่จะบันทึก" readonly /><input id="limitName" placeholder="ชื่อบัญชี" /><input id="limitBank" placeholder="ธนาคาร" /><input id="limitAccount" placeholder="เลขบัญชี" /><input id="limitAmount" type="number" step="0.01" placeholder="วงเงินต่อวัน" /><button onclick="saveAccountLimit()">บันทึกวงเงิน</button></div><div id="limitScopeHint" class="mini muted">เลือกบัญชีจากตารางด้านล่างก่อนแก้ไขวงเงิน</div><div id="byTransferor"></div></div>
     </section>
     <section id="section-deposit-slips" class="sections menu-section" hidden>
@@ -8171,7 +8194,7 @@ async function load(options={{}}) {{
     const withdrawUsageChart = document.getElementById('withdrawLimitUsageChart');
     const depositSummary = document.getElementById('depositCustomerSummary');
     if (withdrawUsageChart) withdrawUsageChart.innerHTML = renderWithdrawLimitUsageChart(data.withdraw_limit_usage || [], data.totals || {{}});
-    if (withdrawSummary) withdrawSummary.textContent = 'ฝั่งถอน/วงเงิน: ' + (data.totals.withdraw_limit_count || 0) + ' สลิป · ' + money(data.totals.withdraw_limit_amount || 0) + ' / วงเงินรวม ' + money(data.totals.withdraw_limit_capacity_amount || 0) + ' · ไม่รวมฝาก/เติมมือ';
+    if (withdrawSummary) withdrawSummary.textContent = 'ฝั่งถอน/วงเงิน: ' + (data.totals.withdraw_limit_count || 0) + ' สลิป · ' + money(data.totals.withdraw_limit_amount || 0) + ' / วงเงินรวม ' + money(data.totals.withdraw_limit_capacity_amount || 0) + ' · ไม่รวมฝาก/เติมมือและโอนนอก';
     if (depositSummary) depositSummary.textContent = 'ฝั่งฝาก/เติมมือ: ' + (data.totals.deposit_customer_count || 0) + ' สลิป · ' + money(data.totals.deposit_customer_amount || 0) + ' · สลิปลูกค้า ไม่มีวงเงิน';
     if (data.limit_check_enabled === false) {{
       const limitNote = '<div class="muted">กลุ่มฝาก/เติมมือ ไม่ต้องเช็กวงเงิน</div>';
