@@ -18,9 +18,10 @@ html = Dash.render_dashboard_html("test-token")
 assert "restoreActiveMenuSection" not in html
 assert "ACTIVE_MENU_KEY" not in html
 assert "window.history.scrollRestoration = 'manual'" in html
-assert "showMenuSection('section-operator-home', {scroll:false, persist:false})" in html
+assert "showMenuSection('section-operator-home', {scroll:false, persist:false, syncHash:false})" in html
 assert "refreshDashboardHome" in html
 assert "load({home:true, scrollTop:true, smooth:false}); setInterval(() => load({lite:true}), 10000)" in html
+assert "load({home:true, scrollTop:true, smooth:false, ignoreHash:true})" in html
 
 # The top dashboard cards should not hide deposit+withdraw in one generic total.
 for marker in [

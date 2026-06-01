@@ -6003,6 +6003,7 @@ def render_dashboard_html(token: str = "") -> str:
     .side-menu-group[open] summary::after {{ content:'▾'; }}
     .side-menu-group .side-nav {{ margin-top:4px; }}
     .side-menu-item {{ width:100%; display:flex; gap:10px; align-items:center; text-align:left; padding:10px; border-radius:14px; background:rgba(15,23,42,.72); border:1px solid transparent; color:var(--text); }}
+    .side-menu-item, .mobile-bottom-nav button {{ min-height:44px; }}
     .side-menu-item:hover, .side-menu-item.active {{ border-color:rgba(59,130,246,.45); background:linear-gradient(135deg,rgba(37,99,235,.28),rgba(15,23,42,.8)); }}
     .side-menu-icon {{ width:28px; height:28px; border-radius:10px; display:flex; align-items:center; justify-content:center; flex:0 0 auto; background:#1f2a44; color:#bfdbfe; font-size:14px; }}
     .side-menu-text {{ min-width:0; }}
@@ -6049,6 +6050,7 @@ def render_dashboard_html(token: str = "") -> str:
     .value {{ font-size:28px; font-weight:800; margin-top:6px; }}
     .good {{ color:var(--good); }} .warn {{ color:var(--warn); }} .bad {{ color:var(--bad); }}
     .sections {{ display:grid; grid-template-columns: 1.2fr .8fr; gap:14px; margin-top:14px; }}
+    .menu-section {{ scroll-margin-top:86px; }}
     .menu-section[hidden] {{ display:none !important; }}
     .pending-badge {{ display:inline-block; min-width:18px; padding:1px 6px; margin-left:6px; border-radius:999px; background:#dc2626; color:#fff; font-size:11px; font-weight:800; line-height:16px; text-align:center; vertical-align:middle; }}
     .pending-badge[hidden] {{ display:none !important; }}
@@ -6107,6 +6109,7 @@ def render_dashboard_html(token: str = "") -> str:
     .modal-backdrop {{ position:fixed; inset:0; z-index:100; display:none; align-items:center; justify-content:center; padding:18px; background:rgba(2,6,23,.72); backdrop-filter:blur(5px); }}
     .modal-backdrop.open {{ display:flex; }}
     .modal-card {{ width:min(440px,100%); border:1px solid rgba(148,163,184,.24); border-radius:18px; background:linear-gradient(180deg,#121a2f,#0f172a); box-shadow:0 30px 80px rgba(0,0,0,.42); padding:18px; }}
+    .mobile-bottom-nav {{ display:none; }}
     .modal-title {{ font-size:18px; font-weight:900; margin:0 0 8px; color:#f8fafc; }}
     .modal-message {{ color:#cbd5e1; line-height:1.55; white-space:pre-wrap; }}
     .modal-input {{ width:100%; min-height:86px; margin-top:12px; resize:vertical; background:#0f172a; color:var(--text); border:1px solid var(--line); border-radius:12px; padding:10px; font:inherit; }}
@@ -6124,7 +6127,7 @@ def render_dashboard_html(token: str = "") -> str:
     body.side-collapsed .side-brand {{ justify-content:center; padding:10px; }}
     body.side-collapsed .side-menu-item {{ justify-content:center; padding:10px 8px; }}
     @media (max-width: 1100px) {{ .grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .operator-home-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .sections {{ grid-template-columns:1fr; }} .side-menu {{ width:292px; }} }}
-    @media (max-width: 780px) {{ .topbar {{ align-items:flex-start; flex-wrap:wrap; }} .top-actions {{ width:100%; justify-content:flex-start; min-width:0; }} .scope-chip {{ max-width:100%; }} .app-shell {{ display:block; }} .side-close {{ display:inline-flex; }} .side-menu {{ position:fixed; top:0; left:0; bottom:0; width:min(88vw,340px); max-width:min(88vw,340px); min-height:100dvh; max-height:100dvh; z-index:60; border-right:1px solid rgba(148,163,184,.22); border-bottom:0; border-radius:0 22px 22px 0; transform:translateX(-105%); }} body.side-open .side-menu {{ transform:translateX(0); }} body.side-collapsed .side-menu {{ width:min(88vw,340px); max-width:min(88vw,340px); padding:14px; }} body.side-collapsed .side-scroll {{ display:grid; }} body.side-collapsed .side-brand {{ margin-bottom:12px; justify-content:flex-start; padding:12px; }} body.side-collapsed .side-menu-item {{ justify-content:flex-start; padding:10px; }} .side-actions {{ grid-template-columns:1fr; }} }}
+    @media (max-width: 780px) {{ body {{ padding-bottom:calc(82px + env(safe-area-inset-bottom)); }} .topbar {{ align-items:flex-start; flex-wrap:wrap; }} .top-actions {{ width:100%; justify-content:flex-start; min-width:0; }} .scope-chip {{ max-width:100%; }} .app-shell {{ display:block; }} .side-close {{ display:inline-flex; }} .side-menu {{ position:fixed; top:0; left:0; bottom:0; width:min(88vw,340px); max-width:min(88vw,340px); min-height:100dvh; max-height:100dvh; z-index:60; border-right:1px solid rgba(148,163,184,.22); border-bottom:0; border-radius:0 22px 22px 0; transform:translateX(-105%); }} body.side-open .side-menu {{ transform:translateX(0); }} body.side-collapsed .side-menu {{ width:min(88vw,340px); max-width:min(88vw,340px); padding:14px; }} body.side-collapsed .side-scroll {{ display:grid; }} body.side-collapsed .side-brand {{ margin-bottom:12px; justify-content:flex-start; padding:12px; }} body.side-collapsed .side-menu-item {{ justify-content:flex-start; padding:10px; }} .side-actions {{ grid-template-columns:1fr; }} .mobile-bottom-nav {{ position:fixed; left:8px; right:8px; bottom:calc(8px + env(safe-area-inset-bottom)); z-index:45; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:6px; padding:7px; border:1px solid rgba(148,163,184,.24); border-radius:18px; background:rgba(15,23,42,.94); backdrop-filter:blur(14px); box-shadow:0 18px 45px rgba(0,0,0,.38); }} .mobile-bottom-nav button {{ display:grid; gap:2px; justify-items:center; align-content:center; padding:7px 4px; border-radius:14px; background:rgba(30,41,59,.86); border:1px solid transparent; color:#dbeafe; font-size:13px; }} .mobile-bottom-nav button.active {{ border-color:rgba(59,130,246,.65); background:linear-gradient(135deg,rgba(37,99,235,.38),rgba(15,23,42,.9)); }} .mobile-action-label {{ font-size:11px; font-weight:850; line-height:1.05; }} }}
     @media (max-width: 720px) {{ .slip-card {{ grid-template-columns:76px 1fr; }} .slip-card.dupe-card {{ grid-template-columns:1fr; }} .dupe-thumbs .slip-thumb {{ width:calc(50vw - 30px); max-width:120px; }} .slip-thumb {{ width:76px; height:104px; }} table {{ min-width:560px; }} }}
     @media (max-width: 640px) {{
       .responsive-table {{ overflow-x:visible; }}
@@ -6140,7 +6143,7 @@ def render_dashboard_html(token: str = "") -> str:
       .responsive-table td.action-cell::before {{ display:none; }}
     }}
     @media (max-width: 420px) {{ .responsive-table td {{ grid-template-columns:1fr; text-align:left; }} .responsive-table td::before {{ margin-bottom:2px; }} }}
-    @media (max-width: 560px) {{ .topbar {{ position:static; }} .wrap {{ padding:10px; }} .grid {{ grid-template-columns:1fr; }} .operator-home-grid {{ grid-template-columns:1fr; }} .value {{ font-size:24px; }} .card {{ padding:12px; border-radius:14px; }} h1 {{ font-size:20px; }} .limit-usage-summary {{ grid-template-columns:1fr; }} .limit-usage-row {{ grid-template-columns:1fr; gap:6px; }} .limit-usage-values {{ text-align:left; }} .cross-company-head, .cross-company-company-head {{ display:grid; }} .cross-company-chips {{ justify-content:flex-start; }} .cross-company-summary {{ grid-template-columns:1fr; }} .cross-company-companies {{ grid-template-columns:1fr; }} .cross-company-total {{ text-align:left; white-space:normal; }} .cross-company-day-row {{ grid-template-columns:1fr; gap:2px; }} .cross-company-day-row .day-amount {{ text-align:left; white-space:normal; }} }}
+    @media (max-width: 560px) {{ .topbar {{ position:static; }} .wrap {{ padding:10px; }} .grid {{ grid-template-columns:1fr; }} .operator-home-grid {{ grid-template-columns:1fr; }} .value {{ font-size:24px; }} .card {{ padding:12px; border-radius:14px; }} h1 {{ font-size:20px; }} .limit-usage-summary {{ grid-template-columns:1fr; }} .limit-usage-row {{ grid-template-columns:1fr; gap:6px; }} .limit-usage-values {{ text-align:left; }} .cross-company-head, .cross-company-company-head {{ display:grid; }} .cross-company-chips {{ justify-content:flex-start; }} .cross-company-summary {{ grid-template-columns:1fr; }} .cross-company-companies {{ grid-template-columns:1fr; }} .cross-company-total {{ text-align:left; white-space:normal; }} .cross-company-day-row {{ grid-template-columns:1fr; gap:2px; }} .cross-company-day-row .day-amount {{ text-align:left; white-space:normal; }} .slip-card {{ grid-template-columns:1fr; gap:8px; }} .slip-card .top {{ align-items:flex-start; flex-wrap:wrap; }} .slip-thumb {{ width:100%; height:auto; max-height:220px; object-fit:contain; }} .dupe-thumbs .slip-thumb {{ width:calc(50vw - 22px); }} .toolbar, .reconcile-actions, .modal-actions {{ align-items:stretch; }} .toolbar > button, .toolbar > a.button, .reconcile-actions > button {{ width:100%; text-align:center; }} }}
   </style>
 </head>
 <body>
@@ -6397,6 +6400,12 @@ def render_dashboard_html(token: str = "") -> str:
     </main>
     <div id="pendingToastHost" class="pending-toast-host" aria-live="polite"></div>
   </div>
+  <nav id="mobileBottomNav" class="mobile-bottom-nav" aria-label="เมนูด่วนมือถือ">
+    <button type="button" data-mobile-target="section-operator-home" onclick="showMenuSection('section-operator-home')"><span>★</span><span class="mobile-action-label">วันนี้</span></button>
+    <button type="button" data-mobile-target="section-cross-company-accounts" onclick="showMenuSection('section-cross-company-accounts')"><span>⇆</span><span class="mobile-action-label">ข้ามบริษัท</span></button>
+    <button type="button" data-mobile-target="section-duplicates" onclick="showMenuSection('section-duplicates')"><span>⧉</span><span class="mobile-action-label">สลิปซ้ำ</span></button>
+    <button type="button" data-mobile-target="limitSection" onclick="showMenuSection('limitSection')"><span>↯</span><span class="mobile-action-label">วงเงิน</span></button>
+  </nav>
   <div id="dashboardModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="dashboardModalTitle" aria-hidden="true">
     <div class="modal-card">
       <div id="dashboardModalTitle" class="modal-title">แจ้งเตือน</div>
@@ -6527,12 +6536,22 @@ function scrollElementIntoView(id, smooth=true) {{
   const target = document.getElementById(id);
   if (target && target.scrollIntoView) target.scrollIntoView({{behavior: smooth ? 'smooth' : 'auto', block:'start'}});
 }}
+function scrollMenuSectionIntoView(target, smooth=true) {{
+  const section = document.getElementById(target);
+  if (section && section.scrollIntoView) section.scrollIntoView({{behavior: smooth ? 'smooth' : 'auto', block:'start'}});
+}}
 function refreshDashboardHome() {{
-  showMenuSection('section-operator-home', {{scroll:false, persist:false}});
-  return load({{home:true, scrollTop:true, smooth:false}});
+  showMenuSection('section-operator-home', {{scroll:false, persist:false, syncHash:false}});
+  try {{ window.history.replaceState({{}}, '', location.pathname + location.search); }} catch (e) {{}}
+  return load({{home:true, scrollTop:true, smooth:false, ignoreHash:true}});
 }}
 function setActiveMenu(target) {{
   document.querySelectorAll('[data-menu-target]').forEach(btn => btn.classList.toggle('active', String(btn.dataset.menuTarget || '') === String(target || 'all')));
+  document.querySelectorAll('[data-mobile-target]').forEach(btn => btn.classList.toggle('active', String(btn.dataset.mobileTarget || '') === String(target || '')));
+}}
+function syncMenuHash(target, options={{}}) {{
+  if (!target || target === 'all' || (options && options.syncHash === false)) return;
+  try {{ window.history.replaceState({{}}, '', location.pathname + location.search + '#' + target); }} catch (e) {{}}
 }}
 function openMenuGroupForTarget(target) {{
   if (!target || target === 'all') return;
@@ -6546,6 +6565,7 @@ function openMenuGroupForTarget(target) {{
 function showAllMenuSections(options={{}}) {{
   document.querySelectorAll('.menu-section').forEach(section => section.hidden = false);
   setActiveMenu('all');
+  try {{ if (!(options && options.syncHash === false)) window.history.replaceState({{}}, '', location.pathname + location.search); }} catch (e) {{}}
   closeSideMenuIfMobile();
   if (options && options.scrollTop) scrollDashboardTop();
 }}
@@ -6556,14 +6576,25 @@ function showMenuSection(target, options={{}}) {{
   }});
   setActiveMenu(target);
   openMenuGroupForTarget(target);
+  syncMenuHash(target, options);
   const section = document.getElementById(target);
-  if (options.scroll !== false && section) section.scrollIntoView({{behavior:'smooth', block:'start'}});
+  if (options.scroll !== false && section) scrollMenuSectionIntoView(target, options.smooth !== false);
   if (target === 'section-account-ledger') populateLedgerAccounts();
   closeSideMenuIfMobile();
 }}
 applySideMenuState();
 applyAdminMode();
 let initialMenuApplied = false;
+let initialHashApplied = false;
+function applyInitialHashSection() {{
+  const initialHashTarget = String(location.hash || '').replace(/^#/, '');
+  if (initialHashTarget && document.getElementById(initialHashTarget) && document.getElementById(initialHashTarget).classList.contains('menu-section')) {{
+    showMenuSection(initialHashTarget, {{scroll:false, syncHash:false}});
+    setTimeout(() => scrollMenuSectionIntoView(initialHashTarget, false), 0);
+    return true;
+  }}
+  return false;
+}}
 function splitChatValue(value) {{
   const raw = String(value || '');
   const parts = raw.split('|');
@@ -8155,17 +8186,17 @@ async function load(options={{}}) {{
   enhanceResponsiveTables();
   updateReconcileScopePreview();
   updateExcel();
+  initialHashApplied = false;
   if (!initialMenuApplied || (options && options.home)) {{
     initialMenuApplied = true;
-    const initialHashTarget = String(location.hash || '').replace(/^#/, '');
-    if (initialHashTarget && document.getElementById(initialHashTarget) && document.getElementById(initialHashTarget).classList.contains('menu-section')) {{
-      showMenuSection(initialHashTarget, {{scroll:false, persist:false}});
-    }} else if (!(options && options.scrollTarget)) {{
-      showMenuSection('section-operator-home', {{scroll:false, persist:false}});
+    if (!(options && options.ignoreHash)) initialHashApplied = applyInitialHashSection();
+    if (!initialHashApplied && !(options && options.scrollTarget)) {{
+      showMenuSection('section-operator-home', {{scroll:false, persist:false, syncHash:false}});
     }}
   }}
   if (options && options.scrollTarget) scrollElementIntoView(options.scrollTarget, options.smooth !== false);
-  else if (options && options.scrollTop) scrollDashboardTop(options.smooth !== false);
+  else if (!initialHashApplied && options && options.scrollTop) scrollDashboardTop(options.smooth !== false);
+  initialHashApplied = false;
   try {{ loadPendingActions({{scrollTop:false}}); }} catch (e) {{}}
 }}
 function selectedDashboardScope() {{

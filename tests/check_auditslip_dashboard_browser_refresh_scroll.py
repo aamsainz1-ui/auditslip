@@ -22,6 +22,7 @@ assert "window.history.scrollRestoration = 'auto'" not in html
 assert "refreshDashboardHome" in html
 assert "topRefreshButton" in html
 assert "load({home:true, scrollTop:true, smooth:false}); setInterval(() => load({lite:true}), 10000)" in html
+assert "load({home:true, scrollTop:true, smooth:false, ignoreHash:true})" in html
 assert "setInterval(() => load({lite:true}), 10000)" in html
 assert "onclick=\"refreshDashboardHome()\"" in html
 
@@ -36,8 +37,9 @@ for removed_marker in [
 
 for marker in [
     "showMenuSection(target, options={})",
-    "if (options.scroll !== false && section) section.scrollIntoView",
-    "showMenuSection('section-operator-home', {scroll:false, persist:false})",
+    "scrollMenuSectionIntoView(target, options.smooth !== false)",
+    "showMenuSection('section-operator-home', {scroll:false, persist:false, syncHash:false})",
+    "applyInitialHashSection",
 ]:
     assert marker in html, marker
 
