@@ -1281,12 +1281,122 @@ def withdraw_limit_usage_summary(rows: List[Dict[str, Any]]) -> List[Dict[str, A
     return out
 
 
+def _positive_limit_values(values: List[float]) -> List[float]:
+    return sorted({float(v) for v in values if float(v or 0) > 0})
+
+
+def _shared_limit_amount(limit_values: List[float]) -> float:
+    positives = _positive_limit_values(limit_values)
+    # Same physical account should consume one real limit.  If legacy per-company
+    # settings disagree, use the most conservative configured amount and flag it.
+    return float(min(positives) if positives else 0.0)
+
+
+def withdraw_account_day_limit_groups(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    groups: List[Dict[str, Any]] = []
+    for row in rows or []:
+        bank = display_bank(row.get("bank"))
+        account = clean_display(row.get("account"))
+        account_key = bank_key(account)
+        if not account_key:
+            continue
+        date_key = clean_display(row.get("date_key") or row.get("date"))
+        date_label = clean_display(row.get("date") or row.get("date_key"))
+        group = None
+        for candidate in groups:
+            if candidate.get("date_key") != date_key:
+                continue
+            if candidate.get("account_key") == account_key and banks_compatible(bank, candidate.get("bank")):
+                group = candidate
+                break
+        if group is None:
+            group = {
+                "date_key": date_key,
+                "date": date_label,
+                "bank": bank,
+                "account": account,
+                "account_key": account_key,
+                "limit_key": clean_display(row.get("limit_key")) or limit_key_for(bank, account, ""),
+                "count": 0,
+                "amount": 0.0,
+                "daily_limit": 0.0,
+                "limit_amount": 0.0,
+                "remaining_amount": 0.0,
+                "over_limit_amount": 0.0,
+                "over_limit": False,
+                "usage_percent": 0.0,
+                "duplicate_capacity_amount": 0.0,
+                "limit_values": [],
+                "limit_conflict": False,
+                "companies_map": {},
+            }
+            groups.append(group)
+        elif bank and not group.get("bank"):
+            group["bank"] = bank
+            group["limit_key"] = clean_display(row.get("limit_key")) or limit_key_for(bank, group.get("account"), "")
+        amount = float(row.get("amount") or row.get("withdraw_amount") or 0)
+        count = int(row.get("count") or row.get("withdraw_count") or 0)
+        limit_amount = float(row.get("daily_limit") or row.get("limit_amount") or 0)
+        bot_key = clean_display(row.get("bot_key")) or "default"
+        company_name = clean_company_name(row.get("company_name"), bot_key)
+        group["count"] += count
+        group["amount"] += amount
+        group["duplicate_capacity_amount"] += limit_amount
+        if limit_amount > 0:
+            group["limit_values"].append(limit_amount)
+        comp = group["companies_map"].setdefault(
+            bot_key,
+            {"bot_key": bot_key, "company_name": company_name, "count": 0, "amount": 0.0, "daily_limit": limit_amount},
+        )
+        comp["count"] += count
+        comp["amount"] += amount
+        if limit_amount and not comp.get("daily_limit"):
+            comp["daily_limit"] = limit_amount
+    out: List[Dict[str, Any]] = []
+    for group in groups:
+        limit_values = _positive_limit_values(group.get("limit_values") or [])
+        limit_amount = _shared_limit_amount(limit_values)
+        amount = float(group.get("amount") or 0)
+        group["limit_values"] = limit_values
+        group["limit_conflict"] = len(limit_values) > 1
+        group["daily_limit"] = limit_amount
+        group["limit_amount"] = limit_amount
+        group["remaining_amount"] = limit_amount - amount if limit_amount else 0.0
+        group["over_limit_amount"] = max(0.0, amount - limit_amount) if limit_amount else 0.0
+        group["over_limit"] = bool(limit_amount and amount > limit_amount)
+        group["usage_percent"] = (amount / limit_amount * 100.0) if limit_amount else 0.0
+        companies = list(group.pop("companies_map", {}).values())
+        companies.sort(key=dict_company_sort_key)
+        group["companies"] = companies
+        group["company_count"] = len(companies)
+        group.pop("account_key", None)
+        out.append(group)
+    out.sort(key=lambda r: (str(r.get("date_key") or r.get("date") or ""), float(r.get("amount") or 0)), reverse=True)
+    return out
+
+
+def shared_withdraw_limit_usage_summary(rows: List[Dict[str, Any]], limit: int = 120) -> List[Dict[str, Any]]:
+    """Account/day rows where one physical withdrawal account is used in 2+ companies."""
+    out = [row for row in withdraw_account_day_limit_groups(rows) if int(row.get("company_count") or 0) >= 2]
+    return out if not limit or limit <= 0 else out[:limit]
+
+
 def withdraw_limit_usage_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    withdraw_amount = sum(float(r.get("withdraw_amount") or 0) for r in rows or [])
-    limit_amount = sum(float(r.get("limit_amount") or 0) for r in rows or [])
-    over_amount = sum(float(r.get("over_limit_amount") or 0) for r in rows or [])
-    account_count = sum(int(r.get("account_count") or 0) for r in rows or [])
-    account_day_count = sum(int(r.get("account_day_count") or 0) for r in rows or [])
+    # Prefer unique physical account/day totals when detailed rows are available;
+    # this prevents one account used by two companies from counting its limit twice.
+    if any(clean_display(r.get("account")) for r in rows or []):
+        account_rows = withdraw_account_day_limit_groups(rows)
+        withdraw_amount = sum(float(r.get("amount") or 0) for r in account_rows)
+        limit_amount = sum(float(r.get("limit_amount") or 0) for r in account_rows)
+        over_amount = sum(float(r.get("over_limit_amount") or 0) for r in account_rows)
+        account_count = len({f"{bank_key(r.get('bank'))}|{bank_key(r.get('account'))}" for r in account_rows if bank_key(r.get("account"))})
+        account_day_count = len(account_rows)
+    else:
+        withdraw_amount = sum(float(r.get("withdraw_amount") or 0) for r in rows or [])
+        limit_amount = sum(float(r.get("limit_amount") or 0) for r in rows or [])
+        over_amount = sum(float(r.get("over_limit_amount") or 0) for r in rows or [])
+        account_count = sum(int(r.get("account_count") or 0) for r in rows or [])
+        account_day_count = sum(int(r.get("account_day_count") or 0) for r in rows or [])
     return {
         "withdraw_limit_capacity_amount": limit_amount,
         "withdraw_limit_remaining_amount": (limit_amount - withdraw_amount) if limit_amount else 0.0,
@@ -2869,6 +2979,7 @@ DASHBOARD_LITE_EMPTY_ARRAY_KEYS = (
     "provider_usage",
     "company_account_daily",
     "withdraw_limit_usage",
+    "shared_withdraw_limit_usage",
     "account_cross_company",
     "by_transferor",
     "by_account_day",
@@ -3146,16 +3257,17 @@ def flow_split_panels(
     flow_type: str,
     account_limits: Dict[str, Dict[str, Any]],
     search: str = "",
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any], Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
     limit_where, limit_params = limit_scope_clause(selected_where, selected_params, flow_type)
     deposit_where, deposit_params = deposit_customer_scope_clause(selected_where, selected_params, flow_type)
     by_transferor = transferor_totals(conn, limit_where, limit_params, account_limits=account_limits)
-    by_account_day = daily_account_totals(conn, limit_where, limit_params, account_limits=account_limits)
-    withdraw_limit_usage = withdraw_limit_usage_summary(daily_account_totals(conn, limit_where, limit_params, account_limits=account_limits, limit=0))
+    by_account_day_all = daily_account_totals(conn, limit_where, limit_params, account_limits=account_limits, limit=0)
+    by_account_day = by_account_day_all[:120]
+    withdraw_limit_usage = withdraw_limit_usage_summary(by_account_day_all)
     deposit_customer_slips = slip_list_rows(conn, deposit_where, deposit_params, search)
     withdraw_limit_totals = count_amount_for_where(conn, limit_where, limit_params)
     deposit_customer_totals = count_amount_for_where(conn, deposit_where, deposit_params)
-    return by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals, withdraw_limit_usage
+    return by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals, withdraw_limit_usage, by_account_day_all
 
 
 def ensure_bank_review_log_table(conn: sqlite3.Connection) -> None:
@@ -4612,7 +4724,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
             job_params = []
             job_recent_where = "WHERE status IN ('queued','processing','failed')"
             job_recent_params = []
-            by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals, withdraw_limit_usage = flow_split_panels(
+            by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals, withdraw_limit_usage, by_account_day_all = flow_split_panels(
                 conn, selected_where, selected_params, flow_type_key, account_limits, slip_search_key
             )
             duplicate_pairs = duplicate_pair_rows(conn, "", scope, "", slip_search_key, flow_type=flow_type_key) if include_detail_rows else []
@@ -4670,7 +4782,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
             job_params = [selected_chat_id, selected_bot_key]
             job_recent_where = "WHERE chat_id=? AND COALESCE(bot_key,'default')=? AND status IN ('queued','processing','failed')"
             job_recent_params = [selected_chat_id, selected_bot_key]
-            by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals, withdraw_limit_usage = flow_split_panels(
+            by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals, withdraw_limit_usage, by_account_day_all = flow_split_panels(
                 conn, selected_where, selected_params, flow_type_key, account_limits, slip_search_key
             )
             duplicate_pairs = duplicate_pair_rows(conn, selected_chat_id, scope, selected_bot_key, slip_search_key, flow_type=flow_type_key) if include_detail_rows else []
@@ -4728,7 +4840,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
                 job_params = [selected_bot_key]
                 job_recent_where = "WHERE COALESCE(bot_key,'default')=? AND status IN ('queued','processing','failed')"
                 job_recent_params = [selected_bot_key]
-                by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals, withdraw_limit_usage = flow_split_panels(
+                by_transferor, by_account_day, deposit_customer_slips, withdraw_limit_totals, deposit_customer_totals, withdraw_limit_usage, by_account_day_all = flow_split_panels(
                     conn, selected_where, selected_params, flow_type_key, account_limits, slip_search_key
                 )
                 duplicate_pairs = duplicate_pair_rows(conn, "", scope, selected_bot_key, slip_search_key, flow_type=flow_type_key) if include_detail_rows else []
@@ -4759,7 +4871,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
                 job_recent_where = "WHERE status IN ('queued','processing','failed')"
                 job_recent_params = []
                 company_accounts = []
-                by_transferor = by_account_day = by_date = by_from_bank = by_to_bank = by_sender = []
+                by_transferor = by_account_day = by_account_day_all = by_date = by_from_bank = by_to_bank = by_sender = []
                 daily_flow_summary = []
                 company_account_daily = []
                 account_slip_search = empty_account_slip_search(slip_search_key)
@@ -4934,12 +5046,15 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
         row["raw_text"] = clean_display(row.get("raw_text"))[:240]
 
     limit_check_enabled = limit_check_enabled_for_flow(flow_type_key)
+    shared_withdraw_limit_usage = shared_withdraw_limit_usage_summary(by_account_day_all) if limit_check_enabled else []
     if not limit_check_enabled:
         by_transferor = []
         by_account_day = []
+        by_account_day_all = []
         withdraw_limit_usage = []
+        shared_withdraw_limit_usage = []
 
-    withdraw_limit_totals_extra = withdraw_limit_usage_totals(withdraw_limit_usage)
+    withdraw_limit_totals_extra = withdraw_limit_usage_totals(by_account_day_all)
     company_menu_rows = company_overview_dicts(company_rows, company_job_rows)
     selected_company_summary = company_menu_rows
     if selected_bot_key and selected_bot_key not in {"__all__", "all"}:
@@ -4949,9 +5064,10 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
     issue_count_total = int(issue_queue_count_total or 0)
     queue_attention_count = int(jobs.get("queued", 0) or 0) + int(jobs.get("processing", 0) or 0) + int(jobs.get("failed", 0) or 0)
     over_limit_count = sum(1 for row in (by_account_day or []) if row.get("over_limit")) if limit_check_enabled else 0
+    shared_over_limit_count = sum(1 for row in (shared_withdraw_limit_usage or []) if row.get("over_limit")) if limit_check_enabled else 0
     bank_ledger_summary = bank_ledger_snapshot(db_path, bot_key=selected_bot_key, scope=scope or "open", flow_type=flow_type_key)
     exception_summary = {
-        "over_limit_count": int(over_limit_count),
+        "over_limit_count": int(over_limit_count + shared_over_limit_count),
         "issue_count": int(issue_count_total),
         "bank_review_count": int(source_bank_review_total or 0),
         "duplicate_count": int(duplicate_count_total),
@@ -5002,6 +5118,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
         "company_menu": company_menu_rows,
         "company_account_daily": aggregate_dicts(company_account_daily),
         "withdraw_limit_usage": aggregate_dicts(withdraw_limit_usage),
+        "shared_withdraw_limit_usage": aggregate_dicts(shared_withdraw_limit_usage),
         "account_slip_search": account_slip_search,
         "cross_company_account_slip_search": cross_company_account_slip_search,
         "account_cross_company": aggregate_dicts(account_cross_company),
@@ -6064,6 +6181,7 @@ def render_dashboard_html(token: str = "") -> str:
       <div class="card"><h3>ค้นหารายการสลิปตามบัญชี</h3><div class="mini">พิมพ์เลขบัญชี/ชื่อ/ธนาคารในช่องค้นหา ระบบจะแสดงจำนวนสลิป ยอดรวม และรูปสลิปทีละใบใน scope ที่เลือก</div><div id="accountSlipSearch"></div></div>
     </section>
     <section id="section-cross-company-accounts" class="sections menu-section" hidden>
+      <div class="card" id="sharedWithdrawLimitUsageBlock" hidden><h3>วงเงินจริงของบัญชีใช้ร่วม</h3><div class="mini">บัญชีถอนเดียวกันที่ถูกใช้หลายบริษัทในวันเดียวกัน ต้องนับวงเงินบัญชีเดียว ไม่ใช่แยกวงเงินซ้ำตามบริษัท</div><div id="sharedWithdrawLimitUsage"></div></div>
       <div class="card" id="accountCrossCompanyBlock" hidden><h3>ยอดข้ามบริษัท / บัญชีถอนที่พบข้ามบริษัท</h3><div class="mini">แสดงบัญชีถอนต้นทางที่มีสลิปถูกส่งเข้ากลุ่มมากกว่า 1 บริษัท · เฉพาะสลิปถอน ไม่เอาฝาก/เติมมือ · พร้อมยอดแยกบริษัทและชื่อผู้ส่งรูป</div><div id="accountCrossCompany"></div></div>
       <div class="card" id="crossCompanyAccountSlipSearchBlock" hidden><h3>ค้นหาสลิปถอนข้ามบริษัท</h3><div class="mini">กด “ดูสลิปข้ามบริษัท” เพื่อดูรูปสลิป รายการรายใบ บริษัท กลุ่ม Telegram และผู้ส่งรูปของบัญชีนั้น</div><div id="crossCompanyAccountSlipSearch"></div></div>
     </section>
@@ -6510,6 +6628,24 @@ function renderWithdrawLimitUsageChart(rows, totals={{}}) {{
       + '</div>';
   }}).join('')+'</div>';
 }}
+function renderSharedWithdrawLimitUsage(rows) {{
+  const items = rows || [];
+  if (!items.length) return '<div class="muted">ยังไม่พบบัญชีถอนที่ใช้ร่วมข้ามบริษัทใน scope นี้</div>';
+  const companyRows = (companies) => (companies || []).map(c => '<div class="cross-company-day-row"><span>'+esc(c.company_name || c.bot_key || '-')+'</span><span class="day-amount">'+money(c.amount || 0)+' / '+esc(c.count || 0)+' สลิป</span></div>').join('') || '<div class="muted">ไม่มีบริษัท</div>';
+  return '<div class="cross-company-list">'+items.map(r => {{
+    const isOver = Boolean(r.over_limit);
+    const conflict = r.limit_conflict ? '<div class="mini bad">วงเงินในแต่ละบริษัทไม่ตรงกัน: '+esc((r.limit_values || []).map(v => money(v)).join(', '))+' · ใช้ค่าต่ำสุดเพื่อกันพลาด</div>' : '';
+    const duplicateLimit = Number(r.duplicate_capacity_amount || 0) && Number(r.duplicate_capacity_amount || 0) !== Number(r.daily_limit || 0)
+      ? '<div class="mini warn">ถ้าดูแยกบริษัทจะเหมือนมีวงเงิน '+money(r.duplicate_capacity_amount || 0)+' แต่เงินจริงของบัญชีนี้คือ '+(Number(r.daily_limit || 0) ? money(r.daily_limit || 0) : '-')+'</div>'
+      : '';
+    return '<article class="cross-company-card '+(isOver ? 'over' : '')+'">'
+      + '<div class="cross-company-head"><div><div class="label">บัญชีใช้ร่วมข้ามบริษัท</div><div class="cross-company-account">'+esc(r.account || '-')+'</div><div class="cross-company-bank">'+esc(r.bank || '-')+' · '+esc(r.date || r.date_key || '-')+'</div></div><div class="cross-company-chips">'+esc(r.company_count || 0)+' บริษัท</div></div>'
+      + '<div class="cross-company-summary"><div class="cross-company-stat"><div class="label">ยอดรวมบัญชีเดียว</div><div class="value good">'+money(r.amount || 0)+'</div></div><div class="cross-company-stat"><div class="label">วงเงินจริง/วัน</div><div class="value">'+(Number(r.daily_limit || 0) ? money(r.daily_limit || 0) : '-')+'</div></div><div class="cross-company-stat"><div class="label">เหลือ/เกินจริง</div><div class="value '+(isOver ? 'bad' : 'good')+'">'+(Number(r.daily_limit || 0) ? money(r.remaining_amount || 0) : '-')+'</div></div></div>'
+      + duplicateLimit + conflict
+      + '<div class="cross-company-section-title">แยกตามบริษัทที่ส่งสลิปของบัญชีนี้</div><div class="cross-company-days">'+companyRows(r.companies)+'</div>'
+      + '</article>';
+  }}).join('')+'</div>';
+}}
 function flowName(value) {{ return value === 'deposit' ? 'ฝาก/เติมมือ' : (value === 'withdraw' ? 'ถอน' : (value === 'other' ? 'อื่นๆ' : 'รวมทุกกลุ่ม')); }}
 function flowChipName(value) {{ return value === 'deposit' ? 'กลุ่มฝาก/เติมมือ' : (value === 'withdraw' ? 'กลุ่มถอน' : (value === 'other' ? 'กลุ่มอื่นๆ' : 'รวมทุกกลุ่ม')); }}
 function renderCompanyAccountDaily(rows) {{
@@ -6669,9 +6805,11 @@ function renderOperatorHome(rows) {{
 function renderExceptionQueue(data) {{
   const items = [];
   const summary = data.exception_summary || {{}};
+  const sharedLimitRows = (data.shared_withdraw_limit_usage || []).filter(r => r.over_limit);
   const overLimitRows = (data.by_account_day || []).filter(r => r.over_limit);
-  const overLimitCount = Number(summary.over_limit_count || overLimitRows.length || 0);
-  if (overLimitCount) items.push({{title:'เกินวงเงินรายวัน', count:overLimitCount, target:'limitSection', detail:overLimitRows.slice(0,3).map(r => (r.company_name || r.name || '-')+' '+(r.date || '')+' '+money(Math.abs(r.remaining_amount || 0))).join(' · ') || 'เปิดดูบัญชีที่เกินวงเงิน'}});
+  const overLimitCount = Number(summary.over_limit_count || (overLimitRows.length + sharedLimitRows.length) || 0);
+  if (sharedLimitRows.length) items.push({{title:'บัญชีใช้ร่วมเกินวงเงินจริง', count:sharedLimitRows.length, target:'section-cross-company-accounts', detail:sharedLimitRows.slice(0,3).map(r => (r.account || '-')+' '+(r.date || '')+' เกิน '+money(Math.abs(r.remaining_amount || 0))).join(' · ')}});
+  if (overLimitRows.length) items.push({{title:'เกินวงเงินรายวัน', count:overLimitRows.length, target:'limitSection', detail:overLimitRows.slice(0,3).map(r => (r.company_name || r.name || '-')+' '+(r.date || '')+' '+money(Math.abs(r.remaining_amount || 0))).join(' · ') || 'เปิดดูบัญชีที่เกินวงเงิน'}});
   const issueRows = data.issues || [];
   const issueCount = Number(summary.issue_count || issueRows.length || 0);
   if (issueCount) items.push({{title:'OCR issue / อ่านไม่ชัด', count:issueCount, target:'section-recent', detail:issueRows.slice(0,3).map(r => (r.company_name || r.bot_key || '-')+' msg '+(r.message_id || '-')).join(' · ') || 'มีรายการอ่านไม่ชัดใน scope นี้'}});
@@ -7735,6 +7873,7 @@ async function load(options={{}}) {{
       provider_usage: currentSnapshot.provider_usage || [],
       company_account_daily: currentSnapshot.company_account_daily || [],
       withdraw_limit_usage: currentSnapshot.withdraw_limit_usage || [],
+      shared_withdraw_limit_usage: currentSnapshot.shared_withdraw_limit_usage || [],
       account_slip_search: currentSnapshot.account_slip_search || data.account_slip_search,
       cross_company_account_slip_search: currentSnapshot.cross_company_account_slip_search || data.cross_company_account_slip_search,
       account_cross_company: currentSnapshot.account_cross_company || [],
@@ -7858,8 +7997,11 @@ async function load(options={{}}) {{
     document.getElementById('companyAccountDailyWithdraw').innerHTML = renderCompanyAccountDaily(accountDailyRows.filter(r => r.flow_type === 'withdraw'));
     document.getElementById('companyAccountDailyDeposit').innerHTML = renderCompanyAccountDaily(accountDailyRows.filter(r => r.flow_type === 'deposit'));
     document.getElementById('accountSlipSearch').innerHTML = renderAccountSlipSearch(data.account_slip_search);
+    document.getElementById('sharedWithdrawLimitUsage').innerHTML = renderSharedWithdrawLimitUsage(data.shared_withdraw_limit_usage);
     document.getElementById('accountCrossCompany').innerHTML = renderAccountCrossCompany(data.account_cross_company);
     document.getElementById('crossCompanyAccountSlipSearch').innerHTML = renderCrossCompanyAccountSlipSearch(data.cross_company_account_slip_search);
+    const sharedLimitBlock = document.getElementById('sharedWithdrawLimitUsageBlock');
+    if (sharedLimitBlock) sharedLimitBlock.hidden = !((data.shared_withdraw_limit_usage || []).length > 0);
     const accountCrossBlock = document.getElementById('accountCrossCompanyBlock');
     if (accountCrossBlock) accountCrossBlock.hidden = !((data.account_cross_company || []).length > 0);
     const crossSearchBlock = document.getElementById('crossCompanyAccountSlipSearchBlock');
