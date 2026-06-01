@@ -1410,14 +1410,14 @@ def cross_company_account_usage(conn: sqlite3.Connection, scope: str = "all", fl
         f"""
         SELECT COALESCE(NULLIF(bot_key,''),'default') AS bot_key,
                COALESCE(NULLIF(company_name,''), COALESCE(NULLIF(bot_key,''),'default')) AS company_name,
-               chat_id, chat_title, slip_date_display, slip_date_iso,
+               chat_id, chat_title, sender_name, username, slip_date_display, slip_date_iso,
                from_bank, from_account, to_bank, to_account,
                COUNT(*) AS count,
                COALESCE(SUM(amount),0) AS amount
         FROM slips
         WHERE {clause}
           AND (NULLIF(TRIM(COALESCE(from_account,'')), '') IS NOT NULL OR NULLIF(TRIM(COALESCE(to_account,'')), '') IS NOT NULL)
-        GROUP BY bot_key, company_name, chat_id, chat_title, slip_date_display, slip_date_iso, from_bank, from_account, to_bank, to_account
+        GROUP BY bot_key, company_name, chat_id, chat_title, sender_name, username, slip_date_display, slip_date_iso, from_bank, from_account, to_bank, to_account
         """,
         params,
     ).fetchall()
@@ -1458,6 +1458,7 @@ def cross_company_account_usage(conn: sqlite3.Connection, scope: str = "all", fl
                 "deposit_amount": 0.0,
                 "withdraw_amount": 0.0,
                 "flows": [],
+                "senders_map": {},
                 "days_map": {},
             },
         )
@@ -1465,6 +1466,7 @@ def cross_company_account_usage(conn: sqlite3.Connection, scope: str = "all", fl
         row_count = int(row["count"] or 0)
         row_amount = float(row["amount"] or 0)
         comp["amount"] += row_amount
+        add_sender_summary(comp, dict(row), row_count, row_amount)
         if flow == "deposit":
             comp["deposit_amount"] += row_amount
         elif flow == "withdraw":
@@ -1499,6 +1501,7 @@ def cross_company_account_usage(conn: sqlite3.Connection, scope: str = "all", fl
                 day["flow_labels"] = [flow_label(f) for f in day.pop("flows", [])]
                 day.pop("sort_date", None)
             company["days"] = days
+            finalize_sender_summary(company)
         if len(companies) < 2:
             continue
         if selected_bot and selected_bot not in {"__all__", "all"} and selected_bot not in {c["bot_key"] for c in companies}:
@@ -2930,14 +2933,56 @@ def account_slip_match(row: sqlite3.Row, search: str) -> Tuple[str, str]:
     return sides[0]
 
 
+def telegram_sender_display(sender_name: Any, username: Any = "") -> str:
+    name = clean_display(sender_name)
+    user = clean_display(username).lstrip("@")
+    if name and user and f"@{user}" not in name:
+        return f"{name} (@{user})"
+    if name:
+        return name
+    if user:
+        return f"@{user}"
+    return "(ไม่ทราบผู้ส่งรูป)"
+
+
+def add_sender_summary(target: Dict[str, Any], row: Dict[str, Any], count: int, amount: float) -> None:
+    sender_name = clean_display(row.get("sender_name"))
+    username = clean_display(row.get("username")).lstrip("@")
+    display_name = telegram_sender_display(sender_name, username)
+    key = f"{sender_name}|{username}|{display_name}"
+    sender_map = target.setdefault("senders_map", {})
+    sender = sender_map.setdefault(
+        key,
+        {
+            "sender_name": sender_name,
+            "username": username,
+            "display_name": display_name,
+            "count": 0,
+            "amount": 0.0,
+        },
+    )
+    sender["count"] += int(count or 0)
+    sender["amount"] += float(amount or 0)
+
+
+def finalize_sender_summary(target: Dict[str, Any]) -> None:
+    senders = list(target.pop("senders_map", {}).values())
+    senders.sort(key=lambda s: (-float(s.get("amount") or 0), clean_display(s.get("display_name"))))
+    target["senders"] = senders
+
+
 def account_slip_search_company_summary(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     companies: Dict[str, Dict[str, Any]] = {}
     for row in rows:
         bot = clean_display(row.get("bot_key")) or "default"
         company = clean_company_name(row.get("company_name"), bot)
-        group = companies.setdefault(bot, {"bot_key": bot, "company_name": company, "count": 0, "amount": 0.0})
+        group = companies.setdefault(bot, {"bot_key": bot, "company_name": company, "count": 0, "amount": 0.0, "senders_map": {}})
+        amount = float(row.get("amount") or 0)
         group["count"] += 1
-        group["amount"] += float(row.get("amount") or 0)
+        group["amount"] += amount
+        add_sender_summary(group, row, 1, amount)
+    for group in companies.values():
+        finalize_sender_summary(group)
     return sorted(companies.values(), key=dict_company_sort_key)
 
 
@@ -3053,6 +3098,7 @@ def account_slip_search_rows(conn: sqlite3.Connection, where_clause: str, params
                 "matched_label": matched_label,
                 "flow_type": flow_type_for_title(row["chat_title"], row["bot_key"], row["chat_id"]),
                 "flow_label": flow_label(flow_type_for_title(row["chat_title"], row["bot_key"], row["chat_id"])),
+                "sender_display": telegram_sender_display(row["sender_name"], row["username"]),
                 "image_url": image_url_for(row["file_id"], row["id"]),
             }
         )
@@ -5943,6 +5989,7 @@ def render_dashboard_html(token: str = "") -> str:
           <div class="side-nav">
             <button class="side-menu-item" type="button" data-menu-target="section-account-ledger" onclick="showMenuSection('section-account-ledger')"><span class="side-menu-icon">≡</span><span class="side-menu-text"><span class="side-menu-title">เดินบัญชีรายบัญชี</span><span class="side-menu-desc">timeline + running balance</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-employee-audit" onclick="showMenuSection('section-employee-audit')"><span class="side-menu-icon">◫</span><span class="side-menu-text"><span class="side-menu-title">ตรวจยอด</span><span class="side-menu-desc">1 เทียบเดินบัญชี · 2 รายวัน · 3 ซ้ำข้ามบริษัท</span></span></button>
+            <button class="side-menu-item" type="button" data-menu-target="section-cross-company-accounts" onclick="showMenuSection('section-cross-company-accounts')"><span class="side-menu-icon">⇆</span><span class="side-menu-text"><span class="side-menu-title">ยอดข้ามบริษัท</span><span class="side-menu-desc">บัญชีถอนซ้ำหลายบริษัท · คนส่งรูป</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-bank-ledger" onclick="showMenuSection('section-bank-ledger')"><span class="side-menu-icon">▤</span><span class="side-menu-text"><span class="side-menu-title">Preview Statement</span><span class="side-menu-desc">อัปโหลด statement เทียบสลิป</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-banks" onclick="showMenuSection('section-banks')"><span class="side-menu-icon">⇄</span><span class="side-menu-text"><span class="side-menu-title">ยอดธนาคาร</span><span class="side-menu-desc">ยอดแยกต้นทาง/ปลายทาง</span></span></button>
             <button class="side-menu-item" type="button" data-menu-target="section-reconcile" onclick="showMenuSection('section-reconcile')"><span class="side-menu-icon">✓</span><span class="side-menu-text"><span class="side-menu-title">กระทบยอด Statement</span><span class="side-menu-desc">หลังบ้าน vs สลิป</span></span></button>
@@ -6014,7 +6061,11 @@ def render_dashboard_html(token: str = "") -> str:
       <div class="card"><h3>บริษัทย่อย/บัญชีรับเงิน</h3><div class="toolbar"><input id="companyName" placeholder="ชื่อบริษัท" /><input id="accountBank" placeholder="ธนาคาร" /><input id="accountNo" placeholder="เลขบัญชีที่ใช้" /><input id="accountName" placeholder="ชื่อบัญชีที่ใช้" /><input id="accountDailyLimit" type="number" step="0.01" placeholder="วงเงิน/วัน" /><button onclick="saveCompanyAccount()">บันทึกบัญชีบริษัท</button></div><div id="companyAccounts"></div></div>
       <div class="card"><h3>ฝั่งถอน · รายบัญชีตามวันที่</h3><div class="mini">บัญชีของบริษัท/ผู้โอน [กลุ่มถอน] · บัญชีผู้โอน/ต้นทางจากกลุ่มถอน แยกตามวันและบริษัท วางไว้ก่อนเพื่อไม่ต้องเลื่อนผ่านรายการฝาก/เติมมือ</div><div id="companyAccountDailyWithdraw"></div></div>
       <div class="card"><h3>ฝั่งฝาก/เติมมือ · รายบัญชีตามวันที่</h3><div class="mini">บัญชีของบริษัท/ผู้โอน [กลุ่มฝาก/เติมมือ] · บัญชีรับเงิน/ปลายทางจากกลุ่มฝาก/เติมมือ แยกไว้คนละส่วนกับฝั่งถอน</div><div id="companyAccountDailyDeposit"></div></div>
-      <div class="card"><h3>ค้นหารายการสลิปตามบัญชี</h3><div class="mini">พิมพ์เลขบัญชี/ชื่อ/ธนาคารในช่องค้นหา ระบบจะแสดงจำนวนสลิป ยอดรวม และรูปสลิปทีละใบใน scope ที่เลือก</div><div id="accountSlipSearch"></div><div id="accountCrossCompanyBlock" class="cross-conditional" hidden><h3>บัญชีถอนที่พบข้ามบริษัท</h3><div class="mini">เฉพาะสลิปถอนเท่านั้น ไม่เอาชื่อ/บัญชีจากสลิปฝากหรือเติมมือมาแสดง</div><div id="accountCrossCompany"></div></div><div id="crossCompanyAccountSlipSearchBlock" class="cross-conditional" hidden><h3>ค้นหาสลิปถอนข้ามบริษัท</h3><div class="mini">ค้นทุกบริษัทเฉพาะสลิปถอน เพื่อดูรูปสลิปของบัญชีถอนที่ซ้ำข้ามบริษัท</div><div id="crossCompanyAccountSlipSearch"></div></div></div>
+      <div class="card"><h3>ค้นหารายการสลิปตามบัญชี</h3><div class="mini">พิมพ์เลขบัญชี/ชื่อ/ธนาคารในช่องค้นหา ระบบจะแสดงจำนวนสลิป ยอดรวม และรูปสลิปทีละใบใน scope ที่เลือก</div><div id="accountSlipSearch"></div></div>
+    </section>
+    <section id="section-cross-company-accounts" class="sections menu-section" hidden>
+      <div class="card" id="accountCrossCompanyBlock" hidden><h3>ยอดข้ามบริษัท / บัญชีถอนที่พบข้ามบริษัท</h3><div class="mini">แสดงบัญชีถอนต้นทางที่มีสลิปถูกส่งเข้ากลุ่มมากกว่า 1 บริษัท · เฉพาะสลิปถอน ไม่เอาฝาก/เติมมือ · พร้อมยอดแยกบริษัทและชื่อผู้ส่งรูป</div><div id="accountCrossCompany"></div></div>
+      <div class="card" id="crossCompanyAccountSlipSearchBlock" hidden><h3>ค้นหาสลิปถอนข้ามบริษัท</h3><div class="mini">กด “ดูสลิปข้ามบริษัท” เพื่อดูรูปสลิป รายการรายใบ บริษัท กลุ่ม Telegram และผู้ส่งรูปของบัญชีนั้น</div><div id="crossCompanyAccountSlipSearch"></div></div>
     </section>
     <section id="section-date-sender" class="sections menu-section" hidden>
       <div class="card"><h3>กราฟรายวัน ฝาก/ถอน</h3><div class="mini">นับเฉพาะสลิป success ไม่ซ้ำ แยกกลุ่มฝาก/เติมมือและถอนตามวันที่ของสลิป</div><div id="dailyFlowChart"></div></div>
@@ -6493,8 +6544,13 @@ function pickAccountSearch(queryText, crossCompany=false) {{
     if (exportCompany) exportCompany.value = '__all__';
     document.getElementById('chat').value = '__all__||' + flow;
   }}
-  showMenuSection('section-company-accounts', {{scroll:false}});
-  load({{scrollTarget:'accountSlipSearch', smooth:true}});
+  if (crossCompany) {{
+    showMenuSection('section-cross-company-accounts', {{scroll:false}});
+    load({{scrollTarget:'crossCompanyAccountSlipSearch', smooth:true}});
+  }} else {{
+    showMenuSection('section-company-accounts', {{scroll:false}});
+    load({{scrollTarget:'accountSlipSearch', smooth:true}});
+  }}
 }}
 function wireAccountSearchButtons() {{
   document.querySelectorAll('[data-account-search]').forEach(btn => {{
@@ -6517,6 +6573,7 @@ function renderAccountSlipSearch(result) {{
     const names = [r.transferor_name, r.recipient_name].filter(Boolean).join(' → ') || r.sender_name || '-';
     return '<div class="slip-card">'+image+'<div class="slip-body"><div class="top"><b>'+esc(r.company_name || r.bot_key || '-')+'</b><span class="pill">'+esc(r.flow_label || flowName(r.flow_type))+'</span></div>'
       + '<div class="mini">'+esc(r.slip_date_text || ((r.date || r.date_key || '')+' '+(r.slip_time || '')))+' · msg '+esc(r.message_id || '-')+' · '+esc(r.matched_label || '-')+'</div>'
+      + '<div class="mini">ผู้ส่งรูป: '+esc(r.sender_display || r.sender_name || r.username || '-')+' · กลุ่ม: '+esc(r.chat_title || '-')+'</div>'
       + '<div>'+esc(names)+'</div><div class="mini">'+esc(banks)+' · '+esc(accounts)+'</div>'
       + '<div>ยอด <b>'+money(r.amount || 0)+'</b></div>'
       + '<div class="mini">ref '+esc(r.reference || r.reference_no || '-')+'</div>'
@@ -6528,7 +6585,8 @@ function renderCrossCompanyAccountSlipSearch(result) {{
   if (!queryText) return '<div class="muted">กรอกเลขบัญชี/ชื่อ/ธนาคาร หรือกด “ดูสลิปข้ามบริษัท” เพื่อค้นทุกบริษัทในวันที่/ฝากถอนที่เลือก</div>';
   const rows = (result && result.rows) || [];
   const companies = (result && result.companies) || [];
-  const companyLine = companies.length ? '<div class="mini">บริษัทที่พบ: '+companies.map(c => esc(c.company_name || c.bot_key || '-')+' '+money(c.amount || 0)+' / '+esc(c.count || 0)+' สลิป').join(' · ')+'</div>' : '';
+  const senderSummary = (senders) => (senders || []).map(s => esc(s.display_name || s.sender_name || s.username || '-')+' '+esc(s.count || 0)+' สลิป').join(', ') || '-';
+  const companyLine = companies.length ? '<div class="mini">บริษัทที่มีสลิปของบัญชีนี้: '+companies.map(c => esc(c.company_name || c.bot_key || '-')+' '+money(c.amount || 0)+' / '+esc(c.count || 0)+' สลิป · ผู้ส่งรูป '+senderSummary(c.senders)).join(' · ')+'</div>' : '';
   const summary = '<div class="good"><b>ค้นข้ามบริษัท: '+esc(queryText)+'</b></div><div class="mini">พบ '+esc((result && result.count) || 0)+' สลิป · '+esc((result && result.company_count) || 0)+' บริษัท · ยอดรวม '+money((result && result.amount) || 0)+(result && result.truncated ? ' · แสดงเฉพาะรายการแรก ๆ' : '')+'</div>'+companyLine;
   const exportLink = Number((result && result.count) || 0) > 0 ? '<div class="toolbar" style="margin:8px 0"><a class="button" target="exportDownloadFrame" href="'+esc(buildCrossCompanyAccountExcelUrl(queryText))+'">ส่งออก Excel ข้ามบริษัท</a></div>' : '';
   if (!rows.length) return summary + exportLink + '<div class="muted">ไม่พบสลิปของบัญชีนี้ข้ามบริษัทในวันที่/ฝากถอนที่เลือก</div>';
@@ -6539,6 +6597,7 @@ function renderCrossCompanyAccountSlipSearch(result) {{
     const names = [r.transferor_name, r.recipient_name].filter(Boolean).join(' → ') || r.sender_name || '-';
     return '<div class="slip-card">'+image+'<div class="slip-body"><div class="top"><b>'+esc(r.company_name || r.bot_key || '-')+'</b><span class="pill">'+esc(r.flow_label || flowName(r.flow_type))+'</span></div>'
       + '<div class="mini">'+esc(r.slip_date_text || ((r.date || r.date_key || '')+' '+(r.slip_time || '')))+' · msg '+esc(r.message_id || '-')+' · '+esc(r.matched_label || '-')+'</div>'
+      + '<div class="mini">ผู้ส่งรูป: '+esc(r.sender_display || r.sender_name || r.username || '-')+' · กลุ่ม: '+esc(r.chat_title || '-')+'</div>'
       + '<div>'+esc(names)+'</div><div class="mini">'+esc(banks)+' · '+esc(accounts)+'</div>'
       + '<div>ยอด <b>'+money(r.amount || 0)+'</b></div>'
       + '<div class="mini">ref '+esc(r.reference || r.reference_no || '-')+'</div>'
@@ -6548,15 +6607,17 @@ function renderCrossCompanyAccountSlipSearch(result) {{
 function renderAccountCrossCompany(rows) {{
   if (!rows || !rows.length) return '<div class="muted">ยังไม่พบบัญชีเดียวกันข้ามบริษัทในช่วงนี้</div>';
   const dayRows = (days) => (days || []).map(d => '<div class="cross-company-day-row"><span>'+esc(d.date || d.date_key || '-')+'</span><span class="day-amount">'+money(d.amount || 0)+' / '+esc(d.count || 0)+' สลิป</span></div>').join('') || '<div class="muted">ไม่มีรายวัน</div>';
+  const senderRows = (senders) => (senders || []).map(s => '<div class="cross-company-day-row"><span>'+esc(s.display_name || s.sender_name || s.username || '-')+'</span><span class="day-amount">'+money(s.amount || 0)+' / '+esc(s.count || 0)+' สลิป</span></div>').join('') || '<div class="muted">ไม่มีชื่อผู้ส่งรูป</div>';
   const companyCards = (companies) => (companies || []).map(c => '<div class="cross-company-company">'
     + '<div class="cross-company-company-head"><div class="cross-company-company-name">'+esc(c.company_name || c.bot_key || '-')+'</div><div class="cross-company-total">'+money(c.amount || 0)+' / '+esc(c.count || 0)+' สลิป</div></div>'
-    + '<div class="cross-company-days">'+dayRows(c.days)+'</div>'
+    + '<div class="cross-company-section-title">ผู้ส่งรูปเข้ากลุ่มนี้</div><div class="cross-company-days">'+senderRows(c.senders)+'</div>'
+    + '<div class="cross-company-section-title">รายวันของบริษัทนี้</div><div class="cross-company-days">'+dayRows(c.days)+'</div>'
     + '</div>').join('') || '<div class="muted">ไม่มีบริษัท</div>';
   return '<div class="cross-company-list">'+rows.map(r => '<article class="cross-company-card">'
     + '<div class="cross-company-head"><div><div class="label">บัญชี</div><div class="cross-company-account">'+esc(r.account || '-')+'</div><div class="cross-company-bank">ธนาคาร '+esc(r.bank || '-')+'</div></div><div class="cross-company-chips">'+esc((r.flow_labels || []).map(v => '['+v+']').join(' '))+'</div></div>'
-    + '<div class="cross-company-summary"><div class="cross-company-stat"><div class="label">สลิปรวมบัญชีนี้</div><div class="value">'+esc(r.total_count || 0)+'</div></div><div class="cross-company-stat"><div class="label">รวมบัญชีนี้</div><div class="value good">'+money(r.total_amount || 0)+'</div></div></div>'
+    + '<div class="cross-company-summary"><div class="cross-company-stat"><div class="label">สลิปรวมบัญชีนี้</div><div class="value">'+esc(r.total_count || 0)+'</div></div><div class="cross-company-stat"><div class="label">รวมบัญชีนี้</div><div class="value good">'+money(r.total_amount || 0)+'</div></div><div class="cross-company-stat"><div class="label">จำนวนบริษัท</div><div class="value">'+esc(r.company_count || ((r.companies || []).length))+'</div></div></div>'
     + '<div class="toolbar"><button type="button" data-cross-account-search="'+esc(String(r.account || ''))+'">ดูสลิปข้ามบริษัท</button></div>'
-    + '<div><div class="cross-company-section-title">แยกตามบริษัท · ไปอยู่บริษัทไหน / ยอดเท่าไหร่</div><div class="cross-company-companies">'+companyCards(r.companies)+'</div></div>'
+    + '<div><div class="cross-company-section-title">แยกตามบริษัท · บริษัทที่มีสลิปของบัญชีนี้ · ไปอยู่บริษัทไหน / ยอดเท่าไหร่ / ใครส่งรูป</div><div class="cross-company-companies">'+companyCards(r.companies)+'</div></div>'
     + '<div class="cross-company-overall-days"><div class="cross-company-section-title">ยอดรายวันรวม</div><div class="cross-company-days">'+dayRows(r.days)+'</div></div>'
     + '</article>').join('')+'</div>';
 }}
