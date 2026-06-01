@@ -391,6 +391,13 @@ def ensure_dashboard_performance_indexes(conn: sqlite3.Connection) -> None:
         WHERE status='success' AND COALESCE(is_duplicate,0)=1
         """
     )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_slips_cross_duplicate_lookup
+        ON slips(reference_no, slip_date_iso, amount, bot_key, chat_id)
+        WHERE status='success' AND reference_no IS NOT NULL AND reference_no!=''
+        """
+    )
     if sqlite_table_exists(conn, "ocr_jobs"):
         conn.execute(
             """
@@ -3156,6 +3163,82 @@ def account_search_sql_predicate(search: str) -> Tuple[str, List[Any]]:
     return "(" + " OR ".join(clauses) + ")", params
 
 
+def cross_duplicate_key(row: Dict[str, Any]) -> Tuple[str, str, float] | None:
+    reference = clean_display(row.get("reference_no"))
+    date = clean_display(row.get("slip_date_iso"))
+    amount = round(float(row.get("amount") or 0), 2)
+    if not reference or not date or amount <= 0:
+        return None
+    return reference, date, amount
+
+
+def annotate_cross_duplicate_matches(conn: sqlite3.Connection, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Add exact cross-company duplicate context to visible account slip rows."""
+    keys = sorted({key for row in rows if (key := cross_duplicate_key(row))})
+    duplicate_groups: Dict[Tuple[str, str, float], List[Dict[str, Any]]] = {}
+    if keys:
+        values_sql = ",".join(["(?,?,?)"] * len(keys))
+        values: List[Any] = []
+        for reference, date_key, amount in keys:
+            values.extend([reference, date_key, amount])
+        matches = rows_to_dicts(conn.execute(
+            f"""
+            WITH duplicate_keys(reference_no, slip_date_iso, amount) AS (VALUES {values_sql})
+            SELECT COALESCE(NULLIF(s.bot_key,''),'default') AS bot_key,
+                   s.company_name, s.chat_id, s.message_id,
+                   s.sender_name, s.username, s.amount, s.reference_no,
+                   s.slip_date_iso, s.is_duplicate
+            FROM slips s
+            JOIN duplicate_keys k
+              ON s.reference_no=k.reference_no
+             AND s.slip_date_iso=k.slip_date_iso
+             AND s.amount=k.amount
+            WHERE s.status='success'
+              AND s.reference_no IS NOT NULL
+              AND s.reference_no!=''
+            ORDER BY s.created_at_iso, s.id
+            """,
+            values,
+        ).fetchall())
+        grouped: Dict[Tuple[str, str, float], List[Dict[str, Any]]] = defaultdict(list)
+        for match in matches:
+            clean_company_fields(match)
+            key = cross_duplicate_key(match)
+            if not key:
+                continue
+            grouped[key].append(match)
+        for key, group in grouped.items():
+            source_keys = {f"{m.get('bot_key') or 'default'}:{m.get('chat_id') or ''}" for m in group}
+            company_keys = {m.get("company_name") or m.get("bot_key") or "" for m in group}
+            if len(source_keys) > 1 and len(company_keys) > 1:
+                duplicate_groups[key] = group
+
+    for row in rows:
+        key = cross_duplicate_key(row)
+        group = duplicate_groups.get(key or ("", "", 0.0), [])
+        row_company = clean_display(row.get("company_name") or row.get("bot_key"))
+        companies = sorted({m.get("company_name") or m.get("bot_key") or "-" for m in group}, key=company_sort_key)
+        other_matches = []
+        for match in group:
+            match_company = clean_display(match.get("company_name") or match.get("bot_key"))
+            if match_company == row_company:
+                continue
+            other_matches.append({
+                "company_name": match.get("company_name") or match.get("bot_key") or "-",
+                "bot_key": match.get("bot_key") or "default",
+                "message_id": clean_display(match.get("message_id")),
+                "amount": float(match.get("amount") or 0),
+                "sender_display": telegram_sender_display(match.get("sender_name"), match.get("username")),
+                "is_duplicate": int(match.get("is_duplicate") or 0),
+            })
+        row["cross_duplicate_source_count"] = len({f"{m.get('bot_key') or 'default'}:{m.get('chat_id') or ''}" for m in group}) if group else 0
+        row["cross_duplicate_company_count"] = len(companies)
+        row["cross_duplicate_companies"] = companies
+        row["cross_duplicate_match_count"] = len(other_matches)
+        row["cross_duplicate_matches"] = other_matches[:6]
+    return rows
+
+
 def account_slip_search_rows(conn: sqlite3.Connection, where_clause: str, params: List[Any], search: str = "", limit: int = 80) -> Dict[str, Any]:
     """Individual counted slip rows for auditing one account within the selected day/company/flow scope."""
     query = clean_display(search)
@@ -3217,6 +3300,7 @@ def account_slip_search_rows(conn: sqlite3.Connection, where_clause: str, params
     company_rows = account_slip_search_company_summary(matched)
     row_limit = int(limit or 0)
     visible_rows = matched if row_limit <= 0 else matched[:row_limit]
+    annotate_cross_duplicate_matches(conn, visible_rows)
     return {"query": query, "count": len(matched), "amount": total_amount, "rows": visible_rows, "truncated": row_limit > 0 and len(matched) > row_limit, "company_count": len(company_rows), "companies": company_rows}
 
 
@@ -6731,9 +6815,13 @@ function renderCrossCompanyAccountSlipSearch(result) {{
     const banks = [r.from_bank, r.to_bank].filter(Boolean).join(' → ') || r.issuer_bank || '-';
     const accounts = [r.from_account, r.to_account].filter(Boolean).join(' → ') || '-';
     const names = [r.transferor_name, r.recipient_name].filter(Boolean).join(' → ') || r.sender_name || '-';
-    return '<div class="slip-card">'+image+'<div class="slip-body"><div class="top"><b>'+esc(r.company_name || r.bot_key || '-')+'</b><span class="pill">'+esc(r.flow_label || flowName(r.flow_type))+'</span></div>'
+    const crossDupeMatches = r.cross_duplicate_matches || [];
+    const crossDupeBadge = Number(r.cross_duplicate_match_count || 0) > 0 ? '<span class="pill warn">พบสลิปตรงกันในบริษัทอื่น</span>' : '';
+    const crossDupeLine = crossDupeMatches.length ? '<div class="mini warn">พบสลิปตรงกันในบริษัทอื่น: '+crossDupeMatches.map(m => esc(m.company_name || m.bot_key || '-')+' msg '+esc(m.message_id || '-')+' · '+money(m.amount || 0)+' · ผู้ส่งรูป '+esc(m.sender_display || m.sender_name || m.username || '-')).join(' · ')+'</div>' : '';
+    return '<div class="slip-card">'+image+'<div class="slip-body"><div class="top"><b>'+esc(r.company_name || r.bot_key || '-')+'</b><span class="pill">'+esc(r.flow_label || flowName(r.flow_type))+'</span>'+crossDupeBadge+'</div>'
       + '<div class="mini">'+esc(r.slip_date_text || ((r.date || r.date_key || '')+' '+(r.slip_time || '')))+' · msg '+esc(r.message_id || '-')+' · '+esc(r.matched_label || '-')+'</div>'
       + '<div class="mini">ผู้ส่งรูป: '+esc(r.sender_display || r.sender_name || r.username || '-')+' · กลุ่ม: '+esc(r.chat_title || '-')+'</div>'
+      + crossDupeLine
       + '<div>'+esc(names)+'</div><div class="mini">'+esc(banks)+' · '+esc(accounts)+'</div>'
       + '<div>ยอด <b>'+money(r.amount || 0)+'</b></div>'
       + '<div class="mini">ref '+esc(r.reference || r.reference_no || '-')+'</div>'
