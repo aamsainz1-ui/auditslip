@@ -6540,6 +6540,14 @@ function scrollMenuSectionIntoView(target, smooth=true) {{
   const section = document.getElementById(target);
   if (section && section.scrollIntoView) section.scrollIntoView({{behavior: smooth ? 'smooth' : 'auto', block:'start'}});
 }}
+function scheduleHashTargetScroll(target, smooth=true) {{
+  if (!target) return;
+  scrollMenuSectionIntoView(target, smooth);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(() => scrollMenuSectionIntoView(target, smooth));
+  setTimeout(() => scrollMenuSectionIntoView(target, smooth), 80);
+  setTimeout(() => scrollMenuSectionIntoView(target, smooth), 260);
+  setTimeout(() => scrollMenuSectionIntoView(target, smooth), 700);
+}}
 function refreshDashboardHome() {{
   showMenuSection('section-operator-home', {{scroll:false, persist:false, syncHash:false}});
   try {{ window.history.replaceState({{}}, '', location.pathname + location.search); }} catch (e) {{}}
@@ -6591,6 +6599,7 @@ function applyInitialHashSection() {{
   if (initialHashTarget && document.getElementById(initialHashTarget) && document.getElementById(initialHashTarget).classList.contains('menu-section')) {{
     showMenuSection(initialHashTarget, {{scroll:false, syncHash:false}});
     setTimeout(() => scrollMenuSectionIntoView(initialHashTarget, false), 0);
+    setTimeout(() => scheduleHashTargetScroll(initialHashTarget, false), 260);
     return true;
   }}
   return false;

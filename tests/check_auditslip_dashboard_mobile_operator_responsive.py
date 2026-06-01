@@ -50,6 +50,10 @@ required_markers = [
     "let initialHashApplied = false",
     "showMenuSection(initialHashTarget, {scroll:false, syncHash:false})",
     "scrollMenuSectionIntoView(initialHashTarget, false)",
+    "function scheduleHashTargetScroll",
+    "requestAnimationFrame(() => scrollMenuSectionIntoView(target, smooth))",
+    "setTimeout(() => scrollMenuSectionIntoView(target, smooth), 80)",
+    "setTimeout(() => scheduleHashTargetScroll(initialHashTarget, false), 260)",
     "if (!initialHashApplied && options && options.scrollTop)",
     # Mobile card polish: no horizontal overflow, better slip cards/tap targets on narrow screens.
     "scroll-margin-top:86px",
