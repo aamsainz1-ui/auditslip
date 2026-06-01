@@ -1510,6 +1510,117 @@ def company_account_daily_totals(conn: sqlite3.Connection, where_clause: str, pa
     return out[:limit]
 
 
+def bank_account_name_totals(conn: sqlite3.Connection, where_clause: str, params: List[Any], limit: int = 500) -> List[Dict[str, Any]]:
+    """Account-name rows for the bank section, grouped by company/chat/account/name."""
+    rows = conn.execute(
+        f"""
+        SELECT COALESCE(NULLIF(bot_key,''),'default') AS bot_key,
+               COALESCE(NULLIF(company_name,''), COALESCE(NULLIF(bot_key,''),'default')) AS company_name,
+               chat_id,
+               COALESCE(NULLIF(chat_title,''), chat_id) AS chat_title,
+               slip_date_display,
+               slip_date_iso,
+               transferor_name,
+               recipient_name,
+               account_name,
+               sender_name,
+               issuer_bank,
+               from_bank,
+               from_account,
+               to_bank,
+               to_account,
+               COUNT(*) AS count,
+               COALESCE(SUM(amount),0) AS amount
+        FROM slips
+        WHERE {where_clause}
+          AND (
+            NULLIF(TRIM(COALESCE(transferor_name,'')), '') IS NOT NULL
+            OR NULLIF(TRIM(COALESCE(recipient_name,'')), '') IS NOT NULL
+            OR NULLIF(TRIM(COALESCE(account_name,'')), '') IS NOT NULL
+            OR NULLIF(TRIM(COALESCE(from_account,'')), '') IS NOT NULL
+            OR NULLIF(TRIM(COALESCE(to_account,'')), '') IS NOT NULL
+          )
+        GROUP BY bot_key, company_name, chat_id, chat_title, slip_date_display, slip_date_iso,
+                 transferor_name, recipient_name, account_name, sender_name,
+                 issuer_bank, from_bank, from_account, to_bank, to_account
+        """,
+        params,
+    ).fetchall()
+    groups: Dict[Tuple[str, str, str, str, str, str, str, str, str], Dict[str, Any]] = {}
+    for row in rows:
+        bot_key = clean_display(row["bot_key"]) or "default"
+        company_name = clean_company_name(row["company_name"], bot_key)
+        chat_id = clean_display(row["chat_id"])
+        chat_title = clean_display(row["chat_title"])
+        flow = flow_type_for_title(chat_title, bot_key, chat_id)
+        if flow == "deposit":
+            # Deposit/top-up groups: the company account is the receiving/destination side.
+            # The source side is the customer's bank account and must not appear here.
+            raw_name = clean_display(row["recipient_name"] or row["account_name"])
+            bank = display_bank(row["to_bank"])
+            account = clean_display(row["to_account"])
+            role = "บัญชีฝาก/รับเงินของบริษัท"
+        elif flow == "withdraw":
+            # Withdrawal groups: the company account is the sender/source side.
+            # The destination side is the customer's bank account and must not appear here.
+            raw_name = clean_display(row["transferor_name"] or row["account_name"])
+            bank = display_bank(row["from_bank"] or row["issuer_bank"])
+            account = clean_display(row["from_account"])
+            role = "บัญชีถอน/จ่ายของบริษัท"
+        else:
+            continue
+
+        display_name = display_transferor_name(raw_name) or "(ไม่ทราบชื่อบัญชีบริษัท)"
+        if not any([display_name.strip("()"), bank, account]):
+            continue
+        date_key, date_label, sort_date = date_bucket(row["slip_date_display"], row["slip_date_iso"])
+        name_key = transferor_key(display_name) or bank_key(display_name)
+        account_key = bank_key(account)
+        key = (date_key, bot_key, chat_id, flow, role, bank_key(bank), account_key, name_key, bank_key(chat_title))
+        group = groups.setdefault(
+            key,
+            {
+                "date_key": date_key,
+                "date": date_label,
+                "sort_date": sort_date,
+                "bot_key": bot_key,
+                "company_name": company_name,
+                "chat_id": chat_id,
+                "chat_title": chat_title,
+                "flow_type": flow,
+                "flow_label": flow_label(flow),
+                "account_role": role,
+                "account_name": display_name,
+                "display_name": display_name,
+                "bank": bank,
+                "account": account,
+                "count": 0,
+                "amount": 0.0,
+                "name_aliases": [],
+                "account_aliases": [],
+                "search_text": account or display_name or bank,
+            },
+        )
+        row_count = int(row["count"] or 0)
+        row_amount = float(row["amount"] or 0)
+        group["count"] += row_count
+        group["amount"] += row_amount
+        if display_name and display_name not in group["name_aliases"]:
+            group["name_aliases"].append(display_name)
+        if account and account not in group["account_aliases"]:
+            group["account_aliases"].append(account)
+        if bank and not group["bank"]:
+            group["bank"] = bank
+        if account and better_account_display(account, group.get("account", "")):
+            group["account"] = account
+            group["search_text"] = account
+    out = list(groups.values())
+    out.sort(key=lambda r: (-float(r.get("amount") or 0), -int(r.get("count") or 0), clean_display(r.get("account_name"))))
+    out.sort(key=dict_company_sort_key)
+    out.sort(key=lambda r: str(r.get("sort_date") or ""), reverse=True)
+    return out[:limit]
+
+
 def cross_company_withdraw_flow_type(flow_type: str) -> str:
     """Cross-company account audits are for withdrawal/source accounts only."""
     flow = normalize_flow_type(flow_type)
@@ -2985,6 +3096,7 @@ DASHBOARD_LITE_EMPTY_ARRAY_KEYS = (
     "jobs_recent",
     "provider_usage",
     "company_account_daily",
+    "bank_account_names",
     "withdraw_limit_usage",
     "shared_withdraw_limit_usage",
     "account_cross_company",
@@ -4822,6 +4934,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
             by_to_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(to_bank,''), '(ไม่ทราบธนาคารปลายทาง)')", "(ไม่ทราบธนาคารปลายทาง)") if include_detail_rows else []
             by_sender = grouped_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(sender_name,''), NULLIF(username,''), '(ไม่ทราบผู้ส่งรูป)')") if include_detail_rows else []
             company_account_daily = company_account_daily_totals(conn, selected_where, selected_params, account_daily_search_key)
+            bank_account_names = bank_account_name_totals(conn, selected_where, selected_params) if include_detail_rows else []
             account_slip_search = account_slip_search_rows(conn, selected_where, selected_params, slip_search_key) if include_detail_rows else empty_account_slip_search(slip_search_key)
             account_cross_company = cross_company_account_usage(conn, scope, flow_type_key, selected_bot_key, slip_search_key) if include_detail_rows else []
         elif selected_chat_id:
@@ -4880,6 +4993,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
             by_to_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(to_bank,''), '(ไม่ทราบธนาคารปลายทาง)')", "(ไม่ทราบธนาคารปลายทาง)") if include_detail_rows else []
             by_sender = grouped_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(sender_name,''), NULLIF(username,''), '(ไม่ทราบผู้ส่งรูป)')") if include_detail_rows else []
             company_account_daily = company_account_daily_totals(conn, selected_where, selected_params, account_daily_search_key)
+            bank_account_names = bank_account_name_totals(conn, selected_where, selected_params) if include_detail_rows else []
             account_slip_search = account_slip_search_rows(conn, selected_where, selected_params, slip_search_key) if include_detail_rows else empty_account_slip_search(slip_search_key)
             account_cross_company = cross_company_account_usage(conn, scope, flow_type_key, selected_bot_key, slip_search_key) if include_detail_rows else []
         else:
@@ -4938,6 +5052,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
                 by_to_bank = bank_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(to_bank,''), '(ไม่ทราบธนาคารปลายทาง)')", "(ไม่ทราบธนาคารปลายทาง)") if include_detail_rows else []
                 by_sender = grouped_totals(conn, selected_where, selected_params, "COALESCE(NULLIF(sender_name,''), NULLIF(username,''), '(ไม่ทราบผู้ส่งรูป)')") if include_detail_rows else []
                 company_account_daily = company_account_daily_totals(conn, selected_where, selected_params, account_daily_search_key)
+                bank_account_names = bank_account_name_totals(conn, selected_where, selected_params) if include_detail_rows else []
                 account_slip_search = account_slip_search_rows(conn, selected_where, selected_params, slip_search_key) if include_detail_rows else empty_account_slip_search(slip_search_key)
                 account_cross_company = cross_company_account_usage(conn, scope, flow_type_key, selected_bot_key, slip_search_key) if include_detail_rows else []
             else:
@@ -4960,6 +5075,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
                 by_transferor = by_account_day = by_account_day_all = by_date = by_from_bank = by_to_bank = by_sender = []
                 daily_flow_summary = []
                 company_account_daily = []
+                bank_account_names = []
                 account_slip_search = empty_account_slip_search(slip_search_key)
                 account_cross_company = []
                 deposit_customer_slips = []
@@ -5203,6 +5319,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
         "company_summary": selected_company_summary,
         "company_menu": company_menu_rows,
         "company_account_daily": aggregate_dicts(company_account_daily),
+        "bank_account_names": aggregate_dicts(bank_account_names),
         "withdraw_limit_usage": aggregate_dicts(withdraw_limit_usage),
         "shared_withdraw_limit_usage": aggregate_dicts(shared_withdraw_limit_usage),
         "account_slip_search": account_slip_search,
@@ -6320,6 +6437,8 @@ def render_dashboard_html(token: str = "") -> str:
       </div>
     </section>
     <section id="section-banks" class="sections menu-section" hidden>
+      <div class="card"><h3>บัญชีฝาก/รับเงินของบริษัท</h3><div class="mini">ดึงเฉพาะฝั่งปลายทางของกลุ่มฝาก/เติมมือ · ไม่แสดงบัญชีลูกค้าผู้โอน</div><div id="bankDepositAccountNames"></div></div>
+      <div class="card"><h3>บัญชีถอน/จ่ายของบริษัท</h3><div class="mini">ดึงเฉพาะฝั่งต้นทางของกลุ่มถอน · ไม่แสดงบัญชีลูกค้าผู้รับเงิน</div><div id="bankWithdrawAccountNames"></div></div>
       <div class="card"><h3>ยอดแยกตามธนาคารต้นทาง/ผู้โอน</h3><div id="byFromBank"></div><h3>ธนาคารปลายทาง</h3><div id="byToBank"></div></div>
       <div class="card"><h3>หมายเหตุธนาคาร</h3><div class="muted">ตัดตารางยอดแยกตาม issuer ออกแล้ว เหลือเฉพาะต้นทางและปลายทางที่ใช้ตรวจยอดจริง</div></div>
     </section>
@@ -6710,6 +6829,29 @@ function enhanceResponsiveTables(root=document) {{
 }}
 function aggregateTable(rows) {{ return table(rows, [['ชื่อ','name'], ['สลิป','count'], ['ยอด', r => money(r.amount)]]); }}
 function sourceBankTable(rows) {{ return aggregateTable(rows); }}
+function renderBankAccountNames(rows, emptyText='ยังไม่มีบัญชีบริษัทใน scope นี้') {{
+  const items = rows || [];
+  if (!items.length) return '<div class="muted">'+esc(emptyText)+'</div>';
+  return '<div class="responsive-table"><table><thead><tr><th>บริษัท</th><th>กลุ่ม</th><th>ประเภท</th><th>ชื่อบัญชีบริษัท</th><th>ธนาคาร</th><th>เลขบัญชี</th><th>สลิป</th><th>ยอด</th><th class="action-col">ดูรายการ</th></tr></thead><tbody>'+
+    items.map(r => {{
+      const accountAliases = (r.account_aliases || []).filter(a => a && a !== r.account);
+      const nameAliases = (r.name_aliases || []).filter(a => a && a !== r.account_name);
+      const nameCell = esc(r.account_name || r.display_name || '-') + (nameAliases.length ? '<div class="mini">ชื่ออื่น: '+esc(nameAliases.join(', '))+'</div>' : '');
+      const accountCell = esc(r.account || '-') + (accountAliases.length ? '<div class="mini">รวมรูปแบบ: '+esc(accountAliases.join(', '))+'</div>' : '');
+      const searchText = String(r.search_text || r.account || r.account_name || r.bank || '');
+      return '<tr>'+[
+        '<td>'+esc(r.company_name || r.bot_key || '-')+'</td>',
+        '<td>'+esc(r.chat_title || '-')+'</td>',
+        '<td>'+esc(r.account_role || flowName(r.flow_type))+'</td>',
+        '<td>'+nameCell+'</td>',
+        '<td>'+esc(r.bank || '-')+'</td>',
+        '<td>'+accountCell+'</td>',
+        '<td>'+esc(r.count || 0)+'</td>',
+        '<td>'+money(r.amount || 0)+'</td>',
+        '<td class="action-cell"><button type="button" data-account-search="'+esc(searchText)+'">ดูสลิปบัญชีนี้</button></td>'
+      ].join('')+'</tr>';
+    }}).join('')+'</tbody></table></div>';
+}}
 function dailyAccountLimitTable(rows) {{
   if (!rows || !rows.length) return '<div class="muted">ไม่มีข้อมูล</div>';
   return '<div class="responsive-table"><table><thead><tr><th>วันที่</th><th>บัญชีผู้โอน (บริษัท)</th><th>เลขบัญชี</th><th>สลิป</th><th>ยอดวันนี้</th><th>วงเงิน/วัน</th><th>เหลือ/เกิน</th></tr></thead><tbody>'+
@@ -8183,8 +8325,12 @@ async function load(options={{}}) {{
     }}
     document.getElementById('depositCustomerSlips').innerHTML = recentCards(data.deposit_customer_slips || []);
     document.getElementById('bySender').innerHTML = aggregateTable(data.by_sender);
+    const bankAccountRows = data.bank_account_names || [];
+    document.getElementById('bankDepositAccountNames').innerHTML = renderBankAccountNames(bankAccountRows.filter(r => r.flow_type === 'deposit'), 'ยังไม่มีบัญชีฝาก/รับเงินของบริษัทใน scope นี้');
+    document.getElementById('bankWithdrawAccountNames').innerHTML = renderBankAccountNames(bankAccountRows.filter(r => r.flow_type === 'withdraw'), 'ยังไม่มีบัญชีถอน/จ่ายของบริษัทใน scope นี้');
     document.getElementById('byFromBank').innerHTML = sourceBankTable(data.by_from_bank);
     document.getElementById('byToBank').innerHTML = aggregateTable(data.by_to_bank);
+    wireAccountSearchButtons();
     document.getElementById('duplicatePairs').innerHTML = renderDuplicatePairs(data.duplicate_pairs);
     wireDuplicateButtons();
     document.getElementById('sourceBankReview').innerHTML = sourceBankReviewCards(data.source_bank_review);
