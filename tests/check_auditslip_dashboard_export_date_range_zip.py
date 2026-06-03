@@ -58,6 +58,7 @@ ws = wb["Slips"]
 rows = list(ws.iter_rows(values_only=True))
 headers = list(rows[0])
 records = [dict(zip(headers, row)) for row in rows[1:]]
+records = [r for r in records if not str(r.get("company_name") or "").startswith("รวม")]
 refs = [row["reference_no"] for row in records]
 assert refs == ["R1"], rows
 assert "R2" not in refs, rows

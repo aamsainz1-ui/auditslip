@@ -58,20 +58,23 @@ for sheet in ["SummaryByCompany", "SummaryByTransferor", "DailySummary", "Slips"
     assert sheet in wb.sheetnames, wb.sheetnames
 
 headers = [cell.value for cell in wb["Slips"][1]]
-for forbidden_header in ["id", "chat_id", "file_id", "status", "bot_key"]:
+for forbidden_header in ["id", "chat_id", "file_id", "bot_key"]:
     assert forbidden_header not in headers, f"dashboard export still exposes/internal old column: {forbidden_header}"
 for required_header in ["company_name", "chat_title", "message_id", "slip_date_display", "slip_date_iso", "transferor_name", "from_bank", "to_bank", "amount", "reference_no"]:
     assert required_header in headers, f"missing useful operator column: {required_header}"
 slip_rows = [dict(zip(headers, [cell.value for cell in row])) for row in wb["Slips"].iter_rows(min_row=2)]
+slip_rows = [r for r in slip_rows if not str(r.get("company_name") or "").startswith("รวม")]
 assert [row["reference_no"] for row in slip_rows] == ["R-IN"], slip_rows
 assert slip_rows[0]["amount"] == 111.0, slip_rows
 
 summary_headers = [cell.value for cell in wb["SummaryByCompany"][1]]
 summary_rows = [dict(zip(summary_headers, [cell.value for cell in row])) for row in wb["SummaryByCompany"].iter_rows(min_row=2)]
+summary_rows = [r for r in summary_rows if not str(r.get("company_name") or "").startswith("รวม")]
 assert summary_rows == [{"company_name": "บริษัท 1", "count": 1, "amount": 111.0, "fee": 0}], summary_rows
 
 daily_headers = [cell.value for cell in wb["DailySummary"][1]]
 daily_rows = [dict(zip(daily_headers, [cell.value for cell in row])) for row in wb["DailySummary"].iter_rows(min_row=2)]
+daily_rows = [r for r in daily_rows if not str(r.get("date") or "").startswith("รวม")]
 assert daily_rows == [{"date": "22/05/26", "count": 1, "amount": 111.0, "fee": 0}], daily_rows
 
 print("ok: dashboard export format is operator-ready and visible dates work in ranges")

@@ -48,7 +48,7 @@ from functools import lru_cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -777,6 +777,99 @@ def ensure_slip_reviews_table(conn: sqlite3.Connection) -> None:
         )
         """
     )
+
+
+def ensure_account_config_table(conn: sqlite3.Connection) -> None:
+    """ตารางตั้งค่าบัญชี: ระบุว่าเลขบัญชีไหนสังกัดบริษัทไหน + ชื่อ/วงเงิน (credit limit)."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS account_config (
+          account_no TEXT PRIMARY KEY,
+          account_name TEXT,
+          company_name TEXT,
+          credit_limit REAL DEFAULT 0,
+          updated_at TEXT
+        )
+        """
+    )
+
+
+def account_config_key(account_no: Any) -> str:
+    """คีย์เลขบัญชีแบบ normalize (ตัดขีด/ช่องว่าง) ให้เทียบกับ from_account/to_account ของสลิปได้."""
+    return bank_key(account_no)
+
+
+def save_account_config(db_path: Path, account_no: str, account_name: str, company_name: str, credit_limit: float = 0.0) -> Dict[str, Any]:
+    key = account_config_key(account_no)
+    if not key:
+        return {"ok": False, "error": "ต้องระบุเลขบัญชี", "status_code": 400}
+    account_name = clean_display(account_name)
+    company_name = clean_display(company_name)
+    now_iso = bkk_iso_from_ms(int(time.time() * 1000))
+    with connect(db_path) as conn:
+        ensure_account_config_table(conn)
+        conn.execute(
+            """
+            INSERT INTO account_config(account_no, account_name, company_name, credit_limit, updated_at)
+            VALUES (?,?,?,?,?)
+            ON CONFLICT(account_no) DO UPDATE SET
+              account_name=excluded.account_name,
+              company_name=excluded.company_name,
+              credit_limit=excluded.credit_limit,
+              updated_at=excluded.updated_at
+            """,
+            (key, account_name, company_name, float(credit_limit or 0), now_iso),
+        )
+        conn.commit()
+    return {"ok": True, "account_no": key, "account_name": account_name, "company_name": company_name, "credit_limit": float(credit_limit or 0)}
+
+
+def delete_account_config(db_path: Path, account_no: str) -> Dict[str, Any]:
+    key = account_config_key(account_no)
+    if not key:
+        return {"ok": False, "error": "ต้องระบุเลขบัญชี", "status_code": 400}
+    with connect(db_path) as conn:
+        ensure_account_config_table(conn)
+        cur = conn.execute("DELETE FROM account_config WHERE account_no=?", (key,))
+        conn.commit()
+    return {"ok": True, "account_no": key, "deleted": cur.rowcount}
+
+
+def load_account_config(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    ensure_account_config_table(conn)
+    rows = conn.execute(
+        "SELECT account_no, account_name, company_name, credit_limit, updated_at FROM account_config ORDER BY company_name ASC, account_no ASC"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def account_config_company_map(db_path: Path) -> Dict[str, str]:
+    """map normalized account_no -> company_name (เฉพาะที่ตั้ง company ไว้) สำหรับ overlay export."""
+    out: Dict[str, str] = {}
+    with connect(db_path) as conn:
+        for row in load_account_config(conn):
+            key = account_config_key(row.get("account_no"))
+            company = clean_display(row.get("company_name"))
+            if key and company:
+                out[key] = company
+    return out
+
+
+def account_config_limit_map(db_path: Path) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    with connect(db_path) as conn:
+        for row in load_account_config(conn):
+            key = account_config_key(row.get("account_no"))
+            limit = float(row.get("credit_limit") or 0)
+            if key and limit > 0:
+                out[key] = limit
+    return out
+
+
+def account_config_snapshot(db_path: Path = DB_PATH) -> List[Dict[str, Any]]:
+    """รายการตั้งค่าบัญชีทั้งหมด (account_no/ชื่อ/บริษัท/วงเงิน) สำหรับแสดงบน dashboard."""
+    with connect(db_path) as conn:
+        return load_account_config(conn)
 
 
 def save_company_account(
@@ -2206,7 +2299,7 @@ def slip_reconcile_rows(conn: sqlite3.Connection, chat_id: str = "", scope: str 
     return out
 
 
-def reconcile_backend_excel(db_path: Path, excel_path: Path, chat_id: str = "", scope: str = "all", bot_key: str = "", flow_type: str = "all") -> Dict[str, Any]:
+def reconcile_backend_excel(db_path: Path, excel_path: Path, chat_id: str = "", scope: str = "all", bot_key: str = "", flow_type: str = "all", include_full: bool = False) -> Dict[str, Any]:
     all_backend_rows = parse_backend_excel(excel_path)
     flow = normalize_flow_type(flow_type)
     bot = clean_display(bot_key)
@@ -2250,7 +2343,7 @@ def reconcile_backend_excel(db_path: Path, excel_path: Path, chat_id: str = "", 
     backend_amount = sum(float(r["amount"] or 0) for r in backend_rows)
     slip_amount = sum(float(r["amount"] or 0) for r in slip_rows)
     matched_amount = sum(float(m["backend"]["amount"] or 0) for m in matches)
-    return {
+    result = {
         "ok": True,
         "excel_path": str(excel_path),
         "scope": {"chat_id": clean_display(chat_id), "bot_key": bot or "__all__", "flow_type": flow, "flow_label": flow_label(flow), "date_scope": clean_display(scope)},
@@ -2265,9 +2358,13 @@ def reconcile_backend_excel(db_path: Path, excel_path: Path, chat_id: str = "", 
         "daily": {"backend": reconcile_daily_summary(backend_rows), "slips": reconcile_daily_summary(slip_rows)},
         "diff_amount": backend_amount - slip_amount,
     }
+    if include_full:
+        # ลิสต์เต็ม (ไม่ถูกตัด [:100]) สำหรับ export เป็นไฟล์ — ไม่ส่งขึ้น UI
+        result["_full"] = {"matched": matches, "missing_in_slips": missing, "extra_slips": extra}
+    return result
 
 
-def reconcile_backend_slips_statement(db_path: Path, excel_path: Path, statement_path: Path, chat_id: str = "", scope: str = "all", bot_key: str = "", flow_type: str = "all") -> Dict[str, Any]:
+def reconcile_backend_slips_statement(db_path: Path, excel_path: Path, statement_path: Path, chat_id: str = "", scope: str = "all", bot_key: str = "", flow_type: str = "all", include_full: bool = False) -> Dict[str, Any]:
     """Compare three sources by amount/time/date: backend Excel, OCR slips, and bank statement."""
     all_backend_rows = parse_backend_excel(excel_path)
     all_statement_rows = parse_statement_file(statement_path)
@@ -2310,7 +2407,7 @@ def reconcile_backend_slips_statement(db_path: Path, excel_path: Path, statement
     slip_amount = sum(float(r["amount"] or 0) for r in slip_rows)
     statement_amount = sum(float(r["amount"] or 0) for r in statement_rows)
     matched_amount = sum(float(m["backend"]["amount"] or 0) for m in matched)
-    return {
+    result = {
         "ok": True,
         "mode": "backend_slips_statement",
         "excel_path": str(excel_path),
@@ -2331,6 +2428,15 @@ def reconcile_backend_slips_statement(db_path: Path, excel_path: Path, statement
         "daily": {"backend": reconcile_daily_summary(backend_rows), "slips": reconcile_daily_summary(slip_rows), "statement": reconcile_daily_summary(statement_rows)},
         "diff_amounts": {"backend_minus_slips": backend_amount - slip_amount, "backend_minus_statement": backend_amount - statement_amount, "slips_minus_statement": slip_amount - statement_amount},
     }
+    if include_full:
+        result["_full"] = {
+            "matched": matched,
+            "backend_missing_slip": backend_missing_slip,
+            "backend_missing_statement": backend_missing_statement,
+            "slip_extra": slip_extra,
+            "statement_extra": statement_extra,
+        }
+    return result
 
 
 def scope_where(chat_id: str, scope: str = "open", success_only: bool = True, bot_key: str = "") -> Tuple[str, List[Any], str]:
@@ -5291,6 +5397,7 @@ def dashboard_snapshot(db_path: Path = DB_PATH, chat_id: str = "", scope: str = 
         "scope_label": scope_label,
         "telegram_bots": public_telegram_bots(),
         "company_accounts": company_accounts,
+        "account_config": account_config_snapshot(db_path),
         "totals": {
             "open_success_count": int(open_totals["count"] or 0),
             "open_success_amount": float(open_totals["amount"] or 0),
@@ -5422,6 +5529,7 @@ DASHBOARD_EXPORT_HEADERS = [
     "label",
     "raw_text",
     "confidence",
+    "status",
     "is_duplicate",
     "duplicate_of",
     "settlement_id",
@@ -5439,6 +5547,7 @@ DASHBOARD_DUPLICATE_HEADERS = [
     "to_bank",
     "to_account",
     "amount",
+    "matched_amount",
     "reference_no",
     "matched_reference_no",
     "sender_name",
@@ -5601,6 +5710,26 @@ def dashboard_slip_export_rows(rows: List[sqlite3.Row], flow_type: str = "all") 
     return out
 
 
+def export_row_status(row: Any) -> str:
+    return str(export_row_get(row, "status", "") or "")
+
+
+def dashboard_pending_unclear_export_rows(rows: List[sqlite3.Row]) -> List[List[Any]]:
+    """แถวที่ status != success (queued/unclear/...) ไม่ใช่ duplicate.
+
+    แถวเหล่านี้โผล่ใน detail (Slips) แต่ไม่ถูกนับใน summary (counted_export_rows กรอง success อย่างเดียว)
+    แยกออกมาเป็น sheet ของตัวเองเพื่อให้ยอด summary กับ detail อธิบายส่วนต่างได้.
+    """
+    out: List[List[Any]] = []
+    for row in rows:
+        if export_row_is_duplicate(row):
+            continue
+        if export_row_status(row) == "success":
+            continue
+        out.append([export_cell_value(row, header) for header in DASHBOARD_EXPORT_HEADERS])
+    return out
+
+
 def cross_company_account_slip_export_rows(rows: List[Dict[str, Any]], flow_type: str = "all") -> List[List[Any]]:
     target = normalize_flow_type(flow_type)
     out: List[List[Any]] = []
@@ -5611,6 +5740,165 @@ def cross_company_account_slip_export_rows(rows: List[Dict[str, Any]], flow_type
             continue
         out.append([cross_company_account_export_cell(row, header) for header in CROSS_COMPANY_ACCOUNT_EXPORT_HEADERS])
     return out
+
+
+# คอลัมน์คงที่ (ฝั่งซ้าย) ของรายงานเทียบยอดข้ามบริษัทแบบบรรทัดเดียว
+# เวลา (slip_time) ย้ายไป block ของแต่ละบริษัท เพราะแต่ละบริษัทมีเวลาของตัวเอง
+CROSS_COMPANY_RECONCILE_BASE_HEADERS = [
+    "slip_date_display",
+    "amount",
+]
+# คอลัมน์สถานะ (ฝั่งขวา) ต่อท้ายหลัง block ของแต่ละบริษัท
+# count_diff = ผลต่างจำนวนใบ (มาก-น้อย), amount_diff = ผลต่างเป็นบาท (count_diff x amount)
+CROSS_COMPANY_RECONCILE_STATUS_HEADERS = [
+    "companies_present",
+    "match_status",
+    "count_diff",
+    "amount_diff",
+]
+
+
+def _cross_reconcile_filter_rows(rows: List[Dict[str, Any]], flow_type: str = "all") -> List[Dict[str, Any]]:
+    """กรอง slip ที่นับจริง (ไม่ใช่ duplicate) ตาม flow_type — ใช้ตรรกะเดียวกับ export เดิม."""
+    target = normalize_flow_type(flow_type)
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        if export_row_is_duplicate(row):
+            continue
+        if target != "all" and export_row_flow_type(row) != target:
+            continue
+        out.append(row)
+    return out
+
+
+def reconcile_row_own_account(row: Dict[str, Any]) -> str:
+    """บัญชี 'ของตัวเอง' ของสลิป: ถอน = from_account (ต้นทาง), ฝาก = to_account (ปลายทางรับเงิน)."""
+    flow = export_row_flow_type(row)
+    if flow == "deposit":
+        return clean_display(row.get("to_account"))
+    return clean_display(row.get("from_account"))
+
+
+def cross_company_account_company_overlay(rows: List[Dict[str, Any]], account_company_map: Dict[str, str]) -> Dict[str, str]:
+    """สร้าง override บริษัทต่อ bot_key จาก account_config (เลขบัญชี -> บริษัท).
+
+    overlay = ผูกชื่อบริษัทใหม่ตามที่ตั้งค่า โดยยึดบัญชีของสลิปแต่ละ bot. ถ้าไม่มี config
+    ที่ตรง จะคืน dict ว่าง (no-op) และ logic เดิม (derive จาก company_name/bot_key) ทำงานต่อ.
+    """
+    if not account_company_map:
+        return {}
+    overlay: Dict[str, str] = {}
+    for row in rows:
+        bot = clean_display(row.get("bot_key")) or "default"
+        if bot in overlay:
+            continue
+        key = account_config_key(reconcile_row_own_account(row))
+        company = account_company_map.get(key) if key else ""
+        if company:
+            overlay[bot] = company
+    return overlay
+
+
+def cross_company_account_reconcile_company_order(rows: List[Dict[str, Any]], company_overlay: Optional[Dict[str, str]] = None) -> List[Tuple[str, str]]:
+    """คืน (bot_key, company_name) ของบริษัทที่ปรากฏ เรียงด้วย company_sort_key.
+
+    company_overlay (เลือกได้) = override ชื่อบริษัทต่อ bot_key จาก account_config.
+    """
+    overlay = company_overlay or {}
+    seen: Dict[str, str] = {}
+    for row in rows:
+        bot = clean_display(row.get("bot_key")) or "default"
+        company = overlay.get(bot) or clean_company_name(row.get("company_name"), bot)
+        seen.setdefault(bot, company)
+    return [(bot, seen[bot]) for bot in sorted(seen, key=lambda b: company_sort_key(seen[b], b))]
+
+
+def cross_company_account_reconcile_headers(companies: List[Tuple[str, str]]) -> List[str]:
+    """หัวคอลัมน์แบบ dynamic: คอลัมน์คงที่ + block ต่อบริษัท + คอลัมน์สถานะ."""
+    headers = list(CROSS_COMPANY_RECONCILE_BASE_HEADERS)
+    for _bot, company in companies:
+        label = company or "-"
+        headers.append(f"{label} - จำนวน")
+        headers.append(f"{label} - เวลา")
+        headers.append(f"{label} - อ้างอิง")
+        headers.append(f"{label} - ผู้โอน")
+    headers.extend(CROSS_COMPANY_RECONCILE_STATUS_HEADERS)
+    return headers
+
+
+def cross_company_account_reconcile_export(rows: List[Dict[str, Any]], flow_type: str = "all", company_overlay: Optional[Dict[str, str]] = None) -> Tuple[List[str], List[List[Any]]]:
+    """แปลง slip ข้ามบริษัทเป็นตารางเทียบยอดบรรทัดเดียว.
+
+    คีย์การจับคู่ = (slip_date_iso, ยอดเงินปัดทศนิยม 2 ตำแหน่ง) โดย account คงที่อยู่แล้ว
+    จากการ search. แต่ละบรรทัด = 1 ยอด/1 วัน แสดงคอลัมน์ของแต่ละบริษัทเทียบซ้าย-ขวา.
+    company_overlay (เลือกได้) = override ชื่อบริษัทต่อ bot_key จาก account_config.
+    """
+    counted = _cross_reconcile_filter_rows(rows, flow_type)
+    companies = cross_company_account_reconcile_company_order(counted, company_overlay)
+    headers = cross_company_account_reconcile_headers(companies)
+    bot_order = [bot for bot, _ in companies]
+
+    # group[(date_iso, amount)] -> { date_display, slip_time, amount, per_bot{bot -> {count, refs, senders}} }
+    groups: Dict[Tuple[str, float], Dict[str, Any]] = {}
+    for row in counted:
+        date_iso = clean_display(row.get("slip_date_iso"))
+        amount = round(float(row.get("amount") or 0), 2)
+        key = (date_iso, amount)
+        group = groups.get(key)
+        if group is None:
+            group = {
+                "date_iso": date_iso,
+                "date_display": clean_display(row.get("slip_date_display")) or date_iso,
+                "amount": amount,
+                "per_bot": {},
+            }
+            groups[key] = group
+        bot = clean_display(row.get("bot_key")) or "default"
+        cell = group["per_bot"].setdefault(bot, {"count": 0, "refs": [], "senders": [], "times": []})
+        cell["count"] += 1
+        ref = clean_display(row.get("reference_no") or row.get("reference") or row.get("seq") or row.get("aid"))
+        if ref:
+            cell["refs"].append(ref)
+        sender = clean_display(row.get("sender_display")) or telegram_sender_display(row.get("sender_name"), row.get("username"))
+        if sender:
+            cell["senders"].append(sender)
+        slip_time = clean_display(row.get("slip_time"))
+        if slip_time:
+            cell["times"].append(slip_time)
+
+    out: List[List[Any]] = []
+    # เรียงตามวันที่ (ใหม่ก่อน) แล้วยอดเงินมากก่อน เพื่อให้ยอดเด่นอยู่บน
+    ordered = sorted(groups.values(), key=lambda g: (str(g["date_iso"] or ""), g["amount"]), reverse=True)
+    for group in ordered:
+        per_bot: Dict[str, Any] = group["per_bot"]
+        present = [bot for bot in bot_order if bot in per_bot]
+        counts = [per_bot[bot]["count"] for bot in present]
+        company_names = [name for bot, name in companies if bot in per_bot]
+        if len(present) < 2:
+            status = "เฉพาะฝั่งเดียว"
+        elif len(set(counts)) == 1:
+            status = "ตรงกัน"
+        else:
+            status = "ไม่ตรง"
+        count_diff = (max(counts) - min(counts)) if counts else 0
+        amount_diff = round(count_diff * group["amount"], 2)
+
+        line: List[Any] = [group["date_display"], group["amount"]]
+        for bot in bot_order:
+            cell = per_bot.get(bot)
+            if cell:
+                line.append(cell["count"])
+                line.append(", ".join(dict.fromkeys(cell["times"])))
+                line.append(", ".join(cell["refs"]))
+                line.append(", ".join(dict.fromkeys(cell["senders"])))
+            else:
+                line.extend(["", "", "", ""])
+        line.append(", ".join(company_names))
+        line.append(status)
+        line.append(count_diff)
+        line.append(amount_diff)
+        out.append(line)
+    return headers, out
 
 
 def export_group_summary(rows: List[sqlite3.Row], key_field: str, label: str) -> List[List[Any]]:
@@ -5637,6 +5925,9 @@ def export_daily_summary(rows: List[sqlite3.Row]) -> List[List[Any]]:
     return [[g["date"], g["count"], g["amount"], g["fee"]] for g in ordered]
 
 
+EXPORT_MONEY_HEADERS = {"amount", "fee", "amount_diff", "matched_amount", "credit_limit", "diff_amount"}
+
+
 def write_export_sheet(ws: Any, headers: List[str], rows: List[List[Any]]) -> None:
     ws.append(headers)
     for row in rows:
@@ -5645,6 +5936,14 @@ def write_export_sheet(ws: Any, headers: List[str], rows: List[List[Any]]) -> No
         font = copy(cell.font)
         font.bold = True
         cell.font = font
+    # E) format polish: เลขเงิน #,##0.00 ทุก sheet + ตรึงหัวตาราง
+    money_cols = [idx + 1 for idx, header in enumerate(headers) if str(header) in EXPORT_MONEY_HEADERS]
+    for col_idx in money_cols:
+        for cell in ws.iter_cols(min_col=col_idx, max_col=col_idx, min_row=2):
+            for c in cell:
+                if isinstance(c.value, (int, float)):
+                    c.number_format = "#,##0.00"
+    ws.freeze_panes = "A2"
 
 
 def autofit_workbook(wb: Workbook) -> None:
@@ -5696,6 +5995,7 @@ def duplicate_export_rows(conn: sqlite3.Connection, rows: List[sqlite3.Row]) -> 
             display_bank(row["to_bank"]),
             row["to_account"],
             row["amount"],
+            original["amount"] if original else "",
             row["reference_no"],
             original["reference_no"] if original else "",
             row["sender_name"],
@@ -5707,6 +6007,49 @@ def duplicate_export_rows(conn: sqlite3.Connection, rows: List[sqlite3.Row]) -> 
     return out
 
 
+def append_total_row(ws: Any, headers: List[str], rows: List[List[Any]], *, label_col: int = 0) -> None:
+    """ต่อแถวสรุปท้าย sheet: นับจำนวนแถว + ผลรวม count/amount/fee ตามชื่อคอลัมน์."""
+    if not rows:
+        return
+    total: List[Any] = ["" for _ in headers]
+    for idx, header in enumerate(headers):
+        name = str(header)
+        if name == "count":
+            total[idx] = sum(int(r[idx] or 0) for r in rows if idx < len(r) and isinstance(r[idx], (int, float)))
+        elif name in {"amount", "fee", "amount_diff"}:
+            total[idx] = round(sum(float(r[idx] or 0) for r in rows if idx < len(r) and isinstance(r[idx], (int, float))), 2)
+    if label_col < len(total):
+        total[label_col] = f"รวม ({len(rows)} แถว)"
+    ws.append(total)
+    last_row = ws.max_row
+    for cell in ws[last_row]:
+        font = copy(cell.font)
+        font.bold = True
+        cell.font = font
+        if isinstance(cell.value, float) and str(headers[cell.column - 1]) in EXPORT_MONEY_HEADERS:
+            cell.number_format = "#,##0.00"
+
+
+def highlight_duplicate_amount_mismatch(ws: Any, headers: List[str]) -> None:
+    """E) ไฮไลต์แถว DuplicateSlips ที่ amount != matched_amount เป็นสีแดง."""
+    from openpyxl.styles import PatternFill
+
+    try:
+        amount_idx = headers.index("amount")
+        matched_idx = headers.index("matched_amount")
+    except ValueError:
+        return
+    fill = PatternFill(start_color="FFF4CCCC", end_color="FFF4CCCC", fill_type="solid")
+    for row_cells in ws.iter_rows(min_row=2):
+        amount_val = row_cells[amount_idx].value if amount_idx < len(row_cells) else None
+        matched_val = row_cells[matched_idx].value if matched_idx < len(row_cells) else None
+        if not isinstance(amount_val, (int, float)) or not isinstance(matched_val, (int, float)):
+            continue
+        if abs(float(amount_val) - float(matched_val)) > 0.009:
+            for cell in row_cells:
+                cell.fill = fill
+
+
 def export_dashboard_excel(db_path: Path, bot_key: str = "", chat_id: str = "", flow_type: str = "all", scope: str = "all", start_date: str = "", end_date: str = "", company_name: str = "") -> Path:
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     with connect(db_path) as conn:
@@ -5716,19 +6059,37 @@ def export_dashboard_excel(db_path: Path, bot_key: str = "", chat_id: str = "", 
     summary_ws = wb.active
     assert summary_ws is not None
     summary_ws.title = "SummaryByCompany"
-    write_export_sheet(summary_ws, ["company_name", "count", "amount", "fee"], export_group_summary(rows, "company_name", "company_name"))
+    company_summary = export_group_summary(rows, "company_name", "company_name")
+    write_export_sheet(summary_ws, ["company_name", "count", "amount", "fee"], company_summary)
+    append_total_row(summary_ws, ["company_name", "count", "amount", "fee"], company_summary)
     transferor_ws = wb.create_sheet("SummaryByTransferor")
-    write_export_sheet(transferor_ws, ["transferor_name", "count", "amount", "fee"], export_group_summary(rows, "transferor_name", "transferor_name"))
+    transferor_summary = export_group_summary(rows, "transferor_name", "transferor_name")
+    write_export_sheet(transferor_ws, ["transferor_name", "count", "amount", "fee"], transferor_summary)
+    append_total_row(transferor_ws, ["transferor_name", "count", "amount", "fee"], transferor_summary)
     daily_ws = wb.create_sheet("DailySummary")
-    write_export_sheet(daily_ws, ["date", "count", "amount", "fee"], export_daily_summary(rows))
+    daily_summary = export_daily_summary(rows)
+    write_export_sheet(daily_ws, ["date", "count", "amount", "fee"], daily_summary)
+    append_total_row(daily_ws, ["date", "count", "amount", "fee"], daily_summary)
     slips_ws = wb.create_sheet("Slips")
-    write_export_sheet(slips_ws, DASHBOARD_EXPORT_HEADERS, dashboard_slip_export_rows(rows, "all"))
+    all_detail = dashboard_slip_export_rows(rows, "all")
+    write_export_sheet(slips_ws, DASHBOARD_EXPORT_HEADERS, all_detail)
+    append_total_row(slips_ws, DASHBOARD_EXPORT_HEADERS, all_detail)
     deposit_ws = wb.create_sheet("DepositSlips")
-    write_export_sheet(deposit_ws, DASHBOARD_EXPORT_HEADERS, dashboard_slip_export_rows(rows, "deposit"))
+    deposit_detail = dashboard_slip_export_rows(rows, "deposit")
+    write_export_sheet(deposit_ws, DASHBOARD_EXPORT_HEADERS, deposit_detail)
+    append_total_row(deposit_ws, DASHBOARD_EXPORT_HEADERS, deposit_detail)
     withdraw_ws = wb.create_sheet("WithdrawSlips")
-    write_export_sheet(withdraw_ws, DASHBOARD_EXPORT_HEADERS, dashboard_slip_export_rows(rows, "withdraw"))
+    withdraw_detail = dashboard_slip_export_rows(rows, "withdraw")
+    write_export_sheet(withdraw_ws, DASHBOARD_EXPORT_HEADERS, withdraw_detail)
+    append_total_row(withdraw_ws, DASHBOARD_EXPORT_HEADERS, withdraw_detail)
+    # B) sheet แยกสำหรับ status != success (queued/unclear) ที่หลุดเข้า detail แต่ไม่อยู่ summary
+    pending_ws = wb.create_sheet("PendingUnclear")
+    pending_detail = dashboard_pending_unclear_export_rows(rows)
+    write_export_sheet(pending_ws, DASHBOARD_EXPORT_HEADERS, pending_detail)
+    append_total_row(pending_ws, DASHBOARD_EXPORT_HEADERS, pending_detail)
     dup_ws = wb.create_sheet("DuplicateSlips")
     write_export_sheet(dup_ws, DASHBOARD_DUPLICATE_HEADERS, duplicate_rows)
+    highlight_duplicate_amount_mismatch(dup_ws, DASHBOARD_DUPLICATE_HEADERS)
     autofit_workbook(wb)
     label_parts = [safe_export_name(company_name or bot_key or "all"), normalize_flow_type(flow_type), normalize_export_date(start_date) or clean_display(scope or "all")]
     if end_date:
@@ -5775,6 +6136,18 @@ def cross_company_account_export_cell(row: Dict[str, Any], header: str) -> Any:
     return display_bank(value) if header in BANK_EXPORT_FIELDS else value
 
 
+CROSS_COMPANY_UNMATCHED_STATUSES = {"ไม่ตรง", "เฉพาะฝั่งเดียว"}
+
+
+def cross_company_reconcile_unmatched_rows(headers: List[str], rows: List[List[Any]]) -> List[List[Any]]:
+    """กรองเฉพาะแถวที่ยอดไม่ตรง (match_status ∈ {ไม่ตรง, เฉพาะฝั่งเดียว})."""
+    try:
+        status_idx = headers.index("match_status")
+    except ValueError:
+        return []
+    return [row for row in rows if status_idx < len(row) and str(row[status_idx]) in CROSS_COMPANY_UNMATCHED_STATUSES]
+
+
 def export_cross_company_account_slips_excel(db_path: Path, flow_type: str = "all", scope: str = "all", search: str = "") -> Path:
     """Export one account's counted slips across every company as a single workbook."""
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
@@ -5784,6 +6157,8 @@ def export_cross_company_account_slips_excel(db_path: Path, flow_type: str = "al
     with connect(db_path) as conn:
         result = cross_company_account_slip_search_rows(conn, scope=scope, flow_type=flow_type, search=query, limit=0)
     rows = list(result.get("rows") or [])
+    # Overlay บริษัทของบัญชีจาก account_config (config-first, ถ้าไม่มีจะเป็น no-op)
+    overlay = cross_company_account_company_overlay(rows, account_config_company_map(db_path))
     wb = Workbook()
     summary_ws = wb.active
     assert summary_ws is not None
@@ -5791,13 +6166,130 @@ def export_cross_company_account_slips_excel(db_path: Path, flow_type: str = "al
     summary_rows = [[row.get("company_name") or row.get("bot_key") or "", int(row.get("count") or 0), float(row.get("amount") or 0)] for row in (result.get("companies") or [])]
     write_export_sheet(summary_ws, ["company_name", "count", "amount"], summary_rows)
     slips_ws = wb.create_sheet("CrossCompanyAccountSlips")
-    write_export_sheet(slips_ws, CROSS_COMPANY_ACCOUNT_EXPORT_HEADERS, cross_company_account_slip_export_rows(rows, "all"))
+    all_headers, all_rows = cross_company_account_reconcile_export(rows, "all", overlay)
+    write_export_sheet(slips_ws, all_headers, all_rows)
     deposit_ws = wb.create_sheet("DepositSlips")
-    write_export_sheet(deposit_ws, CROSS_COMPANY_ACCOUNT_EXPORT_HEADERS, cross_company_account_slip_export_rows(rows, "deposit"))
+    deposit_headers, deposit_rows = cross_company_account_reconcile_export(rows, "deposit", overlay)
+    write_export_sheet(deposit_ws, deposit_headers, deposit_rows)
     withdraw_ws = wb.create_sheet("WithdrawSlips")
-    write_export_sheet(withdraw_ws, CROSS_COMPANY_ACCOUNT_EXPORT_HEADERS, cross_company_account_slip_export_rows(rows, "withdraw"))
+    withdraw_headers, withdraw_rows = cross_company_account_reconcile_export(rows, "withdraw", overlay)
+    write_export_sheet(withdraw_ws, withdraw_headers, withdraw_rows)
+    # Sheet แยกเฉพาะยอดที่ไม่ตรง (Nathan ขอ "แยกยอดที่ไม่ตรงกัน")
+    unmatched_ws = wb.create_sheet("Unmatched")
+    unmatched_rows = cross_company_reconcile_unmatched_rows(all_headers, all_rows)
+    write_export_sheet(unmatched_ws, all_headers, unmatched_rows)
     autofit_workbook(wb)
     out = EXPORT_DIR / f"auditslip-cross-company-account-{normalize_flow_type(flow_type)}-{safe_export_name(query)}-{safe_export_name(clean_display(scope or 'all'))}-{int(time.time())}.xlsx"
+    wb.save(out)
+    return out
+
+
+RECONCILE_MATCHED_HEADERS = ["date", "time", "name", "bank", "source", "reference", "amount", "slip_source", "slip_name", "slip_time", "score"]
+RECONCILE_ROW_HEADERS = ["date", "time", "name", "bank", "source", "reference", "amount"]
+RECONCILE_DAILY_HEADERS = ["date", "count", "amount"]
+
+
+def _reconcile_matched_row(match: Dict[str, Any]) -> List[Any]:
+    backend = match.get("backend") or {}
+    slip = match.get("slip") or {}
+    return [
+        backend.get("date"), backend.get("time"), backend.get("name"), backend.get("bank"),
+        backend.get("source"), backend.get("reference"), float(backend.get("amount") or 0),
+        slip.get("source"), slip.get("name"), slip.get("time"), match.get("score"),
+    ]
+
+
+def _reconcile_plain_rows(rows: List[Dict[str, Any]]) -> List[List[Any]]:
+    return [[r.get("date"), r.get("time"), r.get("name"), r.get("bank"), r.get("source"), r.get("reference"), float(r.get("amount") or 0)] for r in rows]
+
+
+def export_reconcile_backend_excel(db_path: Path, excel_path: Path, chat_id: str = "", scope: str = "all", bot_key: str = "", flow_type: str = "all") -> Path:
+    """Export backend↔slip reconcile result as a workbook (Matched / MissingInSlips / ExtraSlips / DailyDiff)."""
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    result = reconcile_backend_excel(db_path, excel_path, chat_id=chat_id, scope=scope, bot_key=bot_key, flow_type=flow_type, include_full=True)
+    full = result.get("_full") or {}
+    wb = Workbook()
+    summary_ws = wb.active
+    assert summary_ws is not None
+    summary_ws.title = "Summary"
+    write_export_sheet(summary_ws, ["metric", "count", "amount"], [
+        ["backend", result["backend"]["count"], result["backend"]["amount"]],
+        ["slips", result["slips"]["count"], result["slips"]["amount"]],
+        ["matched", result["matched"]["count"], result["matched"]["amount"]],
+        ["missing_in_slips", result["missing"]["count"], result["missing"]["amount"]],
+        ["extra_slips", result["extra"]["count"], result["extra"]["amount"]],
+        ["diff_amount", "", result["diff_amount"]],
+    ])
+    matched_ws = wb.create_sheet("Matched")
+    matched_rows = [_reconcile_matched_row(m) for m in (full.get("matched") or [])]
+    write_export_sheet(matched_ws, RECONCILE_MATCHED_HEADERS, matched_rows)
+    append_total_row(matched_ws, RECONCILE_MATCHED_HEADERS, matched_rows)
+    missing_ws = wb.create_sheet("MissingInSlips")
+    missing_rows = _reconcile_plain_rows(full.get("missing_in_slips") or [])
+    write_export_sheet(missing_ws, RECONCILE_ROW_HEADERS, missing_rows)
+    append_total_row(missing_ws, RECONCILE_ROW_HEADERS, missing_rows)
+    extra_ws = wb.create_sheet("ExtraSlips")
+    extra_rows = _reconcile_plain_rows(full.get("extra_slips") or [])
+    write_export_sheet(extra_ws, RECONCILE_ROW_HEADERS, extra_rows)
+    append_total_row(extra_ws, RECONCILE_ROW_HEADERS, extra_rows)
+    daily_ws = wb.create_sheet("DailyDiff")
+    daily_rows = [
+        [r.get("date"), "backend", int(r.get("count") or 0), float(r.get("amount") or 0)] for r in (result.get("daily", {}).get("backend") or [])
+    ] + [
+        [r.get("date"), "slips", int(r.get("count") or 0), float(r.get("amount") or 0)] for r in (result.get("daily", {}).get("slips") or [])
+    ]
+    write_export_sheet(daily_ws, ["date", "source", "count", "amount"], daily_rows)
+    autofit_workbook(wb)
+    out = EXPORT_DIR / f"auditslip-reconcile-{normalize_flow_type(flow_type)}-{safe_export_name(clean_display(scope or 'all'))}-{int(time.time())}.xlsx"
+    wb.save(out)
+    return out
+
+
+def export_reconcile_statement_excel(db_path: Path, excel_path: Path, statement_path: Path, chat_id: str = "", scope: str = "all", bot_key: str = "", flow_type: str = "all") -> Path:
+    """Export 3-way (backend↔slip↔statement) reconcile result as a workbook."""
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    result = reconcile_backend_slips_statement(db_path, excel_path, statement_path, chat_id=chat_id, scope=scope, bot_key=bot_key, flow_type=flow_type, include_full=True)
+    full = result.get("_full") or {}
+    diffs = result.get("diff_amounts") or {}
+    wb = Workbook()
+    summary_ws = wb.active
+    assert summary_ws is not None
+    summary_ws.title = "Summary"
+    write_export_sheet(summary_ws, ["metric", "count", "amount"], [
+        ["backend", result["backend"]["count"], result["backend"]["amount"]],
+        ["slips", result["slips"]["count"], result["slips"]["amount"]],
+        ["statement", result["statement"]["count"], result["statement"]["amount"]],
+        ["matched_3way", result["matched"]["count"], result["matched"]["amount"]],
+        ["backend_missing_slip", result["backend_missing_slip"]["count"], result["backend_missing_slip"]["amount"]],
+        ["backend_missing_statement", result["backend_missing_statement"]["count"], result["backend_missing_statement"]["amount"]],
+        ["slip_extra", result["slip_extra"]["count"], result["slip_extra"]["amount"]],
+        ["statement_extra", result["statement_extra"]["count"], result["statement_extra"]["amount"]],
+        ["diff backend-slips", "", diffs.get("backend_minus_slips")],
+        ["diff backend-statement", "", diffs.get("backend_minus_statement")],
+        ["diff slips-statement", "", diffs.get("slips_minus_statement")],
+    ])
+    matched_ws = wb.create_sheet("Matched")
+    matched_rows = [_reconcile_matched_row(m) for m in (full.get("matched") or [])]
+    write_export_sheet(matched_ws, RECONCILE_MATCHED_HEADERS, matched_rows)
+    append_total_row(matched_ws, RECONCILE_MATCHED_HEADERS, matched_rows)
+    for sheet_name, key in [
+        ("MissingInSlips", "backend_missing_slip"),
+        ("MissingInStatement", "backend_missing_statement"),
+        ("ExtraSlips", "slip_extra"),
+        ("ExtraStatement", "statement_extra"),
+    ]:
+        ws = wb.create_sheet(sheet_name)
+        sheet_rows = _reconcile_plain_rows(full.get(key) or [])
+        write_export_sheet(ws, RECONCILE_ROW_HEADERS, sheet_rows)
+        append_total_row(ws, RECONCILE_ROW_HEADERS, sheet_rows)
+    daily_ws = wb.create_sheet("DailyDiff")
+    daily_rows = []
+    for src in ("backend", "slips", "statement"):
+        for r in (result.get("daily", {}).get(src) or []):
+            daily_rows.append([r.get("date"), src, int(r.get("count") or 0), float(r.get("amount") or 0)])
+    write_export_sheet(daily_ws, ["date", "source", "count", "amount"], daily_rows)
+    autofit_workbook(wb)
+    out = EXPORT_DIR / f"auditslip-reconcile3-{normalize_flow_type(flow_type)}-{safe_export_name(clean_display(scope or 'all'))}-{int(time.time())}.xlsx"
     wb.save(out)
     return out
 
@@ -5820,6 +6312,7 @@ def export_workbook_preview(rows: List[sqlite3.Row], *, bot_key: str = "", chat_
         "Slips": len(dashboard_slip_export_rows(rows, "all")),
         "DepositSlips": len(dashboard_slip_export_rows(rows, "deposit")),
         "WithdrawSlips": len(dashboard_slip_export_rows(rows, "withdraw")),
+        "PendingUnclear": len(dashboard_pending_unclear_export_rows(rows)),
         "DuplicateSlips": len(duplicate_rows),
     }
     flow = normalize_flow_type(flow_type)
@@ -5848,11 +6341,14 @@ def export_dashboard_preview(db_path: Path, bot_key: str = "", chat_id: str = ""
         with connect(db_path) as conn:
             result = cross_company_account_slip_search_rows(conn, scope=scope, flow_type=flow, search=query, limit=0)
         rows = list(result.get("rows") or [])
+        overlay = cross_company_account_company_overlay(rows, account_config_company_map(db_path))
+        all_headers, all_rows = cross_company_account_reconcile_export(rows, "all", overlay)
         sheets = {
             "SummaryByCompany": len(result.get("companies") or []),
-            "CrossCompanyAccountSlips": len(cross_company_account_slip_export_rows(rows, "all")),
-            "DepositSlips": len(cross_company_account_slip_export_rows(rows, "deposit")),
-            "WithdrawSlips": len(cross_company_account_slip_export_rows(rows, "withdraw")),
+            "CrossCompanyAccountSlips": len(all_rows),
+            "DepositSlips": len(cross_company_account_reconcile_export(rows, "deposit", overlay)[1]),
+            "WithdrawSlips": len(cross_company_account_reconcile_export(rows, "withdraw", overlay)[1]),
+            "Unmatched": len(cross_company_reconcile_unmatched_rows(all_headers, all_rows)),
         }
         return {
             "ok": True,
@@ -8256,6 +8752,9 @@ async function load(options={{}}) {{
   document.getElementById('twalletTodayAmount').textContent = tw.ok ? money(tw.today_total || 0) : '-';
   document.getElementById('twalletTodayMeta').textContent = tw.ok ? ((tw.today_count || 0)+' รายการ · คงเหลือ '+money(tw.balance_amount || 0)) : ('TWallet: '+(tw.error || 'offline'));
   if (data.scope && ['today','open','all'].includes(String(data.scope))) scopeEl.value = data.scope;
+  // กัน auto-refresh (10 วิ) เขียนทับช่องวันที่ขณะผู้ใช้กำลังเลือก → ไม่เด้งกลับวันปัจจุบัน
+  const dateFieldFocused = document.activeElement === customDateEl || document.activeElement === summaryStartEl || document.activeElement === summaryEndEl;
+  if (!dateFieldFocused) {{
   if (customDateEl && /^\\d{{4}}-\\d{{2}}-\\d{{2}}$/.test(data.scope || '')) {{
     customDateEl.value = data.scope;
     if (summaryStartEl) summaryStartEl.value = '';
@@ -8270,6 +8769,7 @@ async function load(options={{}}) {{
     scopeEl.value = 'all';
   }} else if (customDateEl && !currentDate) {{
     customDateEl.value = '';
+  }}
   }}
   if (data.slip_filter) slipFilterEl.value = data.slip_filter;
   if (document.activeElement !== slipSearchEl) slipSearchEl.value = data.slip_search || currentSearch || '';
@@ -8820,6 +9320,48 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 logger.exception("api_export failed")
                 self.send_json({"ok": False, "error": safe_error(exc)}, 400)
             return
+        if parsed.path == "/api/account-config":
+            if not self.role_or_401("admin", "auditor"):
+                return
+            try:
+                with connect(DB_PATH) as conn:
+                    self.send_json({"ok": True, "items": load_account_config(conn)})
+            except Exception as exc:
+                logger.exception("api_account_config_list failed")
+                self.send_json({"ok": False, "error": safe_error(exc), "items": []}, 400)
+            return
+        if parsed.path in {"/api/reconcile/export", "/api/reconcile/statement/export"}:
+            if not self.role_or_401("admin"):
+                return
+            q = parse_qs(parsed.query)
+            chat_id = (q.get("chat_id") or [""])[0]
+            bot_key = (q.get("bot_key") or [""])[0]
+            flow_type = (q.get("flow_type") or ["all"])[0]
+            scope = (q.get("scope") or ["all"])[0]
+            try:
+                excel_path = safe_backend_excel_path((q.get("excel_path") or [""])[0])
+                if not excel_path.exists():
+                    self.send_json({"ok": False, "error": f"excel not found: {excel_path}"}, 404)
+                    return
+                if parsed.path == "/api/reconcile/statement/export":
+                    statement_path = safe_statement_file_path((q.get("statement_path") or [""])[0])
+                    if not statement_path.exists():
+                        self.send_json({"ok": False, "error": f"statement not found: {statement_path}"}, 404)
+                        return
+                    path = export_reconcile_statement_excel(DB_PATH, excel_path, statement_path, chat_id=chat_id, scope=scope, bot_key=bot_key, flow_type=flow_type)
+                else:
+                    path = export_reconcile_backend_excel(DB_PATH, excel_path, chat_id=chat_id, scope=scope, bot_key=bot_key, flow_type=flow_type)
+                body = path.read_bytes()
+                self.send_bytes(
+                    200,
+                    body,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    {"Content-Disposition": f'attachment; filename="{path.name}"'},
+                )
+            except Exception as exc:
+                logger.exception("api_reconcile_export failed")
+                self.send_json({"ok": False, "error": safe_error(exc)}, 400)
+            return
         if parsed.path == "/api/audit-chain/verify":
             if not self.role_or_401("admin", "auditor"):
                 return
@@ -8964,6 +9506,32 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if isinstance(result, dict):
                 result["pending_id"] = pending_id_executed
             self.send_json(result, 200 if result.get("ok") else 400)
+            return
+        if parsed.path == "/api/account-config":
+            if not self.role_or_401("admin"):
+                return
+            actor_fp = self.actor_fingerprint()
+            request_id = uuid.uuid4().hex[:12]
+            op = clean_display(payload.get("op") or "")
+            try:
+                if op == "delete":
+                    result = delete_account_config(DB_PATH, str(payload.get("account_no") or ""))
+                else:
+                    result = save_account_config(
+                        DB_PATH,
+                        str(payload.get("account_no") or ""),
+                        str(payload.get("account_name") or ""),
+                        str(payload.get("company_name") or ""),
+                        parse_number(payload.get("credit_limit")),
+                    )
+                record_endpoint_mutation(DB_PATH, f"account_config.{op or 'upsert'}", actor=actor_fp, request_id=request_id, payload=payload, result_status=("ok" if result.get("ok") else "error"), result_summary=str(result.get("account_no") or result.get("error") or ""))
+                if isinstance(result, dict):
+                    result["request_id"] = request_id
+                self.send_json(result, 200 if result.get("ok") else int(result.get("status_code") or 400))
+            except Exception as exc:
+                logger.exception("api_account_config failed")
+                record_endpoint_mutation(DB_PATH, f"account_config.{op or 'upsert'}", actor=actor_fp, request_id=request_id, payload=payload, result_status="error", result_summary=safe_error(exc))
+                self.send_json({"ok": False, "error": safe_error(exc), "request_id": request_id}, 400)
             return
         if parsed.path == "/api/account-limit":
             if not self.role_or_401("admin"):
@@ -9611,6 +10179,7 @@ def main() -> None:
     try:
         with connect(DB_PATH) as conn:
             ensure_dashboard_performance_indexes(conn)
+            ensure_account_config_table(conn)
             conn.commit()
         ensure_dashboard_tokens_table(DB_PATH)
         if DASHBOARD_TOKEN:

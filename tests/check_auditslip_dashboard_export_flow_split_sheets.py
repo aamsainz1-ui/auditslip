@@ -61,7 +61,11 @@ spec.loader.exec_module(Dash)
 def records(ws):
     rows = list(ws.iter_rows(values_only=True))
     headers = list(rows[0])
-    return headers, [dict(zip(headers, row)) for row in rows[1:]]
+    data = [dict(zip(headers, row)) for row in rows[1:]]
+    # drop appended total row(s) — first column reads "รวม (...)"
+    first = headers[0]
+    data = [r for r in data if not str(r.get(first) or "").startswith("รวม")]
+    return headers, data
 
 
 # Normal workbook: keep the all-slips sheet, but also split operator item lists.
@@ -88,14 +92,21 @@ _, zip_wdr = records(bot1_wb["WithdrawSlips"])
 assert [r["reference_no"] for r in zip_dep] == ["RDEP"], zip_dep
 assert [r["reference_no"] for r in zip_wdr] == ["RWDR"], zip_wdr
 
-# Cross-company account export is also one Excel workbook, so it needs the same split sheets.
+# Cross-company account export is also one Excel workbook with the same split sheets,
+# but now in reconciliation layout (1 บรรทัด = 1 ยอด เทียบบริษัทซ้าย-ขวา).
 cross_xlsx = Dash.export_cross_company_account_slips_excel(db_path, flow_type="all", scope="2026-05-22", search="SHAREDACC789")
 cross_wb = load_workbook(cross_xlsx, data_only=True)
 assert {"CrossCompanyAccountSlips", "DepositSlips", "WithdrawSlips"}.issubset(set(cross_wb.sheetnames)), cross_wb.sheetnames
 _, cross_dep = records(cross_wb["DepositSlips"])
-_, cross_wdr = records(cross_wb["WithdrawSlips"])
+cross_wdr_headers, cross_wdr = records(cross_wb["WithdrawSlips"])
 assert cross_dep == [], cross_dep
-assert [str(r["reference_no"] or "") for r in cross_wdr] == ["RWDR2", "RWDR"], cross_wdr
-assert all(str(r.get("slip_image_url") or "").startswith("/api/slip-image?id=") for r in cross_dep + cross_wdr)
+# RWDR(222 บริษัท 1) และ RWDR2(555 บริษัท 2) คนละยอด -> คนละบรรทัด แต่ละบรรทัดเฉพาะฝั่งเดียว
+assert cross_wdr_headers[:2] == ["slip_date_display", "amount"], cross_wdr_headers
+assert cross_wdr_headers[-4:] == ["companies_present", "match_status", "count_diff", "amount_diff"], cross_wdr_headers
+by_amount = {float(r["amount"]): r for r in cross_wdr}
+assert set(by_amount) == {222.0, 555.0}, cross_wdr
+assert by_amount[222.0]["บริษัท 1 - อ้างอิง"] == "RWDR", cross_wdr
+assert by_amount[555.0]["บริษัท 2 - อ้างอิง"] == "RWDR2", cross_wdr
+assert all(r["match_status"] == "เฉพาะฝั่งเดียว" for r in cross_wdr), cross_wdr
 
 print("ok: dashboard Excel exports separate deposit and withdraw slip sheets")
