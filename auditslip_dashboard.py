@@ -962,9 +962,6 @@ def fetch_slip_image(db_path: Path, slip_id: str) -> Tuple[bytes, str]:
         raise FileNotFoundError("slip image not found")
     bot_key = clean_display(row["bot_key"]) or "default"
     file_id = clean_display(row["file_id"])
-    token = token_for_bot(bot_key)
-    if not token:
-        raise FileNotFoundError("bot token not configured for this slip")
     cache_dir = DATA_DIR / "slip-images"
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_key = hashlib.sha256(f"{bot_key}|{file_id}".encode("utf-8")).hexdigest()
@@ -973,6 +970,9 @@ def fetch_slip_image(db_path: Path, slip_id: str) -> Tuple[bytes, str]:
         body = cached[0].read_bytes()
         mime = mimetypes.guess_type(str(cached[0]))[0] or "image/jpeg"
         return body, mime
+    token = token_for_bot(bot_key)
+    if not token:
+        raise FileNotFoundError("bot token not configured for this slip")
     meta = requests.get(f"{TELEGRAM_API}/bot{token}/getFile", params={"file_id": file_id}, timeout=30)
     meta.raise_for_status()
     obj = meta.json()
@@ -6818,6 +6818,7 @@ def render_dashboard_html(token: str = "") -> str:
           <details class="side-menu-group" data-menu-group="money">
             <summary><span>ตรวจเงิน</span><small>เดินบัญชี · ธนาคาร</small></summary>
             <div class="side-nav">
+              <button class="side-menu-item" type="button" data-menu-target="section-account-registry" onclick="showMenuSection('section-account-registry')"><span class="side-menu-icon">📒</span><span class="side-menu-text"><span class="side-menu-title">คลังบัญชี</span><span class="side-menu-desc">ทะเบียนบัญชี · ยอดรายวัน</span></span></button>
               <button class="side-menu-item" type="button" data-menu-target="section-account-ledger" onclick="showMenuSection('section-account-ledger')"><span class="side-menu-icon">≡</span><span class="side-menu-text"><span class="side-menu-title">เดินบัญชีรายบัญชี</span><span class="side-menu-desc">timeline + running balance</span></span></button>
               <button class="side-menu-item" type="button" data-menu-target="section-employee-audit" onclick="showMenuSection('section-employee-audit')"><span class="side-menu-icon">◫</span><span class="side-menu-text"><span class="side-menu-title">ตรวจยอด</span><span class="side-menu-desc">1 เทียบเดินบัญชี · 2 รายวัน · 3 ซ้ำข้ามบริษัท</span></span></button>
               <button class="side-menu-item" type="button" data-menu-target="section-bank-ledger" onclick="showMenuSection('section-bank-ledger')"><span class="side-menu-icon">▤</span><span class="side-menu-text"><span class="side-menu-title">Preview Statement</span><span class="side-menu-desc">อัปโหลด statement เทียบสลิป</span></span></button>
@@ -6911,6 +6912,11 @@ def render_dashboard_html(token: str = "") -> str:
       <div class="card"><h3>ถอนโอนนอก · แยกต่างหาก</h3><div class="mini">รายการถอนที่เป็นโอนนอก แยกออกจากวงเงินถอนหลัก ไม่เอาไปบวกยอดเกินวงเงิน</div><div id="outsideTransferWithdrawals"></div></div>
       <div class="card"><h3>ฝั่งถอน · วงเงินรายวันต่อบัญชี</h3><div id="withdrawLimitSummary" class="mini">นับเฉพาะกลุ่มถอน ไม่รวมฝาก/เติมมือและโอนนอก</div><div class="mini">แยกตามวันที่ของสลิปและเลขบัญชีผู้โอน วงเงิน/วันจะ reset ทุกวัน และไม่นับสลิปซ้ำ</div><div id="byAccountDay"></div></div>
       <div class="card"><h3>ฝั่งถอน · ตั้งวงเงินจากยอดรายวัน</h3><div class="mini">ตั้งวงเงินบัญชี: กด “ตั้งวงเงิน” จากแถวบัญชี ระบบจะจำบริษัทของแถวนั้นให้เอง แม้ตอนดูรวมทุกบริษัท</div><div class="toolbar limit-edit-form"><input id="limitKey" placeholder="เลือกบัญชีจากปุ่มตั้งวงเงิน" readonly /><input id="limitScopeValue" placeholder="บริษัท/กลุ่มที่จะบันทึก" readonly /><input id="limitName" placeholder="ชื่อบัญชี" /><input id="limitBank" placeholder="ธนาคาร" /><input id="limitAccount" placeholder="เลขบัญชี" /><input id="limitAmount" type="number" step="0.01" placeholder="วงเงินต่อวัน" /><button onclick="saveAccountLimit()">บันทึกวงเงิน</button></div><div id="limitScopeHint" class="mini muted">เลือกบัญชีจากตารางด้านล่างก่อนแก้ไขวงเงิน</div><div id="byTransferor"></div></div>
+    </section>
+    <section id="section-account-registry" class="sections menu-section" hidden>
+      <div class="card" style="padding:0;overflow:hidden;border-radius:16px">
+        <iframe id="regFrame" title="คลังบัญชี" src="http://76.13.190.65:8096/?k=acct-reg-7741" loading="eager" style="width:100%;height:calc(100vh - 140px);min-height:600px;border:0;display:block;background:#0a0c11"></iframe>
+      </div>
     </section>
     <section id="section-deposit-slips" class="sections menu-section" hidden>
       <div class="card"><h3>ฝั่งฝาก/เติมมือ · สลิปลูกค้าฝาก/เติมมือ</h3><div id="depositCustomerSummary" class="mini">สลิปลูกค้า ไม่มีวงเงิน และไม่เอาไปรวมกับถอน/วงเงิน</div><div id="depositCustomerSlips"></div></div>
@@ -9064,7 +9070,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def security_headers(self) -> Dict[str, str]:
         return {
-            "Content-Security-Policy": "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https: http:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'",
+            "Content-Security-Policy": "default-src 'self'; frame-src 'self' http://76.13.190.65:8096; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https: http:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'",
             "X-Frame-Options": "DENY",
             "Referrer-Policy": "no-referrer",
             "X-Content-Type-Options": "nosniff",
