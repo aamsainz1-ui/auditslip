@@ -6137,6 +6137,8 @@ def cross_company_account_export_cell(row: Dict[str, Any], header: str) -> Any:
 
 
 CROSS_COMPANY_UNMATCHED_STATUSES = {"ไม่ตรง", "เฉพาะฝั่งเดียว"}
+# กลุ่ม "ส่งเข้าหลายบริษัท" = ยอดที่ปรากฏ ≥2 บริษัท (ทั้งที่ตรงและไม่ตรงกัน)
+CROSS_COMPANY_MULTI_STATUSES = {"ตรงกัน", "ไม่ตรง"}
 
 
 def cross_company_reconcile_unmatched_rows(headers: List[str], rows: List[List[Any]]) -> List[List[Any]]:
@@ -6146,6 +6148,16 @@ def cross_company_reconcile_unmatched_rows(headers: List[str], rows: List[List[A
     except ValueError:
         return []
     return [row for row in rows if status_idx < len(row) and str(row[status_idx]) in CROSS_COMPANY_UNMATCHED_STATUSES]
+
+
+def cross_company_reconcile_group_rows(headers: List[str], rows: List[List[Any]], multi: bool) -> List[List[Any]]:
+    """แยกแถวตามจำนวนบริษัทที่ส่ง: multi=True → ส่งเข้า ≥2 บริษัท, multi=False → ส่งที่เดียว."""
+    try:
+        status_idx = headers.index("match_status")
+    except ValueError:
+        return []
+    wanted = CROSS_COMPANY_MULTI_STATUSES if multi else {"เฉพาะฝั่งเดียว"}
+    return [row for row in rows if status_idx < len(row) and str(row[status_idx]) in wanted]
 
 
 def export_cross_company_account_slips_excel(db_path: Path, flow_type: str = "all", scope: str = "all", search: str = "") -> Path:
@@ -6168,6 +6180,15 @@ def export_cross_company_account_slips_excel(db_path: Path, flow_type: str = "al
     slips_ws = wb.create_sheet("CrossCompanyAccountSlips")
     all_headers, all_rows = cross_company_account_reconcile_export(rows, "all", overlay)
     write_export_sheet(slips_ws, all_headers, all_rows)
+    # Sheet แยก 2 กลุ่มตามจำนวนบริษัทที่ส่ง (Nathan ขอ: นับจำนวน + ยอดรวม + รายการ ต่อกลุ่ม)
+    multi_ws = wb.create_sheet("ส่งเข้าหลายบริษัท")
+    multi_rows = cross_company_reconcile_group_rows(all_headers, all_rows, multi=True)
+    write_export_sheet(multi_ws, all_headers, multi_rows)
+    append_total_row(multi_ws, all_headers, multi_rows)
+    single_ws = wb.create_sheet("ส่งที่เดียว")
+    single_rows = cross_company_reconcile_group_rows(all_headers, all_rows, multi=False)
+    write_export_sheet(single_ws, all_headers, single_rows)
+    append_total_row(single_ws, all_headers, single_rows)
     deposit_ws = wb.create_sheet("DepositSlips")
     deposit_headers, deposit_rows = cross_company_account_reconcile_export(rows, "deposit", overlay)
     write_export_sheet(deposit_ws, deposit_headers, deposit_rows)
@@ -6346,6 +6367,8 @@ def export_dashboard_preview(db_path: Path, bot_key: str = "", chat_id: str = ""
         sheets = {
             "SummaryByCompany": len(result.get("companies") or []),
             "CrossCompanyAccountSlips": len(all_rows),
+            "ส่งเข้าหลายบริษัท": len(cross_company_reconcile_group_rows(all_headers, all_rows, multi=True)),
+            "ส่งที่เดียว": len(cross_company_reconcile_group_rows(all_headers, all_rows, multi=False)),
             "DepositSlips": len(cross_company_account_reconcile_export(rows, "deposit", overlay)[1]),
             "WithdrawSlips": len(cross_company_account_reconcile_export(rows, "withdraw", overlay)[1]),
             "Unmatched": len(cross_company_reconcile_unmatched_rows(all_headers, all_rows)),

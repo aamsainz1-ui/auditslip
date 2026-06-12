@@ -133,6 +133,25 @@ only_a = by_amount[100.0]
 assert only_a["match_status"] == "เฉพาะฝั่งเดียว", only_a
 assert only_a["บริษัท A - อ้างอิง"] == "RA01", only_a
 
+# Sheet แยก 2 กลุ่มตามจำนวนบริษัทที่ส่ง + แถวสรุป (จำนวนรายการ + ยอดรวม) ต่อกลุ่ม
+assert {"ส่งเข้าหลายบริษัท", "ส่งที่เดียว"}.issubset(set(wb.sheetnames)), wb.sheetnames
+multi_sheet = list(wb["ส่งเข้าหลายบริษัท"].iter_rows(values_only=True))
+assert list(multi_sheet[0]) == headers, multi_sheet[0]
+multi_records = [dict(zip(headers, row)) for row in multi_sheet[1:-1]]
+assert [float(r["amount"]) for r in multi_records] == [500.0], multi_records
+assert all(r["match_status"] in ("ตรงกัน", "ไม่ตรง") for r in multi_records), multi_records
+multi_total = dict(zip(headers, multi_sheet[-1]))
+assert multi_total["slip_date_display"] == "รวม (1 แถว)", multi_total
+assert float(multi_total["amount"]) == 500.0, multi_total
+
+single_sheet = list(wb["ส่งที่เดียว"].iter_rows(values_only=True))
+single_records = [dict(zip(headers, row)) for row in single_sheet[1:-1]]
+assert sorted(float(r["amount"]) for r in single_records) == [100.0, 250.0], single_records
+assert all(r["match_status"] == "เฉพาะฝั่งเดียว" for r in single_records), single_records
+single_total = dict(zip(headers, single_sheet[-1]))
+assert single_total["slip_date_display"] == "รวม (2 แถว)", single_total
+assert float(single_total["amount"]) == 350.0, single_total
+
 # duplicate / นอกวัน / นอก account ต้องไม่โผล่
 all_refs = " ".join(str(r["บริษัท A - อ้างอิง"]) + " " + str(r["บริษัท B - อ้างอิง"]) for r in records)
 assert "RB04" not in all_refs and "RA05" not in all_refs and "RC03" not in all_refs, records
